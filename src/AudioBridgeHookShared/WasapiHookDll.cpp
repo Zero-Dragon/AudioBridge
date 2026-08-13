@@ -64,8 +64,11 @@ struct AudioClientState {
     REFERENCE_TIME fakeDefaultPeriod = 100000;
     REFERENCE_TIME fakeMinPeriod = 30000;
     HANDLE fakeEvent = nullptr;
-    std::uint64_t fakeFramesReleased = 0;
-    ULONGLONG fakeStartTick = 0;
+    std::uint64_t fakeDevicePosition = 0;
+    std::uint64_t fakeQueuedFrames = 0;
+    std::uint64_t fakeReservedFrames = 0;
+    std::uint64_t fakeFrameRemainder = 0;
+    LONGLONG fakeLastUpdateQpc = 0;
     LONGLONG fakeNextEventQpc = 0;
 };
 
@@ -126,6 +129,7 @@ struct FakeRenderClient {
     IAudioClient* audioClient = nullptr;
     std::vector<BYTE> buffer;
     bool bufferOutstanding = false;
+    UINT32 requestedFrames = 0;
 };
 
 struct FakeAudioClock {
@@ -323,6 +327,13 @@ UINT32 ClampFakeFrames(UINT32 frames) {
     return std::min<UINT32>(8192, std::max<UINT32>(32, frames));
 }
 
+UINT32 MinimumFakeBufferFrames(UINT32 periodFrames) {
+    constexpr std::uint64_t kMaxFakeBufferFrames = 16384;
+    return static_cast<UINT32>((std::min<std::uint64_t>)(
+            kMaxFakeBufferFrames,
+            static_cast<std::uint64_t>(periodFrames) * 2U));
+}
+
 UINT32 FramesFromHns(REFERENCE_TIME hns, UINT32 sampleRate, UINT32 fallbackFrames) {
     if (hns <= 0 || sampleRate == 0) {
         return ClampFakeFrames(fallbackFrames);
@@ -345,9 +356,79 @@ LONGLONG QpcNow() {
     return value.QuadPart;
 }
 
+LONGLONG QpcFrequency() {
+    static const LONGLONG frequency = [] {
+        LARGE_INTEGER value{};
+        return QueryPerformanceFrequency(&value) && value.QuadPart > 0
+                ? value.QuadPart
+                : 10000000ll;
+    }();
+    return frequency;
+}
+
+std::uint64_t QpcToHns(LONGLONG qpc) {
+    if (qpc <= 0) {
+        return 0;
+    }
+    const auto frequency = static_cast<std::uint64_t>(QpcFrequency());
+    const auto ticks = static_cast<std::uint64_t>(qpc);
+    return (ticks / frequency) * 10000000ull +
+            ((ticks % frequency) * 10000000ull) / frequency;
+}
+
+void AdvanceFakePlaybackLocked(AudioClientState& state, LONGLONG nowQpc) {
+    if (!state.fakeStarted) {
+        state.fakeLastUpdateQpc = 0;
+        return;
+    }
+    if (state.fakeLastUpdateQpc <= 0 || nowQpc <= state.fakeLastUpdateQpc) {
+        state.fakeLastUpdateQpc = nowQpc;
+        return;
+    }
+
+    const auto frequency = static_cast<std::uint64_t>(QpcFrequency());
+    const auto sampleRate = static_cast<std::uint64_t>(
+            state.format.Format.nSamplesPerSec != 0
+                    ? state.format.Format.nSamplesPerSec
+                    : 48000);
+    const auto elapsedTicks = static_cast<std::uint64_t>(nowQpc - state.fakeLastUpdateQpc);
+    const auto wholeSeconds = elapsedTicks / frequency;
+    const auto partialTicks = elapsedTicks % frequency;
+    const auto partialNumerator =
+            partialTicks * sampleRate + state.fakeFrameRemainder;
+    const auto advancedFrames =
+            wholeSeconds * sampleRate + partialNumerator / frequency;
+
+    state.fakeFrameRemainder = partialNumerator % frequency;
+    state.fakeLastUpdateQpc = nowQpc;
+    state.fakeDevicePosition += advancedFrames;
+    state.fakeQueuedFrames -=
+            (std::min)(state.fakeQueuedFrames, advancedFrames);
+}
+
+UINT32 FakeAvailableFramesLocked(const AudioClientState& state) {
+    const auto capacity = static_cast<std::uint64_t>(state.fakeBufferFrames);
+    const auto used = (std::min<std::uint64_t>)(
+            capacity,
+            state.fakeQueuedFrames + state.fakeReservedFrames);
+    return static_cast<UINT32>(capacity - used);
+}
+
+bool FakeEventReadyLocked(const AudioClientState& state) {
+    const UINT32 periodFrames = state.fakePeriodFrames != 0
+            ? state.fakePeriodFrames
+            : DefaultFramesForRate(
+                      state.format.Format.nSamplesPerSec != 0
+                              ? state.format.Format.nSamplesPerSec
+                              : 48000,
+                      100,
+                      480);
+    const UINT32 requiredFrames =
+            (std::min)(state.fakeBufferFrames, periodFrames);
+    return FakeAvailableFramesLocked(state) >= requiredFrames;
+}
+
 LONGLONG QpcTicksForFakePeriod(const AudioClientState& state) {
-    LARGE_INTEGER frequency{};
-    QueryPerformanceFrequency(&frequency);
     const UINT32 sampleRate = state.format.Format.nSamplesPerSec != 0
             ? state.format.Format.nSamplesPerSec
             : 48000;
@@ -356,7 +437,7 @@ LONGLONG QpcTicksForFakePeriod(const AudioClientState& state) {
             : DefaultFramesForRate(sampleRate, 100, 480);
     return std::max<LONGLONG>(
             1,
-            (static_cast<LONGLONG>(periodFrames) * frequency.QuadPart + sampleRate - 1) /
+            (static_cast<LONGLONG>(periodFrames) * QpcFrequency() + sampleRate - 1) /
                     sampleRate);
 }
 
@@ -556,10 +637,13 @@ void StoreFakeInitialization(IAudioClient* client,
     const UINT32 defaultFrames = DefaultFramesForRate(sampleRate, 100, 480);
     const UINT32 selectedPeriodFrames =
             periodFrames != 0 ? ClampFakeFrames(periodFrames) : defaultFrames;
-    const UINT32 selectedBufferFrames =
+    const UINT32 requestedBufferFrames =
             bufferDuration > 0
                     ? FramesFromHns(bufferDuration, sampleRate, selectedPeriodFrames)
                     : ClampFakeFrames(std::max<UINT32>(selectedPeriodFrames, defaultFrames));
+    const UINT32 selectedBufferFrames = (std::max)(
+            requestedBufferFrames,
+            MinimumFakeBufferFrames(selectedPeriodFrames));
 
     std::lock_guard<std::mutex> lock(g_stateMutex);
     auto& state = g_audioClients[client];
@@ -581,8 +665,11 @@ void StoreFakeInitialization(IAudioClient* client,
             : HnsFromFrames(std::max<UINT32>(1, DefaultFramesForRate(sampleRate, 333, 144)),
                             sampleRate,
                             30000);
-    state.fakeFramesReleased = 0;
-    state.fakeStartTick = 0;
+    state.fakeDevicePosition = 0;
+    state.fakeQueuedFrames = 0;
+    state.fakeReservedFrames = 0;
+    state.fakeFrameRemainder = 0;
+    state.fakeLastUpdateQpc = 0;
     state.fakeNextEventQpc = 0;
 }
 
@@ -710,6 +797,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
     std::uint64_t activeBytes = 0;
     std::uint64_t bytes = 0;
     const ULONGLONG now = GetTickCount64();
+    const LONGLONG nowQpc = QpcNow();
 
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -726,10 +814,23 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
 
             auto audioIt = g_audioClients.find(renderState.audioClient);
             if (audioIt != g_audioClients.end()) {
-                audioState = audioIt->second;
-                if (audioIt->second.fakeOutput && frameCount > 0) {
-                    audioIt->second.fakeFramesReleased += frameCount;
+                auto& state = audioIt->second;
+                if (state.fakeOutput) {
+                    AdvanceFakePlaybackLocked(state, nowQpc);
+                    state.fakeReservedFrames -=
+                            (std::min<std::uint64_t>)(state.fakeReservedFrames,
+                                                      renderState.pendingFrames);
+                    if (frameCount > 0) {
+                        const auto queued =
+                                (std::min<std::uint64_t>)(state.fakeQueuedFrames,
+                                                          state.fakeBufferFrames);
+                        const auto available =
+                                static_cast<std::uint64_t>(state.fakeBufferFrames) - queued;
+                        state.fakeQueuedFrames +=
+                                (std::min<std::uint64_t>)(frameCount, available);
+                    }
                 }
+                audioState = state;
             }
 
             const bool hasPcm =
@@ -850,7 +951,18 @@ ULONG STDMETHODCALLTYPE FakeRenderRelease(IAudioRenderClient* self) {
         bool removed = false;
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
-            removed = g_renderClients.erase(self) > 0;
+            const auto renderIt = g_renderClients.find(self);
+            if (renderIt != g_renderClients.end()) {
+                const auto audioIt = g_audioClients.find(renderIt->second.audioClient);
+                if (audioIt != g_audioClients.end() && audioIt->second.fakeOutput) {
+                    auto& audioState = audioIt->second;
+                    audioState.fakeReservedFrames -=
+                            (std::min<std::uint64_t>)(audioState.fakeReservedFrames,
+                                                      renderIt->second.pendingFrames);
+                }
+                g_renderClients.erase(renderIt);
+                removed = true;
+            }
         }
         if (removed) {
             const auto count = g_renderClientCount.fetch_sub(1) - 1;
@@ -876,13 +988,40 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
         return AUDCLNT_E_OUT_OF_ORDER;
     }
 
-    const AudioClientState audioState = SnapshotAudioClient(fake->audioClient);
-    if (!audioState.fakeInitialized || !audioState.hasFormat) {
+    AudioClientState audioState{};
+    UINT32 availableFrames = 0;
+    bool initialized = false;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto audioIt = g_audioClients.find(fake->audioClient);
+        if (audioIt != g_audioClients.end()) {
+            auto& state = audioIt->second;
+            initialized = state.fakeInitialized && state.hasFormat;
+            if (initialized) {
+                AdvanceFakePlaybackLocked(state, QpcNow());
+                availableFrames = FakeAvailableFramesLocked(state);
+                if (frameCount <= availableFrames) {
+                    state.fakeReservedFrames += frameCount;
+                }
+                audioState = state;
+            }
+        }
+    }
+
+    if (!initialized) {
         Log("Fake output GetBuffer before Initialize. render=%p audio=%p frames=%u",
             self,
             fake->audioClient,
             frameCount);
         return AUDCLNT_E_NOT_INITIALIZED;
+    }
+    if (frameCount > availableFrames) {
+        Log("Fake output GetBuffer request exceeds available frames. render=%p audio=%p requested=%u available=%u",
+            self,
+            fake->audioClient,
+            frameCount,
+            availableFrames);
+        return AUDCLNT_E_BUFFER_TOO_LARGE;
     }
 
     const std::uint32_t bytesPerFrame = BytesPerFrame(audioState);
@@ -893,17 +1032,32 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
             self,
             frameCount,
             static_cast<unsigned long long>(bytes));
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto audioIt = g_audioClients.find(fake->audioClient);
+        if (audioIt != g_audioClients.end()) {
+            auto& state = audioIt->second;
+            state.fakeReservedFrames -=
+                    (std::min<std::uint64_t>)(state.fakeReservedFrames, frameCount);
+        }
         return E_OUTOFMEMORY;
     }
 
     try {
         fake->buffer.assign(static_cast<std::size_t>(bytes), 0);
     } catch (...) {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto audioIt = g_audioClients.find(fake->audioClient);
+        if (audioIt != g_audioClients.end()) {
+            auto& state = audioIt->second;
+            state.fakeReservedFrames -=
+                    (std::min<std::uint64_t>)(state.fakeReservedFrames, frameCount);
+        }
         return E_OUTOFMEMORY;
     }
 
     *data = fake->buffer.empty() ? nullptr : fake->buffer.data();
     fake->bufferOutstanding = true;
+    fake->requestedFrames = frameCount;
 
     std::lock_guard<std::mutex> lock(g_stateMutex);
     auto& state = g_renderClients[self];
@@ -922,8 +1076,17 @@ HRESULT STDMETHODCALLTYPE FakeRenderReleaseBuffer(IAudioRenderClient* self, UINT
             flags);
         return AUDCLNT_E_OUT_OF_ORDER;
     }
+    if (frameCount > fake->requestedFrames) {
+        Log("Fake output ReleaseBuffer rejected invalid size. render=%p requested=%u released=%u flags=0x%08lX",
+            self,
+            fake->requestedFrames,
+            frameCount,
+            flags);
+        return AUDCLNT_E_INVALID_SIZE;
+    }
     fake->bufferOutstanding = false;
     CaptureReleasedBuffer(self, frameCount, flags);
+    fake->requestedFrames = 0;
     return S_OK;
 }
 
@@ -975,12 +1138,18 @@ HRESULT STDMETHODCALLTYPE FakeClockGetPosition(IAudioClock* self, UINT64* positi
         return E_POINTER;
     }
     const auto* fake = reinterpret_cast<FakeAudioClock*>(self);
-    const AudioClientState audioState = SnapshotAudioClient(fake->audioClient);
-    *position = audioState.fakeFramesReleased;
+    const LONGLONG nowQpc = QpcNow();
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto audioIt = g_audioClients.find(fake->audioClient);
+        if (audioIt == g_audioClients.end() || !audioIt->second.fakeInitialized) {
+            return AUDCLNT_E_NOT_INITIALIZED;
+        }
+        AdvanceFakePlaybackLocked(audioIt->second, nowQpc);
+        *position = audioIt->second.fakeDevicePosition;
+    }
     if (qpcPosition != nullptr) {
-        LARGE_INTEGER qpc{};
-        QueryPerformanceCounter(&qpc);
-        *qpcPosition = static_cast<UINT64>(qpc.QuadPart);
+        *qpcPosition = QpcToHns(nowQpc);
     }
     return S_OK;
 }
@@ -1325,12 +1494,23 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentPadding(IAudioClient* self, UINT32* padd
         if (paddingFrames == nullptr) {
             return E_POINTER;
         }
-        const AudioClientState state = SnapshotAudioClient(self);
-        if (!state.fakeInitialized) {
+        bool initialized = false;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            const auto audioIt = g_audioClients.find(self);
+            if (audioIt != g_audioClients.end() && audioIt->second.fakeInitialized) {
+                auto& state = audioIt->second;
+                AdvanceFakePlaybackLocked(state, QpcNow());
+                *paddingFrames = static_cast<UINT32>(
+                        (std::min<std::uint64_t>)(state.fakeQueuedFrames,
+                                                  state.fakeBufferFrames));
+                initialized = true;
+            }
+        }
+        if (!initialized) {
             Log("Fake output GetCurrentPadding before Initialize. audio=%p", self);
             return AUDCLNT_E_NOT_INITIALIZED;
         }
-        *paddingFrames = 0;
         return S_OK;
     }
     return g_originalGetCurrentPadding(self, paddingFrames);
@@ -1409,11 +1589,14 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
                 Log("Fake output Start before Initialize. audio=%p", self);
                 return AUDCLNT_E_NOT_INITIALIZED;
             }
-            state.fakeStarted = true;
-            state.fakeStartTick = GetTickCount64();
-            state.fakeNextEventQpc = QpcNow() + QpcTicksForFakePeriod(state);
-            if (state.fakeEvent != nullptr) {
-                SetEvent(state.fakeEvent);
+            if (!state.fakeStarted) {
+                const LONGLONG nowQpc = QpcNow();
+                state.fakeStarted = true;
+                state.fakeLastUpdateQpc = nowQpc;
+                state.fakeNextEventQpc = nowQpc + QpcTicksForFakePeriod(state);
+                if (state.fakeEvent != nullptr && FakeEventReadyLocked(state)) {
+                    SetEvent(state.fakeEvent);
+                }
             }
         }
         Log("Fake output Start. audio=%p", self);
@@ -1427,7 +1610,9 @@ HRESULT STDMETHODCALLTYPE HookStop(IAudioClient* self) {
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
+            AdvanceFakePlaybackLocked(state, QpcNow());
             state.fakeStarted = false;
+            state.fakeLastUpdateQpc = 0;
             state.fakeNextEventQpc = 0;
         }
         Log("Fake output Stop. audio=%p", self);
@@ -1441,9 +1626,15 @@ HRESULT STDMETHODCALLTYPE HookReset(IAudioClient* self) {
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
-            state.fakeFramesReleased = 0;
+            const LONGLONG nowQpc = QpcNow();
+            AdvanceFakePlaybackLocked(state, nowQpc);
+            state.fakeDevicePosition = 0;
+            state.fakeQueuedFrames = 0;
+            state.fakeReservedFrames = 0;
+            state.fakeFrameRemainder = 0;
+            state.fakeLastUpdateQpc = state.fakeStarted ? nowQpc : 0;
             state.fakeNextEventQpc = state.fakeStarted
-                    ? QpcNow() + QpcTicksForFakePeriod(state)
+                    ? nowQpc + QpcTicksForFakePeriod(state)
                     : 0;
         }
         Log("Fake output Reset. audio=%p", self);
@@ -2064,9 +2255,11 @@ void PumpFakeEvents() {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         for (auto& item : g_audioClients) {
             auto& state = item.second;
+            AdvanceFakePlaybackLocked(state, now);
             if (state.fakeOutput &&
                 state.fakeStarted &&
                 state.fakeEvent != nullptr &&
+                FakeEventReadyLocked(state) &&
                 (state.fakeNextEventQpc == 0 || now >= state.fakeNextEventQpc)) {
                 events.push_back(state.fakeEvent);
                 const LONGLONG ticks = QpcTicksForFakePeriod(state);
