@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>AudioBridge</AssemblyName>
+    <Version>0.1.0</Version>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>AudioBridge</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\AudioBridge.ico</ApplicationIcon>
+    <Platforms>x64;x86</Platforms>
+    <RuntimeIdentifiers>win-x64;win-x86</RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(Platform)'=='x86'">win-x86</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(Platform)'!='x86'">win-x64</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+    <SelfContained>false</SelfContained>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <NativeBridgePlatform Condition="'$(Platform)'=='x86'">Win32</NativeBridgePlatform>
+    <NativeBridgePlatform Condition="'$(Platform)'!='x86'">x64</NativeBridgePlatform>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260317003" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4654" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\AudioBridge.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="CopyNativeAudioBridge" AfterTargets="Build">
+    <ItemGroup>
+      <NativeAudioBridge Include="$(MSBuildThisFileDirectory)..\..\bin\$(NativeBridgePlatform)\$(Configuration)\AudioBridgeCore.dll" />
+      <NativeAudioBridge Include="$(MSBuildThisFileDirectory)..\..\bin\x64\$(Configuration)\AudioBridgeHook.dll" Condition="'$(Platform)'=='x64' And Exists('$(MSBuildThisFileDirectory)..\..\bin\x64\$(Configuration)\AudioBridgeHook.dll')" />
+      <NativeAudioBridge Include="$(MSBuildThisFileDirectory)..\..\bin\Win32\$(Configuration)\AudioBridgeHook32.dll" Condition="Exists('$(MSBuildThisFileDirectory)..\..\bin\Win32\$(Configuration)\AudioBridgeHook32.dll')" />
+      <NativeAudioBridge Include="$(MSBuildThisFileDirectory)..\..\bin\Win32\$(Configuration)\AudioBridgeInject32.exe" Condition="Exists('$(MSBuildThisFileDirectory)..\..\bin\Win32\$(Configuration)\AudioBridgeInject32.exe')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(NativeAudioBridge)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

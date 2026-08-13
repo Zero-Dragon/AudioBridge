@@ -1,0 +1,27 @@
+# Visual Studio and MSBuild
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build and package outputs
+/bin/
+/build/
+**/bin/
+**/obj/
+*.pdb
+*.ilk
+*.exp
+
+# Runtime diagnostics
+*.startup.log
+*.native.log
+/settings.json*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
