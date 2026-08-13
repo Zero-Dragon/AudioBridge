@@ -51,16 +51,6 @@ AudioBridge captures audio PIDs while the target application is starting. Applic
 
 If there is no sound: when no Audio PID appears, exit every process belonging to the target application and reopen it through AudioBridge. When a PID is present, check the ASIO driver, sample rate, and any error or underrun shown in the app.
 
-## Building from source
-
-Requires the .NET 10 SDK, Windows SDK, and Visual Studio with the **Desktop development with C++** workload.
-
-```powershell
-.\build.ps1 -Architecture all -Configuration Release
-```
-
-This script builds the source only; it does not create release ZIP files.
-
 ## Support the project
 
 | Method | Support link |

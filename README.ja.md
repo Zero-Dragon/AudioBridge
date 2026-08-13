@@ -51,16 +51,6 @@ AudioBridge は対象アプリの起動時に音声 PID を取得します。す
 
 音が出ない場合は、Audio PID が表示されていなければ対象アプリの全プロセスを終了し、AudioBridge 経由で開き直してください。PID が表示されている場合は、ASIO ドライバー、サンプルレート、および画面上のエラーや underrun を確認してください。
 
-## ソースからのビルド
-
-.NET 10 SDK、Windows SDK、および **C++ によるデスクトップ開発** ワークロードを含む Visual Studio が必要です。
-
-```powershell
-.\build.ps1 -Architecture all -Configuration Release
-```
-
-このスクリプトはソースのビルドのみを行い、配布用 ZIP は作成しません。
-
 ## プロジェクトを支援する
 
 | 方法 | 支援先 |
