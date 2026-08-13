@@ -38,7 +38,11 @@ AudioBridge 是一个 Windows 音频辅助工具。它可以从工具内启动�
 5. 点击 **Open**，再在目标应用中开始播放音频。
 6. 确认 **Audio PIDs** 中出现 PID，状态变为 `Output Active`。
 
-AudioBridge 需要在应用启动时捕获音频 PID。因此，已经打开的应用通常无法直接接管；请先退出它，再通过 AudioBridge 重新打开。
+### 注意
+
+- Windows 默认音频输出与 **ASIO output** 不要使用同一台设备；
+- **Browse** 请选择实际播放音频的主程序 `.exe`，不要选择 launcher 或 updater；
+- AudioBridge 需要在应用启动时捕获音频 PID，请先完全退出目标应用，再通过 AudioBridge 打开。
 
 ## 使用限制
 

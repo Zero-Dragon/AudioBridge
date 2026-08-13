@@ -38,7 +38,11 @@ It is designed for applications without native ASIO output. **Fake Output** is e
 5. Click **Open**, then start playback in the target application.
 6. Confirm that a PID appears under **Audio PIDs** and the status reaches `Output Active`.
 
-AudioBridge captures audio PIDs while the target application is starting. Applications that are already running usually cannot be redirected reliably; exit them completely and reopen them through AudioBridge.
+### Notes
+
+- Do not use the same device for the Windows default audio output and **ASIO output**.
+- Under **Browse**, select the main `.exe` that produces audio, not a launcher or updater.
+- AudioBridge captures audio PIDs at application startup. Fully exit the target application, then open it through AudioBridge.
 
 ## Limitations
 
