@@ -51,16 +51,6 @@ AudioBridge 需要在应用启动时捕获音频 PID。因此，已经打开的�
 
 如果没有声音：没有 Audio PID 时，请退出目标应用的所有进程并重新打开；已经有 PID 时，请检查 ASIO 驱动、采样率和界面中的错误或 underrun 信息。
 
-## 从源码构建
-
-需要 .NET 10 SDK、Windows SDK，以及安装了“使用 C++ 的桌面开发”工作负载的 Visual Studio。
-
-```powershell
-.\build.ps1 -Architecture all -Configuration Release
-```
-
-该脚本只负责编译源码，不生成发布 ZIP。
-
 ## 支持项目
 
 | 方式 | 支持入口 |
