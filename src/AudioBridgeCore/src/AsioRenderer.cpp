@@ -130,11 +130,11 @@ std::uint32_t NormalizePrebufferMs(std::int32_t prebufferMs) {
     return (std::min<std::uint32_t>)(static_cast<std::uint32_t>(prebufferMs), 10000U);
 }
 
-std::uint32_t NormalizeMaxBufferOffsetMs(std::int32_t maxBufferOffsetMs) {
-    if (maxBufferOffsetMs < 50) {
+std::uint32_t NormalizeMaxBufferAdvanceMs(std::int32_t maxBufferAdvanceMs) {
+    if (maxBufferAdvanceMs < 50) {
         return 100;
     }
-    return (std::min<std::uint32_t>)(static_cast<std::uint32_t>(maxBufferOffsetMs), 10000U);
+    return (std::min<std::uint32_t>)(static_cast<std::uint32_t>(maxBufferAdvanceMs), 10000U);
 }
 
 std::uint32_t FramesFromMs(std::uint32_t sampleRate, std::uint32_t ms) {
@@ -648,7 +648,7 @@ AsioRenderer::~AsioRenderer() {
 bool AsioRenderer::Start(const std::wstring& deviceId,
                          const WAVEFORMATEXTENSIBLE& format,
                          std::int32_t prebufferMs,
-                         std::int32_t maxBufferOffsetMs,
+                         std::int32_t maxBufferAdvanceMs,
                          std::uint32_t requestedBufferFrames,
                          std::wstring* outError) {
     Stop();
@@ -676,10 +676,10 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
         sourceKind_ = SourceKindFromWave(format_);
         prebufferMs_ = static_cast<std::int32_t>(NormalizePrebufferMs(prebufferMs));
         prebufferFrames_ = FramesFromMs(sampleRate_, static_cast<std::uint32_t>(prebufferMs_));
-        maxBufferOffsetMs_ =
-                static_cast<std::int32_t>(NormalizeMaxBufferOffsetMs(maxBufferOffsetMs));
-        maxBufferOffsetFrames_ =
-                FramesFromMs(sampleRate_, static_cast<std::uint32_t>(maxBufferOffsetMs_));
+        maxBufferAdvanceMs_ =
+                static_cast<std::int32_t>(NormalizeMaxBufferAdvanceMs(maxBufferAdvanceMs));
+        maxBufferAdvanceFrames_ =
+                FramesFromMs(sampleRate_, static_cast<std::uint32_t>(maxBufferAdvanceMs_));
         requestedBufferFrames_ = requestedBufferFrames;
         minBufferFrames_ = 0;
         maxBufferFrames_ = 0;
@@ -1517,7 +1517,7 @@ void AsioRenderer::PaddingLoop() {
 
 void AsioRenderer::MaintainPadding() {
     if (!running_.load(std::memory_order_acquire) || prebufferFrames_ == 0 ||
-        maxBufferOffsetFrames_ >= prebufferFrames_) {
+        maxBufferAdvanceFrames_ >= prebufferFrames_) {
         return;
     }
 
@@ -1527,7 +1527,7 @@ void AsioRenderer::MaintainPadding() {
     }
 
     const std::uint32_t bufferedFrames = ringBuffer_.PendingFrames();
-    const std::uint32_t triggerFrames = prebufferFrames_ - maxBufferOffsetFrames_;
+    const std::uint32_t triggerFrames = prebufferFrames_ - maxBufferAdvanceFrames_;
     if (!paddingActive_ && bufferedFrames < triggerFrames) {
         paddingActive_ = true;
     }

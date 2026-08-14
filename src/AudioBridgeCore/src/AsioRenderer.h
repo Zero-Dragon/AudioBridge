@@ -142,7 +142,7 @@ public:
     bool Start(const std::wstring& deviceId,
                const WAVEFORMATEXTENSIBLE& format,
                std::int32_t prebufferMs,
-               std::int32_t maxBufferOffsetMs,
+               std::int32_t maxBufferAdvanceMs,
                std::uint32_t requestedBufferFrames,
                std::wstring* outError);
     void Stop();
@@ -275,8 +275,8 @@ private:
     std::uint32_t asioSampleRate_ = 0;
     std::uint32_t prebufferFrames_ = 0;
     std::int32_t prebufferMs_ = 300;
-    std::uint32_t maxBufferOffsetFrames_ = 0;
-    std::int32_t maxBufferOffsetMs_ = 100;
+    std::uint32_t maxBufferAdvanceFrames_ = 0;
+    std::int32_t maxBufferAdvanceMs_ = 100;
     bool paddingActive_ = false;
     RawFrameRingBuffer ringBuffer_;
     std::vector<std::uint8_t> callbackBuffer_;

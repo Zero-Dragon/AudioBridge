@@ -196,10 +196,10 @@
                        SpinButtonPlacementMode="Inline"
                        ValueChanged="AsioBufferBox_ValueChanged" />
 
-            <NumberBox x:Name="MaxBufferOffsetBox"
+            <NumberBox x:Name="MaxBufferAdvanceBox"
                        Grid.Row="1"
                        Grid.Column="2"
-                       Header="Max buffer offset ms"
+                       Header="Max buffer advance ms"
                        Width="180"
                        Minimum="50"
                        Maximum="10000"
@@ -207,7 +207,7 @@
                        LargeChange="100"
                        Value="100"
                        SpinButtonPlacementMode="Inline"
-                       ValueChanged="MaxBufferOffsetBox_ValueChanged"
+                       ValueChanged="MaxBufferAdvanceBox_ValueChanged"
                        ToolTipService.ToolTip="When buffered audio falls below Prebuffer minus this value, AudioBridge pads the queue with silence to restore the configured Prebuffer." />
 
             <CheckBox x:Name="FakeOutputCheckBox"
