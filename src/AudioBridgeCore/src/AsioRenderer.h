@@ -79,9 +79,10 @@ public:
         PaddingSilence,
     };
 
-    struct PopResult {
+    struct DispatchResult {
         std::uint32_t frames = 0;
         std::uint32_t paddingSilentFrames = 0;
+        std::uint64_t endIndex = 0;
     };
 
     bool Reset(std::uint32_t bytesPerFrame, std::uint32_t capacityFrames);
@@ -90,28 +91,40 @@ public:
                        std::uint32_t frameCount,
                        FrameOrigin origin = FrameOrigin::Captured);
     std::uint32_t PushSilence(std::uint32_t frameCount);
-    PopResult Pop(std::uint8_t* data, std::uint32_t frameCount);
+    std::uint32_t PushCapturedSilence(std::uint32_t frameCount);
+    DispatchResult Dispatch(std::uint8_t* data, std::uint32_t frameCount);
+    bool ConfirmDispatch(std::uint64_t endIndex);
+    void RollbackDispatch();
+    std::uint64_t DispatchPosition() const;
     std::uint32_t AvailableReadFrames() const;
+    std::uint32_t PendingFrames() const;
     std::uint32_t CapacityFrames() const;
 
 private:
-    // Single serialized producer / single consumer (ASIO callback).
-    std::size_t AvailableReadBytes(std::size_t readIndex, std::size_t writeIndex) const;
-    std::size_t AvailableWriteBytes(std::size_t readIndex, std::size_t writeIndex) const;
-    void CopyInto(std::size_t writeIndex, const std::uint8_t* data, std::size_t bytes);
-    void ZeroInto(std::size_t writeIndex, std::size_t bytes);
-    void CopyOut(std::size_t readIndex, std::uint8_t* data, std::size_t bytes) const;
-    void CopyOriginsInto(std::size_t writeIndex,
+    // Single serialized producer / single consumer (ASIO callback). Frames
+    // remain owned by the ring after dispatch and become writable again only
+    // after the corresponding ASIO page is retired and confirmed.
+    std::uint64_t AvailableReadBytes(std::uint64_t readIndex,
+                                     std::uint64_t writeIndex) const;
+    std::size_t AvailableWriteBytes(std::uint64_t readIndex,
+                                    std::uint64_t writeIndex) const;
+    void CopyInto(std::uint64_t writeIndex,
+                  const std::uint8_t* data,
+                  std::size_t bytes);
+    void ZeroInto(std::uint64_t writeIndex, std::size_t bytes);
+    void CopyOut(std::uint64_t readIndex, std::uint8_t* data, std::size_t bytes) const;
+    void CopyOriginsInto(std::uint64_t writeIndex,
                          std::uint32_t frameCount,
                          FrameOrigin origin);
-    std::uint32_t CountPaddingOrigins(std::size_t readIndex,
+    std::uint32_t CountPaddingOrigins(std::uint64_t readIndex,
                                       std::uint32_t frameCount) const;
 
     std::vector<std::uint8_t> bytes_;
     std::vector<FrameOrigin> frameOrigins_;
     std::size_t byteMask_ = 0;
-    std::atomic<std::size_t> readIndex_{0};
-    std::atomic<std::size_t> writeIndex_{0};
+    std::atomic<std::uint64_t> confirmedReadIndex_{0};
+    std::atomic<std::uint64_t> dispatchReadIndex_{0};
+    std::atomic<std::uint64_t> writeIndex_{0};
     std::uint32_t bytesPerFrame_ = 0;
 };
 
@@ -142,7 +155,7 @@ public:
     bool Start(const std::wstring& deviceId,
                const WAVEFORMATEXTENSIBLE& format,
                std::int32_t prebufferMs,
-               std::int32_t maxBufferOffsetMs,
+               std::int32_t maxBufferAdvanceMs,
                std::uint32_t requestedBufferFrames,
                std::int32_t requestedClockSourceIndex,
                std::wstring* outError);
@@ -150,14 +163,31 @@ public:
     std::uint32_t PushPcm(const std::uint8_t* data,
                           std::uint32_t frameCount,
                           std::wstring* outError = nullptr);
+    std::uint32_t PushCapturedSilence(std::uint32_t frameCount,
+                                      std::wstring* outError = nullptr);
     RendererStats GetStats() const;
     bool IsRunning() const;
+    std::int64_t ConfirmedCapturedFrames() const;
+    std::int64_t ConfirmedOutputFrames() const;
+    std::int64_t PendingCapturedFrames() const;
+    bool HasFault() const;
+    std::wstring FaultMessage() const;
 
     void OnAsioBufferSwitch(long doubleBufferIndex);
     void OnAsioSampleRateChanged(ASIOSampleRate sampleRate);
     long OnAsioMessage(long selector, long value, void* message, double* opt);
 
 private:
+    struct OutputPageLedger {
+        bool valid = false;
+        std::uint64_t sequence = 0;
+        std::uint64_t dispatchEndIndex = 0;
+        std::uint32_t outputFrames = 0;
+        std::uint32_t capturedFrames = 0;
+        std::uint32_t paddingSilentFrames = 0;
+        std::uint32_t underrunSilentFrames = 0;
+    };
+
     struct SilenceBucket {
         std::uint64_t second = 0;
         std::int64_t outputFrames = 0;
@@ -170,12 +200,6 @@ private:
         double silentPercent = 0.0;
     };
 
-    enum ResetReason : std::uint32_t {
-        kResetRequest = 1U << 0U,
-        kBufferSizeChange = 1U << 1U,
-        kLatenciesChanged = 1U << 2U,
-    };
-
     void ControlLoop(std::wstring deviceId,
                      std::uint32_t requestedBufferFrames,
                      std::int32_t requestedClockSourceIndex);
@@ -186,13 +210,18 @@ private:
     bool CreateBuffersOnControlThread(std::uint32_t requestedBufferFrames,
                                       bool resetRingBuffer,
                                       std::wstring* outError);
-    bool RebuildBuffersOnControlThread(std::uint32_t requestedBufferFrames,
-                                       std::wstring* outError);
     void DisposeBuffersOnControlThread();
     void CloseDriverOnControlThread();
     bool TryStartStreamIfReady(std::wstring* outError);
+    std::uint32_t PushCapturedFrames(const std::uint8_t* data,
+                                     std::uint32_t frameCount,
+                                     bool silence,
+                                     std::wstring* outError);
     void PaddingLoop();
     void MaintainPadding();
+    bool ConfirmOutputPage(long doubleBufferIndex);
+    void RollbackOutputPages();
+    bool LatchFault(const std::wstring& message, bool fromOutputCallback = false);
     void FillOutputBuffer(long doubleBufferIndex);
     void FillOutputBufferWithSilence(long doubleBufferIndex);
     void WriteConvertedOutput(const std::uint8_t* interleaved,
@@ -218,6 +247,8 @@ private:
     std::mutex paddingWaitMutex_;
     std::condition_variable paddingCv_;
     std::mutex producerMutex_;
+    std::mutex callbackWaitMutex_;
+    std::condition_variable callbackIdleCv_;
     bool initComplete_ = false;
     bool initSucceeded_ = false;
     bool shutdownRequested_ = false;
@@ -226,6 +257,7 @@ private:
     bool lastStartSucceeded_ = false;
     std::wstring initError_;
     std::wstring lastStartError_;
+    std::atomic<bool> faultStopRequested_{false};
 
     IASIO* asioDriver_ = nullptr;
     ASIOBufferInfo bufferInfos_[2]{};
@@ -233,11 +265,14 @@ private:
     ASIOCallbacks callbacks_{};
     bool buffersCreated_ = false;
     bool coInitialized_ = false;
-    std::atomic<std::uint32_t> pendingResetMask_{0};
-
+    std::atomic<bool> driverQuiesceFailed_{false};
     std::atomic<bool> running_{false};
     std::atomic<bool> streamActive_{false};
     std::atomic<bool> prebuffering_{false};
+    std::atomic_flag callbackActive_ = ATOMIC_FLAG_INIT;
+    std::atomic<bool> callbackExecuting_{false};
+    std::atomic<DWORD> callbackThreadId_{0};
+    std::atomic<bool> deferredReentryFault_{false};
 
     WAVEFORMATEXTENSIBLE format_{};
     SourceSampleKind sourceKind_ = SourceSampleKind::Unknown;
@@ -258,11 +293,15 @@ private:
     std::int32_t asioClockSourceIndex_ = -1;
     std::uint32_t prebufferFrames_ = 0;
     std::int32_t prebufferMs_ = 300;
-    std::uint32_t maxBufferOffsetFrames_ = 0;
-    std::int32_t maxBufferOffsetMs_ = 100;
+    std::uint32_t maxBufferAdvanceFrames_ = 0;
+    std::int32_t maxBufferAdvanceMs_ = 100;
     bool paddingActive_ = false;
     RawFrameRingBuffer ringBuffer_;
     std::vector<std::uint8_t> callbackBuffer_;
+    std::array<OutputPageLedger, 2> outputPageLedgers_{};
+    std::uint64_t nextDispatchSequence_ = 1;
+    std::uint64_t nextConfirmSequence_ = 1;
+    bool awaitingFirstBufferSwitch_ = true;
 
     std::atomic<std::int64_t> totalFramesQueued_{0};
     std::atomic<std::int64_t> totalFramesPlayed_{0};
@@ -275,6 +314,10 @@ private:
     std::atomic<std::int64_t> asioLatencyChanges_{0};
     std::atomic<std::int64_t> asioRebuildCount_{0};
     std::atomic<std::int32_t> asioLastMessage_{0};
+    std::atomic<bool> faultRequested_{false};
+    std::atomic<bool> faulted_{false};
+    mutable std::mutex faultMutex_;
+    std::wstring faultMessage_;
     mutable std::mutex silenceStatsMutex_;
     std::array<SilenceBucket, 60> silenceBuckets_{};
 };

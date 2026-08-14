@@ -197,10 +197,10 @@
                        SpinButtonPlacementMode="Inline"
                        ValueChanged="AsioBufferBox_ValueChanged" />
 
-            <NumberBox x:Name="MaxBufferOffsetBox"
+            <NumberBox x:Name="MaxBufferAdvanceBox"
                        Grid.Row="1"
                        Grid.Column="2"
-                       Header="Max buffer offset ms"
+                       Header="Max buffer advance ms"
                        Width="180"
                        Minimum="50"
                        Maximum="10000"
@@ -208,7 +208,7 @@
                        LargeChange="100"
                        Value="100"
                        SpinButtonPlacementMode="Inline"
-                       ValueChanged="MaxBufferOffsetBox_ValueChanged"
+                       ValueChanged="MaxBufferAdvanceBox_ValueChanged"
                        ToolTipService.ToolTip="When buffered audio falls below Prebuffer minus this value, AudioBridge pads the queue with silence to restore the configured Prebuffer." />
 
             <CheckBox x:Name="FakeOutputCheckBox"
@@ -230,7 +230,7 @@
                       IsEnabled="False"
                       PlaceholderText="Driver clock sources unavailable"
                       SelectionChanged="ClockSourceComboBox_SelectionChanged"
-                      ToolTipService.ToolTip="Clock sources reported by the selected ASIO driver. Changing the source safely rebuilds the ASIO stream." />
+                      ToolTipService.ToolTip="Select a driver-reported clock source before opening the target. AudioBridge verifies the source during ASIO initialization." />
         </Grid>
 
         <Grid Grid.Row="1" ColumnSpacing="16">
@@ -289,7 +289,6 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="130" />
@@ -316,8 +315,13 @@
 
                     <TextBlock Grid.Row="2" Text="Underruns" Opacity="0.72" />
                     <TextBlock x:Name="UnderrunText" Grid.Row="2" Grid.Column="1" Text="0" FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="2" Grid.Column="2" Text="Dropped" Opacity="0.72" />
-                    <TextBlock x:Name="DroppedText" Grid.Row="2" Grid.Column="3" Text="0" FontWeight="SemiBold" />
+                    <TextBlock Grid.Row="2" Grid.Column="2" Text="ASIO Clock" Opacity="0.72" />
+                    <TextBlock x:Name="AsioClockText"
+                               Grid.Row="2"
+                               Grid.Column="3"
+                               Text="-"
+                               TextTrimming="CharacterEllipsis"
+                               FontWeight="SemiBold" />
                     <TextBlock Grid.Row="2" Grid.Column="4" Text="Queued / Played" Opacity="0.72" />
                     <TextBlock x:Name="FramesText" Grid.Row="2" Grid.Column="5" Text="0 / 0" FontWeight="SemiBold" />
 
@@ -353,15 +357,6 @@
                     <TextBlock x:Name="AsioRangeText" Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="3" Text="-" FontWeight="SemiBold" />
                     <TextBlock Grid.Row="5" Grid.Column="4" Text="ASIO Events" Opacity="0.72" />
                     <TextBlock x:Name="AsioEventsText" Grid.Row="5" Grid.Column="5" Text="-" FontWeight="SemiBold" />
-
-                    <TextBlock Grid.Row="6" Text="ASIO Clock" Opacity="0.72" />
-                    <TextBlock x:Name="AsioClockText"
-                               Grid.Row="6"
-                               Grid.Column="1"
-                               Grid.ColumnSpan="5"
-                               Text="-"
-                               TextTrimming="CharacterEllipsis"
-                               FontWeight="SemiBold" />
                 </Grid>
 
                 <TextBlock x:Name="LastErrorText"

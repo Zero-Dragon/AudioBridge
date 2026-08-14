@@ -109,7 +109,7 @@ internal static partial class AudioBridgeNative
     internal static extern int ABC_SetPrebufferMs(int prebufferMs);
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int ABC_SetMaxBufferOffsetMs(int maxBufferOffsetMs);
+    internal static extern int ABC_SetMaxBufferAdvanceMs(int maxBufferAdvanceMs);
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int ABC_SelectAudioPid(uint pid);

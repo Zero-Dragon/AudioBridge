@@ -12,11 +12,14 @@
 #include <audiopolicy.h>
 #include <ksmedia.h>
 
+#include "AudioBridgeHookProtocol.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -70,10 +73,22 @@ struct AudioClientState {
     std::uint64_t fakeFrameRemainder = 0;
     LONGLONG fakeLastUpdateQpc = 0;
     LONGLONG fakeNextEventQpc = 0;
+    std::uint64_t streamId = 0;
+    std::uint64_t successfulSubmittedFrames = 0;
+    std::uint64_t pendingSubmittedFrames = 0;
+    std::uint64_t nextPcmSequence = 0;
+    std::uint64_t confirmedCapturedFrames = 0;
+    std::uint64_t lastRawConsumedOutputFrames = 0;
+    LONG managedOutputGeneration = 0;
+    bool hasManagedOutputBaseline = false;
+    bool fakeBridgeManaged = false;
+    bool fakeFaulted = false;
+    bool submissionInFlight = false;
 };
 
 struct RenderClientState {
     IAudioClient* audioClient = nullptr;
+    std::uint64_t streamId = 0;
     BYTE* pendingBuffer = nullptr;
     UINT32 pendingFrames = 0;
     bool lateAttached = false;
@@ -84,53 +99,41 @@ struct RenderClientState {
     ULONGLONG lastActiveLogTick = 0;
     std::uint64_t activeFrames = 0;
     std::uint64_t activeBytes = 0;
+    std::uint64_t successfulSubmittedFrames = 0;
+    std::uint64_t nextPcmSequence = 0;
 };
 
 HMODULE g_module = nullptr;
 #ifndef AUDIOBRIDGE_WASAPI_HOOK_PIPE_NAME
 #define AUDIOBRIDGE_WASAPI_HOOK_PIPE_NAME L"\\\\.\\pipe\\LOCAL\\AudioBridgeWasapiHook"
 #endif
-#ifndef AUDIOBRIDGE_WASAPI_HOOK_CONTROL_MAP_NAME
-#define AUDIOBRIDGE_WASAPI_HOOK_CONTROL_MAP_NAME L"Local\\AudioBridgeWasapiHookControl"
-#endif
-
 #define AUDIOBRIDGE_HOOK_READY_EVENT_PREFIX L"Local\\AudioBridgeHookReady_"
 constexpr wchar_t kPipeName[] = AUDIOBRIDGE_WASAPI_HOOK_PIPE_NAME;
-constexpr wchar_t kControlMapName[] = AUDIOBRIDGE_WASAPI_HOOK_CONTROL_MAP_NAME;
-constexpr DWORD kPipeMagic = 0x48504241;  // ABPH
-constexpr DWORD kPipeText = 1;
-constexpr DWORD kPipeFormat = 2;
-constexpr DWORD kPipePcm = 3;
-constexpr DWORD kPipeFinish = 4;
+constexpr const wchar_t* kControlMapName = audiobridge::hook_protocol::kControlMapName;
+constexpr DWORD kPipeMagic = audiobridge::hook_protocol::kPipeMagic;
+constexpr DWORD kPipeText = audiobridge::hook_protocol::kPipeText;
+constexpr DWORD kPipeFormat = audiobridge::hook_protocol::kPipeFormat;
+constexpr DWORD kPipePcm = audiobridge::hook_protocol::kPipePcm;
+constexpr DWORD kPipeFinish = audiobridge::hook_protocol::kPipeFinish;
+using PipeMessageHeader = audiobridge::hook_protocol::PipeMessageHeader;
+using PipeFormatMessage = audiobridge::hook_protocol::PipeFormatMessage;
+using PipePcmMessage = audiobridge::hook_protocol::PipePcmMessage;
+using HookControlBlock = audiobridge::hook_protocol::HookControlBlock;
+using RendererState = audiobridge::hook_protocol::RendererState;
 
-struct PipeMessageHeader {
-    DWORD magic = kPipeMagic;
-    DWORD type = 0;
-    DWORD pid = 0;
-    DWORD reserved = 0;
-    std::uint64_t payloadBytes = 0;
-};
-
-struct PipeFormatMessage {
-    DWORD formatBytes = sizeof(WAVEFORMATEXTENSIBLE);
-    WAVEFORMATEXTENSIBLE format{};
-    DWORD streamFlags = 0;
-    DWORD shareMode = 0;
-    DWORD periodFrames = 0;
+struct ControlSnapshot {
+    bool valid = false;
+    DWORD lockedPid = 0;
+    bool finish = false;
+    bool fakeOutput = false;
+    RendererState rendererState = RendererState::Idle;
+    LONG streamGeneration = 0;
     std::uint64_t streamId = 0;
-};
-
-struct PipePcmMessage {
-    std::uint64_t streamId = 0;
-};
-
-static_assert(sizeof(PipeFormatMessage) == 64);
-static_assert(sizeof(PipePcmMessage) == 8);
-
-struct HookControlBlock {
-    volatile LONG lockedPid = 0;
-    volatile LONG finish = 0;
-    volatile LONG fakeOutput = 0;
+    std::uint32_t sampleRate = 0;
+    std::uint64_t consumedCapturedFrames = 0;
+    std::uint64_t consumedOutputFrames = 0;
+    std::uint64_t consumedCapturedBaseline = 0;
+    std::uint64_t consumedCapturedOffset = 0;
 };
 
 struct FakeRenderClient {
@@ -170,6 +173,8 @@ struct FakeAudioSessionControl {
 std::mutex g_logMutex;
 std::mutex g_pipeMutex;
 std::mutex g_stateMutex;
+std::mutex g_submissionMutex;
+std::mutex g_controlMutex;
 std::unordered_map<void**, void*> g_patchedSlots;
 std::unordered_set<HMODULE> g_scannedModules;
 std::unordered_map<IAudioClient*, AudioClientState> g_audioClients;
@@ -182,6 +187,7 @@ std::atomic<bool> g_finishCapture{false};
 std::atomic<bool> g_fakeOutput{false};
 std::atomic<std::uint32_t> g_audioClientCount{0};
 std::atomic<std::uint32_t> g_renderClientCount{0};
+std::atomic<std::uint64_t> g_nextStreamId{1};
 thread_local bool g_isBootstrapping = false;
 
 CoCreateInstanceFn g_originalCoCreateInstance = nullptr;
@@ -220,6 +226,104 @@ TimePeriodFn g_timeBeginPeriod = nullptr;
 TimePeriodFn g_timeEndPeriod = nullptr;
 std::atomic<bool> g_timerResolutionActive{false};
 
+void OpenControlMapping();
+
+std::uint64_t AllocateStreamId() {
+    std::uint64_t streamId = g_nextStreamId.fetch_add(1, std::memory_order_relaxed);
+    while (streamId == 0) {
+        streamId = g_nextStreamId.fetch_add(1, std::memory_order_relaxed);
+    }
+    return streamId;
+}
+
+std::uint64_t EnsureAudioStreamIdLocked(AudioClientState& state) {
+    if (state.streamId == 0) {
+        state.streamId = AllocateStreamId();
+    }
+    return state.streamId;
+}
+
+bool ReadControlSnapshot(ControlSnapshot* snapshot) {
+    if (snapshot == nullptr) {
+        return false;
+    }
+    *snapshot = {};
+    OpenControlMapping();
+    const HookControlBlock* control = g_control;
+    if (control == nullptr) {
+        return false;
+    }
+
+    constexpr int kMaxSnapshotAttempts = 16;
+    for (int attempt = 0; attempt < kMaxSnapshotAttempts; ++attempt) {
+        const LONG configBefore = control->configSequence;
+        MemoryBarrier();
+        if ((configBefore & 1) != 0) {
+            YieldProcessor();
+            continue;
+        }
+
+        ControlSnapshot candidate{};
+        candidate.lockedPid = static_cast<DWORD>(control->lockedPid);
+        candidate.finish = control->finish != 0;
+        candidate.fakeOutput = control->fakeOutput != 0;
+        const LONG protocolVersion = control->protocolVersion;
+        const LONG rendererState = control->rendererState;
+        candidate.streamGeneration = control->streamGeneration;
+        const LONG streamIdLow = control->streamIdLow;
+        const LONG streamIdHigh = control->streamIdHigh;
+        candidate.streamId = audiobridge::hook_protocol::JoinCounter(
+                streamIdLow, streamIdHigh);
+        candidate.sampleRate = static_cast<std::uint32_t>(control->sampleRate);
+        MemoryBarrier();
+        const LONG configAfter = control->configSequence;
+        if (configBefore != configAfter || (configAfter & 1) != 0) {
+            continue;
+        }
+
+        const LONG counterBefore = control->counterSequence;
+        MemoryBarrier();
+        if ((counterBefore & 1) != 0) {
+            YieldProcessor();
+            continue;
+        }
+        const LONG capturedLow = control->consumedCapturedLow;
+        const LONG capturedHigh = control->consumedCapturedHigh;
+        const LONG outputLow = control->consumedOutputLow;
+        const LONG outputHigh = control->consumedOutputHigh;
+        const LONG baselineLow = control->consumedCapturedBaselineLow;
+        const LONG baselineHigh = control->consumedCapturedBaselineHigh;
+        const LONG offsetLow = control->consumedCapturedOffsetLow;
+        const LONG offsetHigh = control->consumedCapturedOffsetHigh;
+        MemoryBarrier();
+        const LONG counterAfter = control->counterSequence;
+        const LONG configFinal = control->configSequence;
+        if (counterBefore != counterAfter || (counterAfter & 1) != 0 ||
+            configFinal != configAfter || (configFinal & 1) != 0) {
+            continue;
+        }
+
+        if (protocolVersion != audiobridge::hook_protocol::kControlProtocolVersion ||
+            rendererState < static_cast<LONG>(RendererState::Idle) ||
+            rendererState > static_cast<LONG>(RendererState::Faulted)) {
+            return false;
+        }
+        candidate.rendererState = static_cast<RendererState>(rendererState);
+        candidate.consumedCapturedFrames =
+                audiobridge::hook_protocol::JoinCounter(capturedLow, capturedHigh);
+        candidate.consumedOutputFrames =
+                audiobridge::hook_protocol::JoinCounter(outputLow, outputHigh);
+        candidate.consumedCapturedBaseline =
+                audiobridge::hook_protocol::JoinCounter(baselineLow, baselineHigh);
+        candidate.consumedCapturedOffset =
+                audiobridge::hook_protocol::JoinCounter(offsetLow, offsetHigh);
+        candidate.valid = true;
+        *snapshot = candidate;
+        return true;
+    }
+    return false;
+}
+
 bool EnsurePipeConnectedLocked() {
     if (g_pipe != INVALID_HANDLE_VALUE) {
         return true;
@@ -242,10 +346,13 @@ void ClosePipeLocked() {
     }
 }
 
-void SendPipeMessage(DWORD type, const void* payload, std::uint64_t payloadBytes) {
+bool SendPipeMessage(DWORD type, const void* payload, std::uint64_t payloadBytes) {
+    if (payloadBytes > MAXDWORD) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(g_pipeMutex);
     if (!EnsurePipeConnectedLocked()) {
-        return;
+        return false;
     }
 
     PipeMessageHeader header{};
@@ -267,26 +374,39 @@ void SendPipeMessage(DWORD type, const void* payload, std::uint64_t payloadBytes
     if (!ok) {
         ClosePipeLocked();
     }
+    return ok;
 }
 
-void SendPcmMessage(std::uint64_t streamId,
+bool SendPcmMessage(std::uint64_t streamId,
+                    std::uint64_t sequence,
+                    std::uint64_t submittedFrames,
+                    UINT32 frameCount,
+                    DWORD flags,
                     const void* pcm,
                     std::uint64_t pcmBytes) {
-    if (streamId == 0 || pcm == nullptr || pcmBytes == 0 ||
+    const bool playerSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+    if (streamId == 0 || sequence == 0 || frameCount == 0 ||
+        (!playerSilent && (pcm == nullptr || pcmBytes == 0)) ||
+        (playerSilent && pcmBytes != 0) ||
         pcmBytes > static_cast<std::uint64_t>(MAXDWORD) - sizeof(PipePcmMessage)) {
-        return;
+        return false;
     }
 
     std::lock_guard<std::mutex> lock(g_pipeMutex);
     if (!EnsurePipeConnectedLocked()) {
-        return;
+        return false;
     }
 
     PipeMessageHeader header{};
     header.type = kPipePcm;
     header.pid = GetCurrentProcessId();
     header.payloadBytes = sizeof(PipePcmMessage) + pcmBytes;
-    const PipePcmMessage message{streamId};
+    PipePcmMessage message{};
+    message.streamId = streamId;
+    message.sequence = sequence;
+    message.submittedFrames = submittedFrames;
+    message.frameCount = frameCount;
+    message.flags = flags;
 
     DWORD written = 0;
     bool ok = WriteFile(g_pipe, &header, sizeof(header), &written, nullptr) &&
@@ -295,7 +415,7 @@ void SendPcmMessage(std::uint64_t streamId,
         ok = WriteFile(g_pipe, &message, sizeof(message), &written, nullptr) &&
              written == sizeof(message);
     }
-    if (ok) {
+    if (ok && pcmBytes > 0) {
         ok = WriteFile(g_pipe,
                        pcm,
                        static_cast<DWORD>(pcmBytes),
@@ -306,6 +426,7 @@ void SendPcmMessage(std::uint64_t streamId,
     if (!ok) {
         ClosePipeLocked();
     }
+    return ok;
 }
 
 void Log(const char* format, ...) {
@@ -445,7 +566,98 @@ std::uint64_t QpcToHns(LONGLONG qpc) {
             ((ticks % frequency) * 10000000ull) / frequency;
 }
 
+bool ApplyAuthoritativeProgressLocked(AudioClientState& state) {
+    ControlSnapshot snapshot{};
+    const bool hasSnapshot = ReadControlSnapshot(&snapshot);
+    const bool selectedProcess = hasSnapshot && snapshot.valid &&
+            snapshot.lockedPid == GetCurrentProcessId();
+    if (selectedProcess && snapshot.rendererState == RendererState::Faulted &&
+        state.fakeOutput) {
+        // Faulted describes the selected PID's whole renderer pipeline. It can
+        // be published before Core has a usable stream id (for example after a
+        // missing format), so every fake client in that PID must fail closed.
+        state.fakeFaulted = true;
+        return true;
+    }
+
+    const bool matchesStream = selectedProcess &&
+            snapshot.streamId != 0 && snapshot.streamId == state.streamId;
+
+    if (!matchesStream) {
+        // Once Core has taken custody of this stream, loss of a matching
+        // snapshot must freeze it rather than falling back to synthetic time.
+        return state.fakeBridgeManaged;
+    }
+
+    state.fakeBridgeManaged = true;
+    if (snapshot.rendererState != RendererState::Running) {
+        // Idle and Reconfiguring both preserve the last confirmed progress.
+        return true;
+    }
+
+    if (snapshot.consumedCapturedFrames < snapshot.consumedCapturedBaseline) {
+        state.fakeFaulted = true;
+        return true;
+    }
+    const std::uint64_t generationConsumed =
+            snapshot.consumedCapturedFrames - snapshot.consumedCapturedBaseline;
+    if (generationConsumed >
+        (std::numeric_limits<std::uint64_t>::max)() -
+                snapshot.consumedCapturedOffset) {
+        state.fakeFaulted = true;
+        return true;
+    }
+    const std::uint64_t confirmedCaptured =
+            snapshot.consumedCapturedOffset + generationConsumed;
+    const std::uint64_t submittedCeiling = state.submissionInFlight
+            ? state.pendingSubmittedFrames
+            : state.successfulSubmittedFrames;
+    if (confirmedCaptured < state.confirmedCapturedFrames ||
+        confirmedCaptured > submittedCeiling) {
+        state.fakeFaulted = true;
+        return true;
+    }
+
+    state.confirmedCapturedFrames = confirmedCaptured;
+    if (confirmedCaptured <= state.successfulSubmittedFrames) {
+        state.fakeQueuedFrames = state.successfulSubmittedFrames - confirmedCaptured;
+    }
+    if (state.fakeQueuedFrames > state.fakeBufferFrames) {
+        state.fakeFaulted = true;
+        return true;
+    }
+
+    if (!state.hasManagedOutputBaseline ||
+        state.managedOutputGeneration != snapshot.streamGeneration) {
+        // Core resets the raw renderer counter when ASIO is rebuilt. A new
+        // generation establishes a baseline; it must never move the client's
+        // already-published IAudioClock position backwards or invent a jump.
+        state.lastRawConsumedOutputFrames = snapshot.consumedOutputFrames;
+        state.managedOutputGeneration = snapshot.streamGeneration;
+        state.hasManagedOutputBaseline = true;
+    } else if (snapshot.consumedOutputFrames < state.lastRawConsumedOutputFrames) {
+        state.fakeFaulted = true;
+        return true;
+    } else {
+        const std::uint64_t outputDelta =
+                snapshot.consumedOutputFrames - state.lastRawConsumedOutputFrames;
+        if (state.fakeStarted) {
+            if (outputDelta > (std::numeric_limits<std::uint64_t>::max)() -
+                                      state.fakeDevicePosition) {
+                state.fakeFaulted = true;
+                return true;
+            }
+            state.fakeDevicePosition += outputDelta;
+        }
+        state.lastRawConsumedOutputFrames = snapshot.consumedOutputFrames;
+    }
+    return true;
+}
+
 void AdvanceFakePlaybackLocked(AudioClientState& state, LONGLONG nowQpc) {
+    if (ApplyAuthoritativeProgressLocked(state)) {
+        return;
+    }
     if (!state.fakeStarted) {
         state.fakeLastUpdateQpc = 0;
         return;
@@ -596,12 +808,13 @@ PcmBufferStats InspectPcmBuffer(const BYTE* data, std::uint64_t byteCount) {
     return stats;
 }
 
-void LogWaveFormat(const char* source,
+bool LogWaveFormat(const char* source,
                    const void* client,
                    const WAVEFORMATEX* format,
                    AUDCLNT_SHAREMODE shareMode,
                    DWORD streamFlags,
-                   UINT32 periodInFrames) {
+                   UINT32 periodInFrames,
+                   std::uint64_t streamId) {
     if (format == nullptr) {
         Log("%s client=%p format=null shareMode=%u flags=0x%08lX periodFrames=%u",
             source,
@@ -609,7 +822,7 @@ void LogWaveFormat(const char* source,
             static_cast<unsigned>(shareMode),
             streamFlags,
             periodInFrames);
-        return;
+        return false;
     }
 
     const bool extensible =
@@ -663,9 +876,8 @@ void LogWaveFormat(const char* source,
     message.streamFlags = streamFlags;
     message.shareMode = static_cast<DWORD>(shareMode);
     message.periodFrames = periodInFrames;
-    message.streamId = static_cast<std::uint64_t>(
-            reinterpret_cast<std::uintptr_t>(client));
-    SendPipeMessage(kPipeFormat, &message, sizeof(message));
+    message.streamId = streamId;
+    return SendPipeMessage(kPipeFormat, &message, sizeof(message));
 }
 
 void CopyWaveFormat(const WAVEFORMATEX* source, AudioClientState* state) {
@@ -718,6 +930,8 @@ void StoreFakeInitialization(IAudioClient* client,
 
     std::lock_guard<std::mutex> lock(g_stateMutex);
     auto& state = g_audioClients[client];
+    const bool existingFault = state.fakeFaulted;
+    EnsureAudioStreamIdLocked(state);
     CopyWaveFormat(format, &state);
     if (!state.hasFormat) {
         state.format = DefaultMixFormat();
@@ -742,6 +956,16 @@ void StoreFakeInitialization(IAudioClient* client,
     state.fakeFrameRemainder = 0;
     state.fakeLastUpdateQpc = 0;
     state.fakeNextEventQpc = 0;
+    state.successfulSubmittedFrames = 0;
+    state.pendingSubmittedFrames = 0;
+    state.nextPcmSequence = 0;
+    state.confirmedCapturedFrames = 0;
+    state.lastRawConsumedOutputFrames = 0;
+    state.managedOutputGeneration = 0;
+    state.hasManagedOutputBaseline = false;
+    state.fakeBridgeManaged = false;
+    state.fakeFaulted = existingFault;
+    state.submissionInFlight = false;
 }
 
 bool PatchPointer(void** slot, void* hook, void** original) {
@@ -843,22 +1067,32 @@ bool RegisterAudioClient(IAudioClient* client) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_stateMutex);
-    return g_audioClients.try_emplace(client).second;
+    auto [it, inserted] = g_audioClients.try_emplace(client);
+    EnsureAudioStreamIdLocked(it->second);
+    return inserted;
 }
 
 bool RegisterRenderClient(IAudioRenderClient* renderClient, IAudioClient* audioClient) {
     std::lock_guard<std::mutex> lock(g_stateMutex);
     auto [it, inserted] = g_renderClients.try_emplace(renderClient);
     it->second.audioClient = audioClient;
+    if (audioClient != nullptr) {
+        auto& audioState = g_audioClients[audioClient];
+        it->second.streamId = EnsureAudioStreamIdLocked(audioState);
+    } else if (it->second.streamId == 0) {
+        it->second.streamId = AllocateStreamId();
+    }
     return inserted;
 }
 
 struct CaptureResult {
     BYTE* data = nullptr;
     std::uint64_t bytes = 0;
+    bool fakeDeviceInvalidated = false;
 };
 
 CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount, DWORD flags) {
+    std::lock_guard<std::mutex> submissionLock(g_submissionMutex);
     RenderClientState renderState{};
     AudioClientState audioState{};
     bool shouldLogPcm = false;
@@ -868,6 +1102,8 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
     std::uint64_t activeFrames = 0;
     std::uint64_t activeBytes = 0;
     std::uint64_t bytes = 0;
+    bool hasReleaseState = false;
+    bool fakeOutput = false;
     const ULONGLONG now = GetTickCount64();
     const LONGLONG nowQpc = QpcNow();
 
@@ -876,6 +1112,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
         auto renderIt = g_renderClients.find(self);
         if (renderIt != g_renderClients.end()) {
             renderState = renderIt->second;
+            hasReleaseState = frameCount <= renderState.pendingFrames;
             if (!renderIt->second.loggedPcm &&
                 renderState.pendingBuffer != nullptr &&
                 frameCount > 0 &&
@@ -887,20 +1124,14 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             auto audioIt = g_audioClients.find(renderState.audioClient);
             if (audioIt != g_audioClients.end()) {
                 auto& state = audioIt->second;
+                renderState.streamId = EnsureAudioStreamIdLocked(state);
+                renderIt->second.streamId = renderState.streamId;
+                fakeOutput = state.fakeOutput;
                 if (state.fakeOutput) {
                     AdvanceFakePlaybackLocked(state, nowQpc);
                     state.fakeReservedFrames -=
                             (std::min<std::uint64_t>)(state.fakeReservedFrames,
                                                       renderState.pendingFrames);
-                    if (frameCount > 0) {
-                        const auto queued =
-                                (std::min<std::uint64_t>)(state.fakeQueuedFrames,
-                                                          state.fakeBufferFrames);
-                        const auto available =
-                                static_cast<std::uint64_t>(state.fakeBufferFrames) - queued;
-                        state.fakeQueuedFrames +=
-                                (std::min<std::uint64_t>)(frameCount, available);
-                    }
                 }
                 audioState = state;
             } else if (renderState.lateAttached && g_bootstrapAudioState.hasFormat) {
@@ -913,6 +1144,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
 
             const bool hasPcm =
                     renderState.pendingBuffer != nullptr &&
+                    hasReleaseState &&
                     frameCount > 0 &&
                     (flags & AUDCLNT_BUFFERFLAGS_SILENT) == 0 &&
                     audioState.hasFormat;
@@ -947,26 +1179,128 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
     }
 
     if (shouldAnnounceFallbackFormat) {
-        LogWaveFormat("Late-attached IAudioRenderClient fallback format",
-                      self,
-                      &audioState.format.Format,
-                      audioState.shareMode,
-                      audioState.streamFlags,
-                      0);
+        if (!LogWaveFormat("Late-attached IAudioRenderClient fallback format",
+                           self,
+                           &audioState.format.Format,
+                           audioState.shareMode,
+                           audioState.streamFlags,
+                           0,
+                           renderState.streamId)) {
+            Log("Late-attached format message could not be delivered. render=%p stream=%llu",
+                self,
+                static_cast<unsigned long long>(renderState.streamId));
+        }
     }
 
     const PcmBufferStats stats = InspectPcmBuffer(renderState.pendingBuffer, bytes);
-    const bool captureEnabled =
-            g_lockedAudioPid.load() == GetCurrentProcessId() &&
-            !g_finishCapture.load();
-    if (captureEnabled && bytes > 0 && audioState.hasFormat) {
-        const void* streamClient = renderState.audioClient != nullptr
-                ? static_cast<const void*>(renderState.audioClient)
-                : static_cast<const void*>(self);
-        SendPcmMessage(static_cast<std::uint64_t>(
-                               reinterpret_cast<std::uintptr_t>(streamClient)),
-                       renderState.pendingBuffer,
-                       bytes);
+    ControlSnapshot control{};
+    const bool hasControl = ReadControlSnapshot(&control);
+    const DWORD currentPid = GetCurrentProcessId();
+    const bool captureEnabled = hasControl
+            ? control.lockedPid == currentPid && !control.finish
+            : g_lockedAudioPid.load() == currentPid && !g_finishCapture.load();
+    const bool feedbackMatches = hasControl && control.valid &&
+            control.lockedPid == currentPid &&
+            control.streamId != 0 && control.streamId == renderState.streamId;
+    const bool pipelineFaulted = hasControl && control.valid &&
+            control.lockedPid == currentPid &&
+            control.rendererState == RendererState::Faulted;
+    const bool playerSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+
+    std::uint64_t currentSubmittedFrames = audioState.successfulSubmittedFrames;
+    std::uint64_t currentSequence = audioState.nextPcmSequence;
+    if (renderState.audioClient == nullptr) {
+        currentSubmittedFrames = renderState.successfulSubmittedFrames;
+        currentSequence = renderState.nextPcmSequence;
+    }
+    const bool submittedOverflow = frameCount >
+            (std::numeric_limits<std::uint64_t>::max)() - currentSubmittedFrames;
+    const std::uint64_t nextSubmittedFrames = submittedOverflow
+            ? currentSubmittedFrames
+            : currentSubmittedFrames + frameCount;
+    const bool sequenceOverflow = currentSequence ==
+            (std::numeric_limits<std::uint64_t>::max)();
+    const std::uint64_t nextSequence = sequenceOverflow ? 0 : currentSequence + 1;
+
+    bool sendAttempted = false;
+    bool sendSucceeded = false;
+    const bool canSend = captureEnabled && frameCount > 0 && hasReleaseState &&
+            audioState.hasFormat && renderState.streamId != 0 &&
+            !audioState.fakeFaulted && !pipelineFaulted &&
+            !submittedOverflow && !sequenceOverflow;
+    if (canSend && fakeOutput && renderState.audioClient != nullptr) {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto audioIt = g_audioClients.find(renderState.audioClient);
+        if (audioIt != g_audioClients.end()) {
+            audioIt->second.pendingSubmittedFrames = nextSubmittedFrames;
+            audioIt->second.submissionInFlight = true;
+        }
+    }
+    if (canSend) {
+        sendAttempted = true;
+        sendSucceeded = SendPcmMessage(renderState.streamId,
+                                       nextSequence,
+                                       nextSubmittedFrames,
+                                       frameCount,
+                                       flags,
+                                       playerSilent ? nullptr : renderState.pendingBuffer,
+                                       playerSilent ? 0 : bytes);
+    }
+
+    bool fakeDeviceInvalidated = false;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        auto renderIt = g_renderClients.find(self);
+        auto audioIt = renderState.audioClient != nullptr
+                ? g_audioClients.find(renderState.audioClient)
+                : g_audioClients.end();
+        if (audioIt != g_audioClients.end()) {
+            auto& state = audioIt->second;
+            state.submissionInFlight = false;
+            const bool authoritativeStream = state.fakeBridgeManaged || feedbackMatches;
+            if (feedbackMatches) {
+                state.fakeBridgeManaged = true;
+            }
+            if (state.fakeOutput &&
+                (state.fakeFaulted || submittedOverflow || sequenceOverflow ||
+                 pipelineFaulted ||
+                 (authoritativeStream && captureEnabled && frameCount > 0 &&
+                  (!sendAttempted || !sendSucceeded)))) {
+                state.fakeFaulted = true;
+                fakeDeviceInvalidated = true;
+            } else if (state.fakeOutput && hasReleaseState) {
+                if (sendSucceeded) {
+                    state.successfulSubmittedFrames = nextSubmittedFrames;
+                    state.nextPcmSequence = nextSequence;
+                }
+                if (state.fakeBridgeManaged) {
+                    if (state.confirmedCapturedFrames > state.successfulSubmittedFrames) {
+                        state.fakeFaulted = true;
+                        fakeDeviceInvalidated = true;
+                    } else {
+                        state.fakeQueuedFrames = state.successfulSubmittedFrames -
+                                state.confirmedCapturedFrames;
+                    }
+                } else if (frameCount > 0) {
+                    state.fakeQueuedFrames += frameCount;
+                }
+            } else if (!state.fakeOutput && sendSucceeded) {
+                state.successfulSubmittedFrames = nextSubmittedFrames;
+                state.nextPcmSequence = nextSequence;
+            }
+            state.pendingSubmittedFrames = state.successfulSubmittedFrames;
+            audioState = state;
+        } else if (renderIt != g_renderClients.end()) {
+            if (sendSucceeded) {
+                renderIt->second.successfulSubmittedFrames = nextSubmittedFrames;
+                renderIt->second.nextPcmSequence = nextSequence;
+            }
+            renderState.successfulSubmittedFrames =
+                    renderIt->second.successfulSubmittedFrames;
+            renderState.nextPcmSequence = renderIt->second.nextPcmSequence;
+        } else if (fakeOutput) {
+            fakeDeviceInvalidated = true;
+        }
     }
     if (shouldLogPcm) {
         Log("PCM captured once. render=%p audio=%p frames=%u bytes=%llu sampleRate=%u channels=%u bits=%u blockAlign=%u sampleType=%s formatSource=%s inspectedBytes=%llu nonZeroBytes=%llu checksum=0x%08X formatTag=0x%04X renderClients=%u audioClients=%u fakeOutput=%s",
@@ -1013,7 +1347,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             audioState.fakeOutput ? "on" : "off");
     }
 
-    return {renderState.pendingBuffer, bytes};
+    return {renderState.pendingBuffer, bytes, fakeDeviceInvalidated};
 }
 
 HRESULT STDMETHODCALLTYPE FakeRenderQueryInterface(IAudioRenderClient* self, REFIID iid, void** out) {
@@ -1084,6 +1418,7 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
     AudioClientState audioState{};
     UINT32 availableFrames = 0;
     bool initialized = false;
+    bool faulted = false;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         const auto audioIt = g_audioClients.find(fake->audioClient);
@@ -1092,8 +1427,9 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
             initialized = state.fakeInitialized && state.hasFormat;
             if (initialized) {
                 AdvanceFakePlaybackLocked(state, QpcNow());
-                availableFrames = FakeAvailableFramesLocked(state);
-                if (frameCount <= availableFrames) {
+                faulted = state.fakeFaulted;
+                availableFrames = faulted ? 0 : FakeAvailableFramesLocked(state);
+                if (!faulted && frameCount <= availableFrames) {
                     state.fakeReservedFrames += frameCount;
                 }
                 audioState = state;
@@ -1107,6 +1443,9 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
             fake->audioClient,
             frameCount);
         return AUDCLNT_E_NOT_INITIALIZED;
+    }
+    if (faulted) {
+        return AUDCLNT_E_DEVICE_INVALIDATED;
     }
     if (frameCount > availableFrames) {
         Log("Fake output GetBuffer request exceeds available frames. render=%p audio=%p requested=%u available=%u",
@@ -1178,8 +1517,16 @@ HRESULT STDMETHODCALLTYPE FakeRenderReleaseBuffer(IAudioRenderClient* self, UINT
         return AUDCLNT_E_INVALID_SIZE;
     }
     fake->bufferOutstanding = false;
-    CaptureReleasedBuffer(self, frameCount, flags);
+    const CaptureResult capture = CaptureReleasedBuffer(self, frameCount, flags);
     fake->requestedFrames = 0;
+    if (capture.fakeDeviceInvalidated) {
+        Log("Fake output ReleaseBuffer invalidated after bridge submission failure. render=%p audio=%p frames=%u flags=0x%08lX",
+            self,
+            fake->audioClient,
+            frameCount,
+            flags);
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+    }
     return S_OK;
 }
 
@@ -1239,6 +1586,9 @@ HRESULT STDMETHODCALLTYPE FakeClockGetPosition(IAudioClock* self, UINT64* positi
             return AUDCLNT_E_NOT_INITIALIZED;
         }
         AdvanceFakePlaybackLocked(audioIt->second, nowQpc);
+        if (audioIt->second.fakeFaulted) {
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
         *position = audioIt->second.fakeDevicePosition;
     }
     if (qpcPosition != nullptr) {
@@ -1701,13 +2051,26 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
                                 bufferDuration,
                                 periodicity,
                                 0);
-        const AudioClientState state = SnapshotAudioClient(self);
-        LogWaveFormat("Fake IAudioClient::Initialize",
-                      self,
-                      format,
-                      shareMode,
-                      streamFlags,
-                      state.fakePeriodFrames);
+        AudioClientState state = SnapshotAudioClient(self);
+        if (state.fakeFaulted) {
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
+        if (!LogWaveFormat("Fake IAudioClient::Initialize",
+                           self,
+                           format,
+                           shareMode,
+                           streamFlags,
+                           state.fakePeriodFrames,
+                           state.streamId)) {
+            {
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                g_audioClients[self].fakeFaulted = true;
+            }
+            Log("Fake output Initialize invalidated because the format message could not be delivered. audio=%p stream=%llu",
+                self,
+                static_cast<unsigned long long>(state.streamId));
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
         Log("Fake output accepted IAudioClient::Initialize. audio=%p shareMode=%u flags=0x%08lX bufferHns=%lld periodicityHns=%lld fakeBufferFrames=%u fakePeriodFrames=%u",
             self,
             static_cast<unsigned>(shareMode),
@@ -1725,17 +2088,24 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
+            EnsureAudioStreamIdLocked(state);
             CopyWaveFormat(format, &state);
             state.shareMode = shareMode;
             state.streamFlags = streamFlags;
         }
 
-        LogWaveFormat("IAudioClient::Initialize",
-                      self,
-                      format,
-                      shareMode,
-                      streamFlags,
-                      0);
+        const AudioClientState state = SnapshotAudioClient(self);
+        if (!LogWaveFormat("IAudioClient::Initialize",
+                           self,
+                           format,
+                           shareMode,
+                           streamFlags,
+                           0,
+                           state.streamId)) {
+            Log("IAudioClient format message could not be delivered. audio=%p stream=%llu",
+                self,
+                static_cast<unsigned long long>(state.streamId));
+        }
     }
     return hr;
 }
@@ -1758,13 +2128,26 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                                 0,
                                 0,
                                 periodInFrames);
-        const AudioClientState state = SnapshotAudioClient(audioClient);
-        LogWaveFormat("Fake IAudioClient3::InitializeSharedAudioStream",
-                      audioClient,
-                      format,
-                      AUDCLNT_SHAREMODE_SHARED,
-                      streamFlags,
-                      periodInFrames);
+        AudioClientState state = SnapshotAudioClient(audioClient);
+        if (state.fakeFaulted) {
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
+        if (!LogWaveFormat("Fake IAudioClient3::InitializeSharedAudioStream",
+                           audioClient,
+                           format,
+                           AUDCLNT_SHAREMODE_SHARED,
+                           streamFlags,
+                           periodInFrames,
+                           state.streamId)) {
+            {
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                g_audioClients[audioClient].fakeFaulted = true;
+            }
+            Log("Fake output InitializeSharedAudioStream invalidated because the format message could not be delivered. audio=%p stream=%llu",
+                audioClient,
+                static_cast<unsigned long long>(state.streamId));
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
         Log("Fake output accepted IAudioClient3::InitializeSharedAudioStream. audio=%p flags=0x%08lX requestedPeriodFrames=%u fakeBufferFrames=%u fakePeriodFrames=%u",
             audioClient,
             streamFlags,
@@ -1783,17 +2166,24 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[audioClient];
+            EnsureAudioStreamIdLocked(state);
             CopyWaveFormat(format, &state);
             state.shareMode = AUDCLNT_SHAREMODE_SHARED;
             state.streamFlags = streamFlags;
         }
 
-        LogWaveFormat("IAudioClient3::InitializeSharedAudioStream",
-                      audioClient,
-                      format,
-                      AUDCLNT_SHAREMODE_SHARED,
-                      streamFlags,
-                      periodInFrames);
+        const AudioClientState state = SnapshotAudioClient(audioClient);
+        if (!LogWaveFormat("IAudioClient3::InitializeSharedAudioStream",
+                           audioClient,
+                           format,
+                           AUDCLNT_SHAREMODE_SHARED,
+                           streamFlags,
+                           periodInFrames,
+                           state.streamId)) {
+            Log("IAudioClient3 format message could not be delivered. audio=%p stream=%llu",
+                audioClient,
+                static_cast<unsigned long long>(state.streamId));
+        }
     }
     return hr;
 }
@@ -1958,21 +2348,29 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentPadding(IAudioClient* self, UINT32* padd
             return E_POINTER;
         }
         bool initialized = false;
+        bool faulted = false;
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             const auto audioIt = g_audioClients.find(self);
             if (audioIt != g_audioClients.end() && audioIt->second.fakeInitialized) {
                 auto& state = audioIt->second;
                 AdvanceFakePlaybackLocked(state, QpcNow());
-                *paddingFrames = static_cast<UINT32>(
-                        (std::min<std::uint64_t>)(state.fakeQueuedFrames,
-                                                  state.fakeBufferFrames));
+                faulted = state.fakeFaulted;
+                if (!faulted) {
+                    // Managed streams are driven exclusively by Core's
+                    // confirmed captured-frame counter. Probe streams retain
+                    // the legacy QPC-backed queue maintained above.
+                    *paddingFrames = static_cast<UINT32>(state.fakeQueuedFrames);
+                }
                 initialized = true;
             }
         }
         if (!initialized) {
             Log("Fake output GetCurrentPadding before Initialize. audio=%p", self);
             return AUDCLNT_E_NOT_INITIALIZED;
+        }
+        if (faulted) {
+            return AUDCLNT_E_DEVICE_INVALIDATED;
         }
         return S_OK;
     }
@@ -2052,6 +2450,10 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
                 Log("Fake output Start before Initialize. audio=%p", self);
                 return AUDCLNT_E_NOT_INITIALIZED;
             }
+            AdvanceFakePlaybackLocked(state, QpcNow());
+            if (state.fakeFaulted) {
+                return AUDCLNT_E_DEVICE_INVALIDATED;
+            }
             if (!state.fakeStarted) {
                 const LONGLONG nowQpc = QpcNow();
                 state.fakeStarted = true;
@@ -2074,6 +2476,9 @@ HRESULT STDMETHODCALLTYPE HookStop(IAudioClient* self) {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
             AdvanceFakePlaybackLocked(state, QpcNow());
+            if (state.fakeFaulted) {
+                return AUDCLNT_E_DEVICE_INVALIDATED;
+            }
             state.fakeStarted = false;
             state.fakeLastUpdateQpc = 0;
             state.fakeNextEventQpc = 0;
@@ -2091,6 +2496,9 @@ HRESULT STDMETHODCALLTYPE HookReset(IAudioClient* self) {
             auto& state = g_audioClients[self];
             const LONGLONG nowQpc = QpcNow();
             AdvanceFakePlaybackLocked(state, nowQpc);
+            if (state.fakeFaulted) {
+                return AUDCLNT_E_DEVICE_INVALIDATED;
+            }
             state.fakeDevicePosition = 0;
             state.fakeQueuedFrames = 0;
             state.fakeReservedFrames = 0;
@@ -2201,6 +2609,7 @@ HRESULT STDMETHODCALLTYPE HookGetBuffer(IAudioRenderClient* self, UINT32 frameCo
             auto& state = it->second;
             if (inserted) {
                 state.lateAttached = true;
+                state.streamId = AllocateStreamId();
                 lateAttached = true;
             }
             state.pendingBuffer = *data;
@@ -2662,6 +3071,7 @@ void CheckPcmInactive() {
 }
 
 void OpenControlMapping() {
+    std::lock_guard<std::mutex> lock(g_controlMutex);
     if (g_control != nullptr) {
         return;
     }
@@ -2672,6 +3082,10 @@ void OpenControlMapping() {
     }
     g_control = static_cast<HookControlBlock*>(
             MapViewOfFile(g_controlMapping, FILE_MAP_READ, 0, 0, sizeof(HookControlBlock)));
+    if (g_control == nullptr) {
+        CloseHandle(g_controlMapping);
+        g_controlMapping = nullptr;
+    }
 }
 
 void EnableFakeTimerResolution() {
@@ -2718,9 +3132,9 @@ void SetFakeOutputFromControl(bool fakeOutput) {
 }
 
 bool FakeOutputEnabled() {
-    OpenControlMapping();
-    if (g_control != nullptr) {
-        SetFakeOutputFromControl(g_control->fakeOutput != 0);
+    ControlSnapshot snapshot{};
+    if (ReadControlSnapshot(&snapshot)) {
+        SetFakeOutputFromControl(snapshot.fakeOutput);
     }
     return g_fakeOutput.load();
 }
@@ -2734,6 +3148,7 @@ void PumpFakeEvents() {
             auto& state = item.second;
             AdvanceFakePlaybackLocked(state, now);
             if (state.fakeOutput &&
+                !state.fakeFaulted &&
                 state.fakeStarted &&
                 state.fakeEvent != nullptr &&
                 FakeEventReadyLocked(state) &&
@@ -2756,14 +3171,14 @@ void PumpFakeEvents() {
 }
 
 void ApplyControlBlock() {
-    OpenControlMapping();
-    if (g_control == nullptr) {
+    ControlSnapshot snapshot{};
+    if (!ReadControlSnapshot(&snapshot)) {
         return;
     }
 
-    const DWORD lockedPid = static_cast<DWORD>(g_control->lockedPid);
-    const bool finishCapture = g_control->finish != 0;
-    SetFakeOutputFromControl(g_control->fakeOutput != 0);
+    const DWORD lockedPid = snapshot.lockedPid;
+    const bool finishCapture = snapshot.finish;
+    SetFakeOutputFromControl(snapshot.fakeOutput);
     g_lockedAudioPid = lockedPid;
     if (finishCapture && !g_finishCapture.exchange(true)) {
         SendPipeMessage(kPipeFinish, nullptr, 0);

@@ -98,8 +98,8 @@ ABC_API void ABC_CALL ABC_Stop(void);
 ABC_API int32_t ABC_CALL ABC_SetOutputDevice(const wchar_t* outputDeviceId);
 ABC_API int32_t ABC_CALL ABC_SetPrebufferMs(int32_t prebufferMs);
 ABC_API int32_t ABC_CALL ABC_GetPrebufferMs(void);
-ABC_API int32_t ABC_CALL ABC_SetMaxBufferOffsetMs(int32_t maxBufferOffsetMs);
-ABC_API int32_t ABC_CALL ABC_GetMaxBufferOffsetMs(void);
+ABC_API int32_t ABC_CALL ABC_SetMaxBufferAdvanceMs(int32_t maxBufferAdvanceMs);
+ABC_API int32_t ABC_CALL ABC_GetMaxBufferAdvanceMs(void);
 ABC_API int32_t ABC_CALL ABC_SelectAudioPid(uint32_t pid);
 
 ABC_API int32_t ABC_CALL ABC_RefreshDevices(void);
