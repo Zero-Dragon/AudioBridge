@@ -466,7 +466,6 @@ public sealed partial class MainWindow : Window
         CapacityText.Text = $"{status.BufferCapacityMs} ms";
         SilentPercentText.Text = $"{status.RecentSilentPercent:F2}%";
         UnderrunText.Text = status.UnderrunCount.ToString("N0");
-        DroppedText.Text = status.TotalFramesDropped.ToString("N0");
         FramesText.Text = $"{status.TotalFramesQueued:N0} / {status.TotalFramesPlayed:N0}";
         AsioBufferText.Text = status.AsioActualBufferFrames > 0
             ? $"{status.AsioActualBufferFrames:N0} frames (req {AsioRequestedText(status.AsioRequestedBufferFrames)})"
@@ -493,6 +492,11 @@ public sealed partial class MainWindow : Window
         BufferProgress.Value = bufferPercent;
         SilentProgress.Value = Math.Clamp(status.RecentSilentPercent, 0.0, 100.0);
 
+        if (status.StreamActive < 0)
+        {
+            LastErrorText.Text = AudioBridgeNative.LastError();
+        }
+
         if (status.Running == 0)
         {
             OpenButton.IsEnabled = true;
@@ -505,6 +509,10 @@ public sealed partial class MainWindow : Window
         if (status.Running == 0)
         {
             return "Idle";
+        }
+        if (status.StreamActive < 0)
+        {
+            return "Audio Fault";
         }
         if (status.Prebuffering != 0)
         {

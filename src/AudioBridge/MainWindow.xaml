@@ -302,8 +302,6 @@
 
                     <TextBlock Grid.Row="2" Text="Underruns" Opacity="0.72" />
                     <TextBlock x:Name="UnderrunText" Grid.Row="2" Grid.Column="1" Text="0" FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="2" Grid.Column="2" Text="Dropped" Opacity="0.72" />
-                    <TextBlock x:Name="DroppedText" Grid.Row="2" Grid.Column="3" Text="0" FontWeight="SemiBold" />
                     <TextBlock Grid.Row="2" Grid.Column="4" Text="Queued / Played" Opacity="0.72" />
                     <TextBlock x:Name="FramesText" Grid.Row="2" Grid.Column="5" Text="0 / 0" FontWeight="SemiBold" />
 

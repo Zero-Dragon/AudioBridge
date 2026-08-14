@@ -1,6 +1,7 @@
 #include "AudioBridgeCore.h"
 
 #include "AsioRenderer.h"
+#include "../../AudioBridgeHookShared/AudioBridgeHookProtocol.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -31,6 +32,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -44,14 +46,8 @@ namespace audiobridge {
 namespace {
 
 constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\LOCAL\\AudioBridgeWasapiHook";
-constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControl";
 constexpr wchar_t kHookReadyEventPrefix[] = L"Local\\AudioBridgeHookReady_";
 constexpr DWORD kHookReadyTimeoutMs = 5000;
-constexpr DWORD kPipeMagic = 0x48504241;  // ABPH
-constexpr DWORD kPipeText = 1;
-constexpr DWORD kPipeFormat = 2;
-constexpr DWORD kPipePcm = 3;
-constexpr DWORD kPipeFinish = 4;
 
 constexpr int32_t kOk = 0;
 constexpr int32_t kError = -1;
@@ -69,35 +65,11 @@ constexpr REGSAM kAsioRegistryView = KEY_WOW64_64KEY;
 constexpr REGSAM kAsioRegistryView = KEY_WOW64_32KEY;
 #endif
 
-struct PipeMessageHeader {
-    DWORD magic = kPipeMagic;
-    DWORD type = 0;
-    DWORD pid = 0;
-    DWORD reserved = 0;
-    std::uint64_t payloadBytes = 0;
-};
-
-struct PipeFormatMessage {
-    DWORD formatBytes = sizeof(WAVEFORMATEXTENSIBLE);
-    WAVEFORMATEXTENSIBLE format{};
-    DWORD streamFlags = 0;
-    DWORD shareMode = 0;
-    DWORD periodFrames = 0;
-    std::uint64_t streamId = 0;
-};
-
-struct PipePcmMessage {
-    std::uint64_t streamId = 0;
-};
-
-static_assert(sizeof(PipeFormatMessage) == 64);
-static_assert(sizeof(PipePcmMessage) == 8);
-
-struct HookControlBlock {
-    volatile LONG lockedPid = 0;
-    volatile LONG finish = 0;
-    volatile LONG fakeOutput = 0;
-};
+using hook_protocol::HookControlBlock;
+using hook_protocol::PipeFormatMessage;
+using hook_protocol::PipeMessageHeader;
+using hook_protocol::PipePcmMessage;
+using hook_protocol::RendererState;
 
 struct DeviceInfo {
     std::wstring id;
@@ -111,6 +83,8 @@ struct AudioStreamState {
     std::uint64_t lastFormatMs = 0;
     std::uint64_t lastPcmMs = 0;
     std::uint64_t formatSequence = 0;
+    std::uint64_t nextPcmSequence = 1;
+    std::uint64_t submittedFrames = 0;
 };
 
 struct AudioPidState {
@@ -1067,7 +1041,17 @@ public:
 private:
     void SetLastErrorLocked(const std::wstring& error);
     void Log(const wchar_t* format, ...);
+    void InitializeControlState();
     void WriteControlState(std::uint32_t audioPid, bool finish);
+    void PublishRendererRoute(std::uint64_t streamId,
+                              std::uint32_t sampleRate,
+                              std::uint64_t consumedBaseline,
+                              std::uint64_t consumedOffset,
+                              RendererState state);
+    void PublishRendererCounters();
+    void FeedbackThread();
+    void LatchPipelineFaultLocked(const std::wstring& error);
+    bool WaitForCapturedDrainLocked(std::wstring* outError);
     bool StartPipeServer(std::wstring* outError);
     void PipeServerThread();
     void HandlePipeClient(HANDLE pipe);
@@ -1130,6 +1114,7 @@ private:
     HANDLE controlMapping_ = nullptr;
     HookControlBlock* control_ = nullptr;
     std::thread pipeThread_;
+    std::thread feedbackThread_;
 
     mutable std::mutex clientThreadsMutex_;
     std::vector<std::thread> clientThreads_;
@@ -1137,6 +1122,13 @@ private:
     std::vector<HANDLE> activePipes_;
 
     std::mutex rendererRoutingMutex_;
+    std::mutex controlStateMutex_;
+    std::atomic<bool> pipelineFaulted_{false};
+    std::uint64_t publishedStreamId_ = 0;
+    std::uint64_t publishedConsumedBaseline_ = 0;
+    std::uint64_t publishedConsumedOffset_ = 0;
+    LONG publishedStreamGeneration_ = 0;
+    bool rendererFaultResetAuthorized_ = false;
     AsioRenderer renderer_;
 };
 
@@ -1232,6 +1224,12 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         targetPid_ = 0;
         targetExited_.store(false);
         lockedAudioPid_ = 0;
+        pipelineFaulted_.store(false, std::memory_order_release);
+        publishedStreamId_ = 0;
+        publishedConsumedBaseline_ = 0;
+        publishedConsumedOffset_ = 0;
+        publishedStreamGeneration_ = 0;
+        rendererFaultResetAuthorized_ = true;
         logBuffer_.clear();
         SetLastErrorLocked(L"OK");
     }
@@ -1242,7 +1240,7 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
                                          PAGE_READWRITE,
                                          0,
                                          sizeof(HookControlBlock),
-                                         kControlMapName);
+                                         hook_protocol::kControlMapName);
     if (controlMapping_ == nullptr) {
         std::lock_guard<std::mutex> lock(stateMutex_);
         SetLastErrorLocked(Win32Message(L"CreateFileMappingW"));
@@ -1259,8 +1257,21 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         return kError;
     }
 
+    InitializeControlState();
     WriteControlState(0, false);
     running_ = true;
+
+    try {
+        feedbackThread_ = std::thread(&AudioBridgeCore::FeedbackThread, this);
+    } catch (const std::exception& ex) {
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            SetLastErrorLocked(L"Failed to start renderer feedback thread: " +
+                               Utf8ToWide(ex.what(), std::strlen(ex.what())));
+        }
+        Stop();
+        return kError;
+    }
 
     std::wstring error;
     if (!StartPipeServer(&error) || !LaunchAndInjectTarget(targetPath, hookPath, &error)) {
@@ -1295,6 +1306,10 @@ void AudioBridgeCore::Stop() {
         std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
         renderer_.Stop();
         return;
+    }
+
+    if (feedbackThread_.joinable()) {
+        feedbackThread_.join();
     }
 
     if (processMonitorThread_.joinable()) {
@@ -1553,7 +1568,9 @@ int32_t AudioBridgeCore::GetStatus(ABC_Status* status) const {
     status->running = running_.load() && !targetExited ? 1 : 0;
     status->targetPid = targetExited ? 0 : targetPid_;
     status->lockedAudioPid = lockedAudioPid_.load();
-    status->streamActive = stats.streamActive ? 1 : 0;
+    status->streamActive = pipelineFaulted_.load(std::memory_order_acquire)
+            ? -1
+            : (stats.streamActive ? 1 : 0);
     status->prebuffering = stats.prebuffering ? 1 : 0;
     status->totalFramesQueued = stats.totalFramesQueued;
     status->totalFramesPlayed = stats.totalFramesPlayed;
@@ -1632,13 +1649,164 @@ void AudioBridgeCore::Log(const wchar_t* format, ...) {
     }
 }
 
+void AudioBridgeCore::InitializeControlState() {
+    if (control_ == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> controlLock(controlStateMutex_);
+    std::memset(control_, 0, sizeof(*control_));
+    control_->protocolVersion = hook_protocol::kControlProtocolVersion;
+    control_->rendererState = static_cast<LONG>(RendererState::Idle);
+}
+
 void AudioBridgeCore::WriteControlState(std::uint32_t audioPid, bool finish) {
     if (control_ == nullptr) {
         return;
     }
+    std::lock_guard<std::mutex> controlLock(controlStateMutex_);
+    InterlockedIncrement(&control_->configSequence);
+    MemoryBarrier();
+    const LONG previousPid = control_->lockedPid;
     InterlockedExchange(&control_->lockedPid, static_cast<LONG>(audioPid));
     InterlockedExchange(&control_->finish, finish ? 1 : 0);
     InterlockedExchange(&control_->fakeOutput, fakeOutput_.load() ? 1 : 0);
+    if (finish || previousPid != static_cast<LONG>(audioPid)) {
+        InterlockedExchange(&control_->rendererState,
+                            static_cast<LONG>(finish
+                                                       ? RendererState::Idle
+                                                       : RendererState::Reconfiguring));
+        InterlockedExchange(&control_->streamIdLow, 0);
+        InterlockedExchange(&control_->streamIdHigh, 0);
+        InterlockedExchange(&control_->sampleRate, 0);
+        InterlockedExchange(&control_->consumedCapturedBaselineLow, 0);
+        InterlockedExchange(&control_->consumedCapturedBaselineHigh, 0);
+        InterlockedExchange(&control_->consumedCapturedOffsetLow, 0);
+        InterlockedExchange(&control_->consumedCapturedOffsetHigh, 0);
+    }
+    MemoryBarrier();
+    InterlockedIncrement(&control_->configSequence);
+}
+
+void AudioBridgeCore::PublishRendererRoute(
+        std::uint64_t streamId,
+        std::uint32_t sampleRate,
+        std::uint64_t consumedBaseline,
+        std::uint64_t consumedOffset,
+        RendererState state) {
+    if (control_ == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> controlLock(controlStateMutex_);
+    InterlockedIncrement(&control_->configSequence);
+    MemoryBarrier();
+    InterlockedExchange(&control_->protocolVersion,
+                        hook_protocol::kControlProtocolVersion);
+    InterlockedExchange(&control_->streamGeneration, ++publishedStreamGeneration_);
+    InterlockedExchange(&control_->streamIdLow, hook_protocol::StreamIdLow(streamId));
+    InterlockedExchange(&control_->streamIdHigh, hook_protocol::StreamIdHigh(streamId));
+    InterlockedExchange(&control_->sampleRate, static_cast<LONG>(sampleRate));
+    InterlockedExchange(&control_->consumedCapturedBaselineLow,
+                        hook_protocol::CounterLow(consumedBaseline));
+    InterlockedExchange(&control_->consumedCapturedBaselineHigh,
+                        hook_protocol::CounterHigh(consumedBaseline));
+    InterlockedExchange(&control_->consumedCapturedOffsetLow,
+                        hook_protocol::CounterLow(consumedOffset));
+    InterlockedExchange(&control_->consumedCapturedOffsetHigh,
+                        hook_protocol::CounterHigh(consumedOffset));
+    InterlockedExchange(&control_->rendererState, static_cast<LONG>(state));
+    MemoryBarrier();
+    InterlockedIncrement(&control_->configSequence);
+}
+
+void AudioBridgeCore::PublishRendererCounters() {
+    if (control_ == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> controlLock(controlStateMutex_);
+    const auto captured = renderer_.ConfirmedCapturedFrames();
+    const auto output = renderer_.ConfirmedOutputFrames();
+    InterlockedIncrement(&control_->counterSequence);
+    MemoryBarrier();
+    InterlockedExchange(&control_->consumedCapturedLow,
+                        hook_protocol::CounterLow(captured));
+    InterlockedExchange(&control_->consumedCapturedHigh,
+                        hook_protocol::CounterHigh(captured));
+    InterlockedExchange(&control_->consumedOutputLow,
+                        hook_protocol::CounterLow(output));
+    InterlockedExchange(&control_->consumedOutputHigh,
+                        hook_protocol::CounterHigh(output));
+    MemoryBarrier();
+    InterlockedIncrement(&control_->counterSequence);
+}
+
+void AudioBridgeCore::FeedbackThread() {
+    while (running_.load(std::memory_order_acquire)) {
+        PublishRendererCounters();
+        if (renderer_.HasFault() &&
+            !pipelineFaulted_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+            LatchPipelineFaultLocked(renderer_.FaultMessage());
+        }
+        Sleep(1);
+    }
+    PublishRendererCounters();
+}
+
+void AudioBridgeCore::LatchPipelineFaultLocked(const std::wstring& error) {
+    bool expected = false;
+    if (!pipelineFaulted_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    const std::wstring message = error.empty()
+            ? L"The audio pipeline stopped because accepted audio could not be preserved."
+            : error;
+    rendererFaultResetAuthorized_ = false;
+    PublishRendererCounters();
+    PublishRendererRoute(publishedStreamId_,
+                         rendererFormat_.Format.nSamplesPerSec,
+                         publishedConsumedBaseline_,
+                         publishedConsumedOffset_,
+                         RendererState::Faulted);
+    renderer_.Stop();
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        rendererHasFormat_ = false;
+        SetLastErrorLocked(message);
+        logBuffer_ += L"[fault] " + message + L"\r\n";
+    }
+}
+
+bool AudioBridgeCore::WaitForCapturedDrainLocked(std::wstring* outError) {
+    std::int32_t drainPrebufferMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        drainPrebufferMs = (std::max)(prebufferMs_, rendererPrebufferMs_);
+    }
+    const auto timeout = std::chrono::milliseconds(
+            static_cast<std::int64_t>((std::max)(drainPrebufferMs, 0)) + 5000);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (renderer_.PendingCapturedFrames() > 0) {
+        if (pipelineFaulted_.load(std::memory_order_acquire) ||
+            renderer_.HasFault()) {
+            if (outError != nullptr) {
+                *outError = renderer_.FaultMessage().empty()
+                        ? L"ASIO renderer faulted while draining accepted audio."
+                        : renderer_.FaultMessage();
+            }
+            return false;
+        }
+        if (!running_.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= deadline) {
+            if (outError != nullptr) {
+                *outError = L"Timed out while preserving accepted audio before ASIO reconfiguration.";
+            }
+            return false;
+        }
+        Sleep(1);
+    }
+    return true;
 }
 
 bool AudioBridgeCore::StartPipeServer(std::wstring* outError) {
@@ -1686,7 +1854,8 @@ void AudioBridgeCore::PipeServerThread() {
 void AudioBridgeCore::HandlePipeClient(HANDLE pipe) {
     for (;;) {
         PipeMessageHeader header{};
-        if (!ReadExact(pipe, &header, sizeof(header)) || header.magic != kPipeMagic) {
+        if (!ReadExact(pipe, &header, sizeof(header)) ||
+            header.magic != hook_protocol::kPipeMagic) {
             break;
         }
         if (header.payloadBytes > 64ull * 1024ull * 1024ull) {
@@ -1709,21 +1878,21 @@ void AudioBridgeCore::HandlePipeClient(HANDLE pipe) {
 void AudioBridgeCore::HandlePipeMessage(DWORD type,
                                         DWORD pid,
                                         const std::vector<std::uint8_t>& payload) {
-    if (type == kPipeText) {
+    if (type == hook_protocol::kPipeText) {
         const auto text = Utf8ToWide(reinterpret_cast<const char*>(payload.data()), payload.size());
         std::lock_guard<std::mutex> lock(stateMutex_);
         logBuffer_ += text;
         return;
     }
-    if (type == kPipeFormat) {
+    if (type == hook_protocol::kPipeFormat) {
         HandleFormatMessage(pid, payload.data(), payload.size());
         return;
     }
-    if (type == kPipePcm) {
+    if (type == hook_protocol::kPipePcm) {
         HandlePcmMessage(pid, payload.data(), payload.size());
         return;
     }
-    if (type == kPipeFinish) {
+    if (type == hook_protocol::kPipeFinish) {
         Log(L"Hook reported PCM finish for pid=%u", pid);
     }
 }
@@ -1814,8 +1983,16 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
 }
 
 void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::size_t bytes) {
-    if (pid == 0 || data == nullptr || bytes <= sizeof(PipePcmMessage) ||
-        pid != lockedAudioPid_.load()) {
+    if (pid == 0 || pid != lockedAudioPid_.load()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+    if (pipelineFaulted_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (data == nullptr || bytes < sizeof(PipePcmMessage)) {
+        LatchPipelineFaultLocked(L"Received a truncated PCM message from the selected audio process.");
         return;
     }
 
@@ -1823,58 +2000,103 @@ void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std:
     const std::uint8_t* pcm = data + sizeof(PipePcmMessage);
     const std::size_t pcmBytes = bytes - sizeof(PipePcmMessage);
 
-    std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
-
     std::uint32_t bytesPerFrame = 0;
     WAVEFORMATEXTENSIBLE sourceFormat{};
     bool streamActivated = false;
     bool shouldEnsureRenderer = false;
+    bool routeThisBuffer = true;
     std::uint64_t previousStreamId = 0;
+    std::wstring validationError;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto it = audioPids_.find(pid);
         if (it == audioPids_.end() || message->streamId == 0) {
-            return;
-        }
+            validationError = L"PCM arrived without a matching format for the selected audio process.";
+        } else {
+            auto& pidState = it->second;
+            auto streamIt = pidState.streams.find(message->streamId);
+            if (streamIt == pidState.streams.end()) {
+                validationError = L"PCM arrived for an unknown audio stream.";
+            } else {
+                auto& stream = streamIt->second;
+                bytesPerFrame = stream.bytesPerFrame;
+                sourceFormat = stream.format;
+                if (message->sequence != stream.nextPcmSequence) {
+                    validationError = L"PCM sequence discontinuity detected; accepted audio can no longer be accounted for exactly.";
+                } else if (stream.nextPcmSequence ==
+                           (std::numeric_limits<std::uint64_t>::max)() ||
+                           stream.submittedFrames >
+                                   (std::numeric_limits<std::uint64_t>::max)() -
+                                           message->frameCount) {
+                    validationError = L"PCM accounting counter exhausted its supported range.";
+                } else if (message->frameCount == 0 || bytesPerFrame == 0) {
+                    validationError = L"PCM message contains an invalid frame count or format.";
+                } else if (message->submittedFrames !=
+                           stream.submittedFrames + message->frameCount) {
+                    validationError = L"PCM submitted-frame counter is discontinuous.";
+                } else {
+                    const bool playerSilence =
+                            (message->flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                    if (!playerSilence &&
+                        message->frameCount >
+                                (std::numeric_limits<std::size_t>::max)() /
+                                        bytesPerFrame) {
+                        validationError = L"PCM payload size exceeds the current process architecture.";
+                    }
+                    const std::size_t expectedPcmBytes =
+                            playerSilence || !validationError.empty()
+                            ? 0
+                            : static_cast<std::size_t>(message->frameCount) * bytesPerFrame;
+                    if (validationError.empty() && pcmBytes != expectedPcmBytes) {
+                        validationError = L"PCM payload length does not match its declared frame count.";
+                    }
+                }
 
-        auto& pidState = it->second;
-        auto streamIt = pidState.streams.find(message->streamId);
-        if (streamIt == pidState.streams.end()) {
-            return;
-        }
+                if (validationError.empty()) {
+                    const auto nowMs = NowMs();
+                    stream.lastPcmMs = nowMs;
+                    pidState.lastPcmMs = nowMs;
 
-        const auto nowMs = NowMs();
-        streamIt->second.lastPcmMs = nowMs;
-        pidState.lastPcmMs = nowMs;
+                    previousStreamId = pidState.activeStreamId;
+                    if (previousStreamId != message->streamId) {
+                        const auto* previousStream =
+                                FindAudioStream(pidState, previousStreamId);
+                        const bool previousStreamIsStale = previousStream == nullptr ||
+                                previousStream->lastPcmMs == 0 ||
+                                nowMs - previousStream->lastPcmMs >=
+                                        kActiveStreamHandoffGraceMs;
+                        const bool candidateIsNewer = previousStream == nullptr ||
+                                stream.formatSequence > previousStream->formatSequence;
+                        if (!candidateIsNewer && !previousStreamIsStale) {
+                            // Probe/helper clients remain on the legacy fake-clock path.
+                            // Their stream is not advertised as the ASIO-routed stream.
+                            routeThisBuffer = false;
+                        } else {
+                            pidState.activeStreamId = message->streamId;
+                            streamActivated = true;
+                        }
+                    }
 
-        previousStreamId = pidState.activeStreamId;
-        if (previousStreamId != message->streamId) {
-            const auto* previousStream = FindAudioStream(pidState, previousStreamId);
-            const bool previousStreamIsStale = previousStream == nullptr ||
-                    previousStream->lastPcmMs == 0 ||
-                    nowMs - previousStream->lastPcmMs >= kActiveStreamHandoffGraceMs;
-            const bool candidateIsNewer = previousStream == nullptr ||
-                    streamIt->second.formatSequence > previousStream->formatSequence;
-            if (!candidateIsNewer && !previousStreamIsStale) {
-                return;
+                    shouldEnsureRenderer = routeThisBuffer &&
+                            (streamActivated ||
+                             !rendererHasFormat_ ||
+                             rendererPid_ != pid ||
+                             !WaveFormatsEqual(rendererFormat_, sourceFormat));
+
+                    if (!routeThisBuffer) {
+                        ++stream.nextPcmSequence;
+                        stream.submittedFrames = message->submittedFrames;
+                    }
+                }
             }
-
-            // The stream that produces PCM is authoritative. A newer initialized
-            // stream wins immediately; an older reusable stream may return only
-            // after the current source has gone quiet.
-            pidState.activeStreamId = message->streamId;
-            streamActivated = true;
         }
-
-        sourceFormat = streamIt->second.format;
-        bytesPerFrame = streamIt->second.bytesPerFrame;
-        shouldEnsureRenderer = streamActivated ||
-                !rendererHasFormat_ ||
-                rendererPid_ != pid ||
-                !WaveFormatsEqual(rendererFormat_, sourceFormat);
     }
 
-    if (bytesPerFrame == 0) {
+    if (!validationError.empty()) {
+        LatchPipelineFaultLocked(validationError);
+        return;
+    }
+    if (!routeThisBuffer) {
         return;
     }
     if (streamActivated) {
@@ -1888,57 +2110,151 @@ void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std:
     }
     if ((shouldEnsureRenderer || !renderer_.IsRunning()) &&
         !StartRendererForFormatLocked(pid, sourceFormat)) {
+        std::wstring error;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            error = lastError_;
+        }
+        LatchPipelineFaultLocked(error.empty()
+                                         ? L"ASIO renderer could not accept the selected PCM stream."
+                                         : error);
         return;
     }
 
-    const auto frameCount = static_cast<std::uint32_t>(pcmBytes / bytesPerFrame);
-    if (frameCount == 0) {
+    std::wstring renderError;
+    const bool playerSilence =
+            (message->flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+    const auto written = playerSilence
+            ? renderer_.PushCapturedSilence(message->frameCount, &renderError)
+            : renderer_.PushPcm(pcm, message->frameCount, &renderError);
+    if (written != message->frameCount || !renderError.empty()) {
+        LatchPipelineFaultLocked(renderError.empty()
+                                         ? L"ASIO renderer could not preserve every accepted PCM frame."
+                                         : renderError);
         return;
     }
-    std::wstring renderError;
-    const auto written = renderer_.PushPcm(pcm, frameCount, &renderError);
-    if (!renderError.empty()) {
+
+    {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        SetLastErrorLocked(renderError);
-        logBuffer_ += L"[renderer] " + renderError + L"\r\n";
+        auto pidIt = audioPids_.find(pid);
+        if (pidIt == audioPids_.end()) {
+            validationError = L"Audio stream state changed while PCM was being accepted.";
+        } else {
+            auto streamIt = pidIt->second.streams.find(message->streamId);
+            if (streamIt == pidIt->second.streams.end() ||
+                streamIt->second.nextPcmSequence != message->sequence) {
+                validationError = L"Audio stream state changed while PCM was being accepted.";
+            } else {
+                ++streamIt->second.nextPcmSequence;
+                streamIt->second.submittedFrames = message->submittedFrames;
+            }
+        }
     }
-    if (written < frameCount) {
-        Log(L"Renderer ring dropped frames. pid=%u submitted=%u written=%u",
-            pid,
-            frameCount,
-            written);
+    if (!validationError.empty()) {
+        LatchPipelineFaultLocked(validationError);
     }
 }
 
 void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
                                              const WAVEFORMATEXTENSIBLE& format) {
     std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
-    StartRendererForFormatLocked(pid, format);
+    if (!StartRendererForFormatLocked(pid, format) &&
+        running_.load(std::memory_order_acquire) &&
+        !pipelineFaulted_.load(std::memory_order_acquire)) {
+        std::wstring error;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            error = lastError_;
+        }
+        LatchPipelineFaultLocked(error);
+    }
 }
 
 bool AudioBridgeCore::StartRendererForFormatLocked(
         std::uint32_t pid,
         const WAVEFORMATEXTENSIBLE& format) {
+    if (pipelineFaulted_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        SetLastErrorLocked(L"The audio pipeline is faulted. Stop and open the target again to start a new session.");
+        return false;
+    }
+    if (renderer_.HasFault() && !rendererFaultResetAuthorized_) {
+        const auto rendererError = renderer_.FaultMessage();
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        SetLastErrorLocked(rendererError.empty()
+                                   ? L"The ASIO renderer is entering a faulted state."
+                                   : rendererError);
+        return false;
+    }
+
     std::wstring deviceId;
     std::int32_t prebufferMs = kDefaultPrebufferMs;
     std::int32_t maxBufferOffsetMs = kDefaultMaxBufferOffsetMs;
     std::int32_t asioBufferFrames = kDefaultAsioBufferFrames;
+    std::uint64_t streamId = 0;
+    std::uint64_t submittedFrames = 0;
+    bool configurationMatches = false;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         deviceId = selectedDeviceId_;
         prebufferMs = prebufferMs_;
         maxBufferOffsetMs = maxBufferOffsetMs_;
         asioBufferFrames = asioBufferFrames_;
-        if (renderer_.IsRunning() &&
-            rendererHasFormat_ &&
-            rendererPid_ == pid &&
-            rendererDeviceId_ == deviceId &&
-            rendererPrebufferMs_ == prebufferMs &&
-            rendererMaxBufferOffsetMs_ == maxBufferOffsetMs &&
-            rendererAsioBufferFrames_ == asioBufferFrames &&
-            WaveFormatsEqual(rendererFormat_, format)) {
-            return true;
+        auto pidIt = audioPids_.find(pid);
+        if (pidIt != audioPids_.end()) {
+            streamId = PreferredAudioStreamId(pidIt->second);
+            const auto* stream = FindAudioStream(pidIt->second, streamId);
+            if (stream != nullptr) {
+                submittedFrames = stream->submittedFrames;
+            }
         }
+        configurationMatches = renderer_.IsRunning() &&
+                rendererHasFormat_ &&
+                rendererPid_ == pid &&
+                rendererDeviceId_ == deviceId &&
+                rendererPrebufferMs_ == prebufferMs &&
+                rendererMaxBufferOffsetMs_ == maxBufferOffsetMs &&
+                rendererAsioBufferFrames_ == asioBufferFrames &&
+                WaveFormatsEqual(rendererFormat_, format);
+    }
+
+    if (streamId == 0) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        SetLastErrorLocked(L"Cannot start ASIO without an authoritative audio stream.");
+        return false;
+    }
+
+    if (configurationMatches && publishedStreamId_ == streamId) {
+        return true;
+    }
+
+    if (renderer_.IsRunning()) {
+        std::wstring drainError;
+        if (!WaitForCapturedDrainLocked(&drainError)) {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            SetLastErrorLocked(drainError);
+            logBuffer_ += L"[renderer] " + drainError + L"\r\n";
+            return false;
+        }
+    }
+
+    const auto confirmedBeforeReconfigure = renderer_.ConfirmedCapturedFrames();
+    publishedStreamId_ = streamId;
+    publishedConsumedBaseline_ = confirmedBeforeReconfigure;
+    publishedConsumedOffset_ = submittedFrames;
+    PublishRendererRoute(streamId,
+                         format.Format.nSamplesPerSec,
+                         publishedConsumedBaseline_,
+                         publishedConsumedOffset_,
+                         RendererState::Reconfiguring);
+
+    if (configurationMatches) {
+        PublishRendererRoute(streamId,
+                             format.Format.nSamplesPerSec,
+                             publishedConsumedBaseline_,
+                             publishedConsumedOffset_,
+                             RendererState::Running);
+        return true;
     }
 
     std::wstring error;
@@ -1949,6 +2265,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                 maxBufferOffsetMs,
                 static_cast<std::uint32_t>(asioBufferFrames),
                 &error)) {
+        rendererFaultResetAuthorized_ = false;
         std::lock_guard<std::mutex> lock(stateMutex_);
         rendererHasFormat_ = false;
         rendererPid_ = 0;
@@ -1958,6 +2275,16 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         logBuffer_ += L"[renderer] " + error + L"\r\n";
         return false;
     }
+
+    rendererFaultResetAuthorized_ = false;
+    publishedConsumedBaseline_ = renderer_.ConfirmedCapturedFrames();
+    publishedConsumedOffset_ = submittedFrames;
+    PublishRendererCounters();
+    PublishRendererRoute(streamId,
+                         format.Format.nSamplesPerSec,
+                         publishedConsumedBaseline_,
+                         publishedConsumedOffset_,
+                         RendererState::Running);
 
     {
         std::lock_guard<std::mutex> lock(stateMutex_);

@@ -124,5 +124,8 @@
   <ItemGroup>
     <ClCompile Include="src\AudioBridgeHook.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\AudioBridgeHookShared\AudioBridgeHookProtocol.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

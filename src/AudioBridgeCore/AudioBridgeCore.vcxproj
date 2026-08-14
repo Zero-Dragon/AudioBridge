@@ -125,6 +125,7 @@
   <ItemGroup>
     <ClInclude Include="include\AudioBridgeCore.h" />
     <ClInclude Include="src\AsioRenderer.h" />
+    <ClInclude Include="..\AudioBridgeHookShared\AudioBridgeHookProtocol.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\AudioBridgeCore.cpp" />
