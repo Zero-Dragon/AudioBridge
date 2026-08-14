@@ -2419,7 +2419,23 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         return true;
     }
 
-    if (renderer_.IsRunning()) {
+    // Publish the selected stream before draining the previous renderer. A new
+    // WASAPI client has not established a managed-clock baseline yet; if the
+    // old route remains Running while its retained PCM drains, that client
+    // falls back to synthetic QPC progress and can fill the synchronous pipe.
+    // Reconfiguring freezes both the previous managed stream and the selected
+    // stream until the old PCM is retired and a new DAC generation is ready.
+    const bool rendererWasRunning = renderer_.IsRunning();
+    publishedStreamId_ = streamId;
+    publishedConsumedBaseline_ = renderer_.ConfirmedCapturedFrames();
+    publishedConsumedOffset_ = submittedFrames;
+    PublishRendererRoute(streamId,
+                         format.Format.nSamplesPerSec,
+                         publishedConsumedBaseline_,
+                         publishedConsumedOffset_,
+                         RendererState::Reconfiguring);
+
+    if (rendererWasRunning) {
         std::wstring drainError;
         if (!WaitForCapturedDrainLocked(&drainError)) {
             std::lock_guard<std::mutex> lock(stateMutex_);
@@ -2430,14 +2446,8 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     }
 
     const auto confirmedBeforeReconfigure = renderer_.ConfirmedCapturedFrames();
-    publishedStreamId_ = streamId;
     publishedConsumedBaseline_ = confirmedBeforeReconfigure;
     publishedConsumedOffset_ = submittedFrames;
-    PublishRendererRoute(streamId,
-                         format.Format.nSamplesPerSec,
-                         publishedConsumedBaseline_,
-                         publishedConsumedOffset_,
-                         RendererState::Reconfiguring);
 
     if (configurationMatches) {
         PublishRendererRoute(streamId,
