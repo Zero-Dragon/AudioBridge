@@ -14,7 +14,7 @@
 
 AudioBridge is a Windows audio utility. It launches a selected music player or other application, captures its audio, and routes it directly to a DAC through an ASIO driver.
 
-It is designed for applications without native ASIO output. **Fake Output** is enabled by default and silences the target application's normal WASAPI output, preventing duplicate playback through both the standard Windows output and the ASIO device.
+It is designed for applications without native ASIO output. Fake Output is enabled by default and silences the target application's normal WASAPI output, preventing duplicate playback through both the standard Windows output and the ASIO device.
 
 ## Preview
 
@@ -31,29 +31,24 @@ It is designed for applications without native ASIO output. **Fake Output** is e
 
 ## Usage
 
-1. Fully exit the target application, including tray and background processes.
-2. Start AudioBridge and click **Browse** to select the application's `.exe`.
-3. Select the DAC driver under **ASIO output**.
-4. Keep **Fake Output** enabled. If unsure, leave the other settings at their defaults.
-5. Click **Open**, then start playback in the target application.
-6. Confirm that a PID appears under **Audio PIDs** and the status reaches `Output Active`.
+1. Fully exit the target application.
+2. Start AudioBridge and click Browse to select the application's `.exe`.
+3. Select the DAC driver under ASIO output.
+4. Click Open, then start playback in the target application.
+5. Confirm that a PID appears under Audio PIDs and the status reaches `Output Active`.
 
 ### Notes
 
-- Do not use the same device for the Windows default audio output and **ASIO output**.
-- Under **Browse**, select the main `.exe` that produces audio, not a launcher or updater.
+- Do not use the same device for the Windows default audio output and ASIO output.
+- Under Browse, select the main `.exe` that produces audio, not a launcher or updater.
 - AudioBridge captures audio PIDs at application startup. Fully exit the target application, then open it through AudioBridge.
+- If there is no sound: when no Audio PID appears, exit every process belonging to the target application and reopen it through AudioBridge. When a PID is present, check the ASIO driver, sample rate, and any error or underrun shown in the app.
 
 ## Limitations
 
 - Stereo audio only; no sample-rate conversion;
-- the ASIO driver architecture must match the package: `win64` uses a 64-bit driver and `winx86` uses a 32-bit driver;
-- AudioBridge and the target application should run at the same privilege level;
-- the last successfully opened application path is stored in `settings.json` beside AudioBridge, so the program folder must be writable;
 - applications using specialized audio interfaces or separate system services may not be captured;
 - DLL injection may trigger security software warnings. Launch only applications you trust.
-
-If there is no sound: when no Audio PID appears, exit every process belonging to the target application and reopen it through AudioBridge. When a PID is present, check the ASIO driver, sample rate, and any error or underrun shown in the app.
 
 ## Support the project
 
