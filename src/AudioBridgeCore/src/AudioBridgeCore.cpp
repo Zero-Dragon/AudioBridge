@@ -61,6 +61,8 @@ constexpr int32_t kDefaultPrebufferMs = 300;
 constexpr int32_t kDefaultMaxBufferOffsetMs = 100;
 constexpr int32_t kMinimumMaxBufferOffsetMs = 50;
 constexpr int32_t kDefaultAsioBufferFrames = 0;
+constexpr std::size_t kMaxTrackedAudioStreamsPerPid = 32;
+constexpr std::uint64_t kActiveStreamHandoffGraceMs = 250;
 #if defined(_WIN64)
 constexpr REGSAM kAsioRegistryView = KEY_WOW64_64KEY;
 #else
@@ -103,14 +105,42 @@ struct DeviceInfo {
     bool isDefault = false;
 };
 
-struct AudioPidState {
+struct AudioStreamState {
     WAVEFORMATEXTENSIBLE format{};
-    bool hasFormat = false;
     std::uint32_t bytesPerFrame = 0;
-    std::uint64_t streamId = 0;
+    std::uint64_t lastFormatMs = 0;
+    std::uint64_t lastPcmMs = 0;
+    std::uint64_t formatSequence = 0;
+};
+
+struct AudioPidState {
+    std::unordered_map<std::uint64_t, AudioStreamState> streams;
+    std::uint64_t activeStreamId = 0;
+    std::uint64_t latestStreamId = 0;
+    std::uint64_t nextFormatSequence = 0;
     std::uint64_t lastFormatMs = 0;
     std::uint64_t lastPcmMs = 0;
 };
+
+const AudioStreamState* FindAudioStream(const AudioPidState& state,
+                                        std::uint64_t streamId) {
+    const auto it = state.streams.find(streamId);
+    return it != state.streams.end() ? &it->second : nullptr;
+}
+
+std::uint64_t PreferredAudioStreamId(const AudioPidState& state) {
+    if (FindAudioStream(state, state.activeStreamId) != nullptr) {
+        return state.activeStreamId;
+    }
+    if (FindAudioStream(state, state.latestStreamId) != nullptr) {
+        return state.latestStreamId;
+    }
+    return 0;
+}
+
+const AudioStreamState* PreferredAudioStream(const AudioPidState& state) {
+    return FindAudioStream(state, PreferredAudioStreamId(state));
+}
 
 struct ProcessSnapshotEntry {
     DWORD pid = 0;
@@ -1045,6 +1075,8 @@ private:
     void HandleFormatMessage(DWORD pid, const void* payload, std::size_t payloadBytes);
     void HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::size_t bytes);
     void StartRendererForFormat(std::uint32_t pid, const WAVEFORMATEXTENSIBLE& format);
+    bool StartRendererForFormatLocked(std::uint32_t pid,
+                                      const WAVEFORMATEXTENSIBLE& format);
     bool LaunchAndInjectTarget(const std::filesystem::path& exePath,
                                const std::filesystem::path& hookDllPath,
                                std::wstring* outError);
@@ -1104,6 +1136,7 @@ private:
     std::mutex activePipesMutex_;
     std::vector<HANDLE> activePipes_;
 
+    std::mutex rendererRoutingMutex_;
     AsioRenderer renderer_;
 };
 
@@ -1259,6 +1292,7 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
 
 void AudioBridgeCore::Stop() {
     if (!running_.exchange(false)) {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
         renderer_.Stop();
         return;
     }
@@ -1289,7 +1323,10 @@ void AudioBridgeCore::Stop() {
         }
     }
 
-    renderer_.Stop();
+    {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+        renderer_.Stop();
+    }
 
     if (targetProcess_ != nullptr) {
         CloseHandle(targetProcess_);
@@ -1335,8 +1372,11 @@ int32_t AudioBridgeCore::SetOutputDevice(const wchar_t* outputDeviceId) {
         selectedDeviceId_ = outputDeviceId != nullptr ? outputDeviceId : L"";
         pid = lockedAudioPid_.load();
         auto it = audioPids_.find(pid);
-        if (it != audioPids_.end() && it->second.hasFormat) {
-            format = it->second.format;
+        if (it != audioPids_.end()) {
+            const auto* stream = PreferredAudioStream(it->second);
+            if (stream != nullptr) {
+                format = stream->format;
+            }
         }
     }
 
@@ -1360,8 +1400,11 @@ int32_t AudioBridgeCore::SetPrebufferMs(std::int32_t prebufferMs) {
         prebufferMs_ = prebufferMs;
         pid = lockedAudioPid_.load();
         auto it = audioPids_.find(pid);
-        if (it != audioPids_.end() && it->second.hasFormat) {
-            format = it->second.format;
+        if (it != audioPids_.end()) {
+            const auto* stream = PreferredAudioStream(it->second);
+            if (stream != nullptr) {
+                format = stream->format;
+            }
         }
         SetLastErrorLocked(L"OK");
     }
@@ -1391,8 +1434,11 @@ int32_t AudioBridgeCore::SetMaxBufferOffsetMs(std::int32_t maxBufferOffsetMs) {
         maxBufferOffsetMs_ = maxBufferOffsetMs;
         pid = lockedAudioPid_.load();
         auto it = audioPids_.find(pid);
-        if (it != audioPids_.end() && it->second.hasFormat) {
-            format = it->second.format;
+        if (it != audioPids_.end()) {
+            const auto* stream = PreferredAudioStream(it->second);
+            if (stream != nullptr) {
+                format = stream->format;
+            }
         }
         SetLastErrorLocked(L"OK");
     }
@@ -1419,11 +1465,18 @@ int32_t AudioBridgeCore::SelectAudioPid(std::uint32_t pid) {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto it = audioPids_.find(pid);
-        if (it == audioPids_.end() || !it->second.hasFormat) {
+        if (it == audioPids_.end()) {
             SetLastErrorLocked(L"Audio PID was not detected or has no captured format.");
             return kInvalidArgument;
         }
-        format = it->second.format;
+        const auto streamId = PreferredAudioStreamId(it->second);
+        const auto* stream = FindAudioStream(it->second, streamId);
+        if (stream == nullptr) {
+            SetLastErrorLocked(L"Audio PID was not detected or has no captured format.");
+            return kInvalidArgument;
+        }
+        it->second.activeStreamId = streamId;
+        format = stream->format;
         lockedAudioPid_ = pid;
     }
 
@@ -1693,33 +1746,70 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
 
     bool shouldSelect = false;
     bool shouldStartRenderer = false;
+    WAVEFORMATEXTENSIBLE rendererFormat{};
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto& state = audioPids_[pid];
-        state.format = message->format;
-        state.hasFormat = true;
-        state.bytesPerFrame = bytesPerFrame;
-        state.streamId = message->streamId;
-        state.lastFormatMs = NowMs();
+
+        auto streamIt = state.streams.find(message->streamId);
+        if (streamIt == state.streams.end()) {
+            if (state.streams.size() >= kMaxTrackedAudioStreamsPerPid) {
+                auto oldest = state.streams.end();
+                for (auto it = state.streams.begin(); it != state.streams.end(); ++it) {
+                    if (it->first == state.activeStreamId) {
+                        continue;
+                    }
+                    if (oldest == state.streams.end() ||
+                        it->second.formatSequence < oldest->second.formatSequence) {
+                        oldest = it;
+                    }
+                }
+                if (oldest != state.streams.end()) {
+                    state.streams.erase(oldest);
+                }
+            }
+            streamIt = state.streams.emplace(message->streamId, AudioStreamState{}).first;
+            streamIt->second.formatSequence = ++state.nextFormatSequence;
+        }
+
+        const auto nowMs = NowMs();
+        streamIt->second.format = message->format;
+        streamIt->second.bytesPerFrame = bytesPerFrame;
+        streamIt->second.lastFormatMs = nowMs;
+        state.latestStreamId = message->streamId;
+        state.lastFormatMs = nowMs;
 
         std::uint32_t expected = 0;
         shouldSelect = lockedAudioPid_.compare_exchange_strong(expected, pid);
-        shouldStartRenderer = lockedAudioPid_.load() == pid;
+        if (lockedAudioPid_.load() == pid) {
+            // Prime ASIO from the first usable format, but do not let later probe
+            // clients displace it until they actually produce PCM.
+            if (state.activeStreamId == 0) {
+                state.activeStreamId = message->streamId;
+            }
+            if (state.activeStreamId == message->streamId) {
+                rendererFormat = message->format;
+                shouldStartRenderer = true;
+            }
+        }
     }
 
     if (shouldSelect) {
         WriteControlState(pid, false);
-        Log(L"Auto-selected first audio pid=%u", pid);
-    } else {
-        Log(L"Detected audio pid=%u rate=%u channels=%u bits=%u",
+        Log(L"Auto-selected first audio pid=%u stream=%llu",
             pid,
+            static_cast<unsigned long long>(message->streamId));
+    } else {
+        Log(L"Detected audio stream pid=%u stream=%llu rate=%u channels=%u bits=%u",
+            pid,
+            static_cast<unsigned long long>(message->streamId),
             format.nSamplesPerSec,
             format.nChannels,
             format.wBitsPerSample);
     }
 
     if (shouldStartRenderer) {
-        StartRendererForFormat(pid, message->format);
+        StartRendererForFormat(pid, rendererFormat);
     }
 }
 
@@ -1733,21 +1823,74 @@ void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std:
     const std::uint8_t* pcm = data + sizeof(PipePcmMessage);
     const std::size_t pcmBytes = bytes - sizeof(PipePcmMessage);
 
+    std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+
     std::uint32_t bytesPerFrame = 0;
+    WAVEFORMATEXTENSIBLE sourceFormat{};
+    bool streamActivated = false;
+    bool shouldEnsureRenderer = false;
+    std::uint64_t previousStreamId = 0;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto it = audioPids_.find(pid);
-        if (it != audioPids_.end() &&
-            message->streamId != 0 &&
-            message->streamId == it->second.streamId) {
-            it->second.lastPcmMs = NowMs();
-            bytesPerFrame = it->second.bytesPerFrame;
+        if (it == audioPids_.end() || message->streamId == 0) {
+            return;
         }
+
+        auto& pidState = it->second;
+        auto streamIt = pidState.streams.find(message->streamId);
+        if (streamIt == pidState.streams.end()) {
+            return;
+        }
+
+        const auto nowMs = NowMs();
+        streamIt->second.lastPcmMs = nowMs;
+        pidState.lastPcmMs = nowMs;
+
+        previousStreamId = pidState.activeStreamId;
+        if (previousStreamId != message->streamId) {
+            const auto* previousStream = FindAudioStream(pidState, previousStreamId);
+            const bool previousStreamIsStale = previousStream == nullptr ||
+                    previousStream->lastPcmMs == 0 ||
+                    nowMs - previousStream->lastPcmMs >= kActiveStreamHandoffGraceMs;
+            const bool candidateIsNewer = previousStream == nullptr ||
+                    streamIt->second.formatSequence > previousStream->formatSequence;
+            if (!candidateIsNewer && !previousStreamIsStale) {
+                return;
+            }
+
+            // The stream that produces PCM is authoritative. A newer initialized
+            // stream wins immediately; an older reusable stream may return only
+            // after the current source has gone quiet.
+            pidState.activeStreamId = message->streamId;
+            streamActivated = true;
+        }
+
+        sourceFormat = streamIt->second.format;
+        bytesPerFrame = streamIt->second.bytesPerFrame;
+        shouldEnsureRenderer = streamActivated ||
+                !rendererHasFormat_ ||
+                rendererPid_ != pid ||
+                !WaveFormatsEqual(rendererFormat_, sourceFormat);
     }
 
     if (bytesPerFrame == 0) {
         return;
     }
+    if (streamActivated) {
+        Log(L"Activated PCM stream pid=%u stream=%llu previous=%llu rate=%u channels=%u bits=%u",
+            pid,
+            static_cast<unsigned long long>(message->streamId),
+            static_cast<unsigned long long>(previousStreamId),
+            sourceFormat.Format.nSamplesPerSec,
+            sourceFormat.Format.nChannels,
+            sourceFormat.Format.wBitsPerSample);
+    }
+    if ((shouldEnsureRenderer || !renderer_.IsRunning()) &&
+        !StartRendererForFormatLocked(pid, sourceFormat)) {
+        return;
+    }
+
     const auto frameCount = static_cast<std::uint32_t>(pcmBytes / bytesPerFrame);
     if (frameCount == 0) {
         return;
@@ -1769,6 +1912,13 @@ void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std:
 
 void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
                                              const WAVEFORMATEXTENSIBLE& format) {
+    std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+    StartRendererForFormatLocked(pid, format);
+}
+
+bool AudioBridgeCore::StartRendererForFormatLocked(
+        std::uint32_t pid,
+        const WAVEFORMATEXTENSIBLE& format) {
     std::wstring deviceId;
     std::int32_t prebufferMs = kDefaultPrebufferMs;
     std::int32_t maxBufferOffsetMs = kDefaultMaxBufferOffsetMs;
@@ -1787,7 +1937,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
             rendererMaxBufferOffsetMs_ == maxBufferOffsetMs &&
             rendererAsioBufferFrames_ == asioBufferFrames &&
             WaveFormatsEqual(rendererFormat_, format)) {
-            return;
+            return true;
         }
     }
 
@@ -1806,7 +1956,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
         rendererFormat_ = {};
         SetLastErrorLocked(error);
         logBuffer_ += L"[renderer] " + error + L"\r\n";
-        return;
+        return false;
     }
 
     {
@@ -1830,6 +1980,8 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
     Log(L"Renderer prebuffer target=%d ms", prebufferMs);
     Log(L"Renderer max buffer offset=%d ms", maxBufferOffsetMs);
     Log(L"Renderer ASIO buffer request=%d frames (0=driver preferred)", asioBufferFrames);
+    Log(L"Source sample rate is passed to ASIO without sample-rate conversion.");
+    return true;
 }
 
 bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath,
@@ -2537,15 +2689,16 @@ std::vector<ABC_PidInfo> AudioBridgeCore::SnapshotPidsLocked() const {
     for (const auto& item : audioPids_) {
         ABC_PidInfo info{};
         info.pid = item.first;
-        info.bytesPerFrame = item.second.bytesPerFrame;
         info.lastFormatMs = item.second.lastFormatMs;
         info.lastPcmMs = item.second.lastPcmMs;
         info.isSelected = item.first == lockedPid ? 1 : 0;
-        if (item.second.hasFormat) {
-            info.sampleRate = item.second.format.Format.nSamplesPerSec;
-            info.channels = item.second.format.Format.nChannels;
-            info.bitsPerSample = item.second.format.Format.wBitsPerSample;
-            info.sampleFormat = SampleFormatValue(item.second.format);
+        const auto* stream = PreferredAudioStream(item.second);
+        if (stream != nullptr) {
+            info.bytesPerFrame = stream->bytesPerFrame;
+            info.sampleRate = stream->format.Format.nSamplesPerSec;
+            info.channels = stream->format.Format.nChannels;
+            info.bitsPerSample = stream->format.Format.wBitsPerSample;
+            info.sampleFormat = SampleFormatValue(stream->format);
         }
         result.push_back(info);
     }
