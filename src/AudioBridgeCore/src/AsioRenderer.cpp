@@ -31,7 +31,7 @@ public:
 void AsioBufferSwitch(long doubleBufferIndex, ASIOBool /*directProcess*/) {
     const AsioCallbackIngress ingress;
     if (auto* renderer = g_activeRenderer.load(std::memory_order_acquire)) {
-        renderer->OnAsioBufferSwitch(doubleBufferIndex);
+        renderer->OnAsioBufferSwitch(doubleBufferIndex, nullptr);
     }
 }
 
@@ -55,9 +55,24 @@ ASIOTime* AsioBufferSwitchTimeInfo(ASIOTime* params,
                                    ASIOBool /*directProcess*/) {
     const AsioCallbackIngress ingress;
     if (auto* renderer = g_activeRenderer.load(std::memory_order_acquire)) {
-        renderer->OnAsioBufferSwitch(doubleBufferIndex);
+        renderer->OnAsioBufferSwitch(doubleBufferIndex, params);
     }
     return params;
+}
+
+std::int64_t QpcNow() {
+    LARGE_INTEGER value{};
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
+
+std::uint64_t AsioSamplesToUint64(const ASIOSamples& samples) {
+#if NATIVE_INT64
+    return samples > 0 ? static_cast<std::uint64_t>(samples) : 0;
+#else
+    return (static_cast<std::uint64_t>(samples.hi) << 32U) |
+            static_cast<std::uint32_t>(samples.lo);
+#endif
 }
 
 std::size_t NextPowerOfTwo(std::size_t value) {
@@ -573,7 +588,6 @@ bool RawFrameRingBuffer::Reset(std::uint32_t bytesPerFrame, std::uint32_t capaci
             static_cast<std::size_t>(bytesPerFrame) * static_cast<std::size_t>(capacityFrames);
     const std::size_t capacityBytes = NextPowerOfTwo(requestedBytes);
     bytes_.assign(capacityBytes, 0);
-    frameOrigins_.assign(capacityBytes / bytesPerFrame, FrameOrigin::Captured);
     byteMask_ = capacityBytes - 1;
     confirmedReadIndex_.store(0, std::memory_order_relaxed);
     dispatchReadIndex_.store(0, std::memory_order_relaxed);
@@ -586,12 +600,10 @@ void RawFrameRingBuffer::Clear() {
     dispatchReadIndex_.store(0, std::memory_order_release);
     writeIndex_.store(0, std::memory_order_release);
     std::fill(bytes_.begin(), bytes_.end(), static_cast<std::uint8_t>(0));
-    std::fill(frameOrigins_.begin(), frameOrigins_.end(), FrameOrigin::Captured);
 }
 
 std::uint32_t RawFrameRingBuffer::Push(const std::uint8_t* data,
-                                       std::uint32_t frameCount,
-                                       FrameOrigin origin) {
+                                       std::uint32_t frameCount) {
     if (data == nullptr || frameCount == 0 || bytesPerFrame_ == 0 || bytes_.empty()) {
         return 0;
     }
@@ -605,32 +617,8 @@ std::uint32_t RawFrameRingBuffer::Push(const std::uint8_t* data,
     }
 
     CopyInto(writeIndex, data, requestedBytes);
-    CopyOriginsInto(writeIndex, frameCount, origin);
     writeIndex_.store(writeIndex + requestedBytes, std::memory_order_release);
     return frameCount;
-}
-
-std::uint32_t RawFrameRingBuffer::PushSilence(std::uint32_t frameCount) {
-    if (frameCount == 0 || bytesPerFrame_ == 0 || bytes_.empty()) {
-        return 0;
-    }
-
-    const std::uint64_t readIndex = confirmedReadIndex_.load(std::memory_order_acquire);
-    const std::uint64_t writeIndex = writeIndex_.load(std::memory_order_relaxed);
-    const std::size_t requestedBytes =
-            static_cast<std::size_t>(frameCount) * static_cast<std::size_t>(bytesPerFrame_);
-    const std::size_t writableBytes =
-            (std::min)(requestedBytes, AvailableWriteBytes(readIndex, writeIndex)) /
-            bytesPerFrame_ * bytesPerFrame_;
-    if (writableBytes == 0) {
-        return 0;
-    }
-
-    const auto writableFrames = static_cast<std::uint32_t>(writableBytes / bytesPerFrame_);
-    ZeroInto(writeIndex, writableBytes);
-    CopyOriginsInto(writeIndex, writableFrames, FrameOrigin::PaddingSilence);
-    writeIndex_.store(writeIndex + writableBytes, std::memory_order_release);
-    return writableFrames;
 }
 
 std::uint32_t RawFrameRingBuffer::PushCapturedSilence(std::uint32_t frameCount) {
@@ -647,7 +635,6 @@ std::uint32_t RawFrameRingBuffer::PushCapturedSilence(std::uint32_t frameCount) 
     }
 
     ZeroInto(writeIndex, requestedBytes);
-    CopyOriginsInto(writeIndex, frameCount, FrameOrigin::Captured);
     writeIndex_.store(writeIndex + requestedBytes, std::memory_order_release);
     return frameCount;
 }
@@ -676,7 +663,6 @@ RawFrameRingBuffer::DispatchResult RawFrameRingBuffer::Dispatch(
 
     CopyOut(readIndex, data, readableBytes);
     result.frames = static_cast<std::uint32_t>(readableBytes / bytesPerFrame_);
-    result.paddingSilentFrames = CountPaddingOrigins(readIndex, result.frames);
     result.endIndex += readableBytes;
     dispatchReadIndex_.store(result.endIndex, std::memory_order_release);
     return result;
@@ -780,49 +766,6 @@ void RawFrameRingBuffer::CopyOut(std::uint64_t readIndex,
     if (bytes > firstChunk) {
         std::memcpy(data + firstChunk, bytes_.data(), bytes - firstChunk);
     }
-}
-
-void RawFrameRingBuffer::CopyOriginsInto(std::uint64_t writeIndex,
-                                         std::uint32_t frameCount,
-                                         FrameOrigin origin) {
-    if (frameCount == 0 || bytesPerFrame_ == 0 || frameOrigins_.empty()) {
-        return;
-    }
-    const std::uint64_t frameIndex = writeIndex / bytesPerFrame_;
-    const std::size_t offset = static_cast<std::size_t>(
-            frameIndex % static_cast<std::uint64_t>(frameOrigins_.size()));
-    const std::size_t firstChunk =
-            (std::min)(static_cast<std::size_t>(frameCount), frameOrigins_.size() - offset);
-    std::fill_n(frameOrigins_.begin() + static_cast<std::ptrdiff_t>(offset), firstChunk, origin);
-    if (static_cast<std::size_t>(frameCount) > firstChunk) {
-        std::fill_n(frameOrigins_.begin(),
-                    static_cast<std::size_t>(frameCount) - firstChunk,
-                    origin);
-    }
-}
-
-std::uint32_t RawFrameRingBuffer::CountPaddingOrigins(std::uint64_t readIndex,
-                                                       std::uint32_t frameCount) const {
-    if (frameCount == 0 || bytesPerFrame_ == 0 || frameOrigins_.empty()) {
-        return 0;
-    }
-    const std::uint64_t frameIndex = readIndex / bytesPerFrame_;
-    const std::size_t offset = static_cast<std::size_t>(
-            frameIndex % static_cast<std::uint64_t>(frameOrigins_.size()));
-    const std::size_t firstChunk =
-            (std::min)(static_cast<std::size_t>(frameCount), frameOrigins_.size() - offset);
-    std::uint32_t paddingFrames = static_cast<std::uint32_t>(
-            std::count(frameOrigins_.begin() + static_cast<std::ptrdiff_t>(offset),
-                       frameOrigins_.begin() + static_cast<std::ptrdiff_t>(offset + firstChunk),
-                       FrameOrigin::PaddingSilence));
-    if (static_cast<std::size_t>(frameCount) > firstChunk) {
-        paddingFrames += static_cast<std::uint32_t>(
-                std::count(frameOrigins_.begin(),
-                           frameOrigins_.begin() +
-                                   static_cast<std::ptrdiff_t>(frameCount - firstChunk),
-                           FrameOrigin::PaddingSilence));
-    }
-    return paddingFrames;
 }
 
 AsioRenderer::~AsioRenderer() {
@@ -931,20 +874,6 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
     }
     lock.unlock();
 
-    try {
-        paddingThread_ = std::thread(&AsioRenderer::PaddingLoop, this);
-    } catch (const std::exception&) {
-        Stop();
-        if (outError != nullptr) {
-            *outError = L"Failed to start buffer padding thread.";
-        }
-        return false;
-    }
-
-    // Prime only the retained tagged-silence queue. Both physical ASIO pages
-    // remain zeroed until the driver requests a page in its first callback.
-    MaintainPadding();
-
     std::wstring startError;
     if (!TryStartStreamIfReady(&startError)) {
         Stop();
@@ -961,7 +890,6 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
 
 void AsioRenderer::Stop() {
     running_.store(false, std::memory_order_release);
-    paddingCv_.notify_all();
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
         shutdownRequested_ = true;
@@ -970,9 +898,6 @@ void AsioRenderer::Stop() {
     startCv_.notify_all();
     initCv_.notify_all();
 
-    if (paddingThread_.joinable()) {
-        paddingThread_.join();
-    }
     if (controlThread_.joinable()) {
         controlThread_.join();
     }
@@ -1009,7 +934,7 @@ void AsioRenderer::Stop() {
     outputKind_ = OutputSampleKind::Unknown;
     outputAsioSampleType_ = ASIOSTLastEntry;
     outputRightShift_ = 0;
-    paddingActive_ = false;
+    capturedDrainActive_.store(false, std::memory_order_release);
 }
 
 std::uint32_t AsioRenderer::PushPcm(const std::uint8_t* data,
@@ -1054,7 +979,6 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
             }
             return 0;
         }
-        paddingActive_ = false;
         written = silence
                 ? ringBuffer_.PushCapturedSilence(frameCount)
                 : ringBuffer_.Push(data, frameCount);
@@ -1081,7 +1005,6 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
         }
         return written;
     }
-    paddingCv_.notify_one();
     if (written > 0 && !TryStartStreamIfReady(outError)) {
         return written;
     }
@@ -1175,6 +1098,46 @@ std::int64_t AsioRenderer::PendingCapturedFrames() const {
     return (std::max<std::int64_t>)(queued - confirmed, 0);
 }
 
+void AsioRenderer::BeginCapturedDrain() {
+    capturedDrainActive_.store(true, std::memory_order_release);
+    prebuffering_.store(false, std::memory_order_release);
+}
+
+void AsioRenderer::EndCapturedDrain() {
+    if (running_.load(std::memory_order_acquire) &&
+        streamActive_.load(std::memory_order_acquire) && prebufferFrames_ > 0) {
+        prebuffering_.store(true, std::memory_order_release);
+    }
+    capturedDrainActive_.store(false, std::memory_order_release);
+}
+
+DacClockSnapshot AsioRenderer::GetDacClockSnapshot() const {
+    constexpr int kMaxSnapshotAttempts = 16;
+    for (int attempt = 0; attempt < kMaxSnapshotAttempts; ++attempt) {
+        const std::uint32_t sequenceBefore =
+                dacClockSequence_.load(std::memory_order_acquire);
+        if ((sequenceBefore & 1U) != 0) {
+            YieldProcessor();
+            continue;
+        }
+
+        DacClockSnapshot snapshot{};
+        snapshot.valid = dacClockValid_.load(std::memory_order_relaxed);
+        snapshot.positionFrames =
+                dacPositionFrames_.load(std::memory_order_relaxed);
+        snapshot.anchorQpc = dacAnchorQpc_.load(std::memory_order_relaxed);
+        snapshot.bufferFrames =
+                dacClockBufferFrames_.load(std::memory_order_relaxed);
+
+        const std::uint32_t sequenceAfter =
+                dacClockSequence_.load(std::memory_order_acquire);
+        if (sequenceBefore == sequenceAfter && (sequenceAfter & 1U) == 0) {
+            return snapshot;
+        }
+    }
+    return {};
+}
+
 bool AsioRenderer::HasFault() const {
     return faultRequested_.load(std::memory_order_acquire) ||
            faulted_.load(std::memory_order_acquire);
@@ -1185,7 +1148,9 @@ std::wstring AsioRenderer::FaultMessage() const {
     return faultMessage_;
 }
 
-void AsioRenderer::OnAsioBufferSwitch(long doubleBufferIndex) {
+void AsioRenderer::OnAsioBufferSwitch(long doubleBufferIndex,
+                                      const ASIOTime* timeInfo) {
+    const std::int64_t callbackQpc = QpcNow();
     if (callbackActive_.test_and_set(std::memory_order_acquire)) {
         if (callbackThreadId_.load(std::memory_order_acquire) == GetCurrentThreadId()) {
             running_.store(false, std::memory_order_release);
@@ -1231,11 +1196,16 @@ void AsioRenderer::OnAsioBufferSwitch(long doubleBufferIndex) {
         firstOutputPage.dispatchEndIndex = ringBuffer_.DispatchPosition();
         firstOutputPage.outputFrames = bufferFrames_;
         firstOutputPage.capturedFrames = 0;
-        firstOutputPage.paddingSilentFrames = bufferFrames_;
+        firstOutputPage.managedSilentFrames = bufferFrames_;
         firstOutputPage.underrunSilentFrames = 0;
         awaitingFirstBufferSwitch_ = false;
     }
     if (!ConfirmOutputPage(doubleBufferIndex)) {
+        FillOutputBufferWithSilence(doubleBufferIndex);
+        finishCallback();
+        return;
+    }
+    if (!PublishDacClock(timeInfo, callbackQpc)) {
         FillOutputBufferWithSilence(doubleBufferIndex);
         finishCallback();
         return;
@@ -1351,7 +1321,6 @@ void AsioRenderer::ControlLoop(std::wstring deviceId,
                 LatchFault(startError);
             } else {
                 streamActive_.store(true, std::memory_order_release);
-                prebuffering_.store(false, std::memory_order_release);
                 if (faultRequested_.load(std::memory_order_acquire)) {
                     started = false;
                     startError = L"ASIO renderer entered a faulting state while output was starting.";
@@ -1712,7 +1681,8 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
     }
     running_.store(true, std::memory_order_release);
     streamActive_.store(false, std::memory_order_release);
-    prebuffering_.store(false, std::memory_order_release);
+    capturedDrainActive_.store(false, std::memory_order_release);
+    prebuffering_.store(prebufferFrames_ > 0, std::memory_order_release);
     return true;
 }
 
@@ -1800,43 +1770,6 @@ bool AsioRenderer::TryStartStreamIfReady(std::wstring* outError) {
     return true;
 }
 
-void AsioRenderer::PaddingLoop() {
-    while (running_.load(std::memory_order_acquire)) {
-        std::unique_lock<std::mutex> waitLock(paddingWaitMutex_);
-        paddingCv_.wait_for(waitLock, std::chrono::milliseconds(5), [this] {
-            return !running_.load(std::memory_order_acquire);
-        });
-        waitLock.unlock();
-        if (!running_.load(std::memory_order_acquire)) {
-            break;
-        }
-        MaintainPadding();
-    }
-}
-
-void AsioRenderer::MaintainPadding() {
-    if (!running_.load(std::memory_order_acquire) || prebufferFrames_ == 0 ||
-        maxBufferAdvanceFrames_ >= prebufferFrames_) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> producerLock(producerMutex_);
-    if (!running_.load(std::memory_order_acquire)) {
-        return;
-    }
-
-    const std::uint32_t bufferedFrames = ringBuffer_.PendingFrames();
-    const std::uint32_t triggerFrames = prebufferFrames_ - maxBufferAdvanceFrames_;
-    if (!paddingActive_ && bufferedFrames < triggerFrames) {
-        paddingActive_ = true;
-    }
-    if (!paddingActive_ || bufferedFrames >= prebufferFrames_) {
-        return;
-    }
-
-    ringBuffer_.PushSilence(prebufferFrames_ - bufferedFrames);
-}
-
 bool AsioRenderer::ConfirmOutputPage(long doubleBufferIndex) {
     if (doubleBufferIndex < 0 || doubleBufferIndex > 1) {
         return false;
@@ -1869,10 +1802,9 @@ bool AsioRenderer::ConfirmOutputPage(long doubleBufferIndex) {
         underrunCount_.fetch_add(1, std::memory_order_relaxed);
     }
     RecordOutputFrames(page.outputFrames,
-                       page.paddingSilentFrames + page.underrunSilentFrames);
+                       page.managedSilentFrames + page.underrunSilentFrames);
     page = {};
     ++nextConfirmSequence_;
-    paddingCv_.notify_one();
     return true;
 }
 
@@ -1882,6 +1814,67 @@ void AsioRenderer::RollbackOutputPages() {
     nextDispatchSequence_ = 1;
     nextConfirmSequence_ = 1;
     awaitingFirstBufferSwitch_ = true;
+}
+
+bool AsioRenderer::PublishDacClock(const ASIOTime* timeInfo,
+                                   std::int64_t callbackQpc) {
+    const bool hasDriverPosition = timeInfo != nullptr &&
+            (timeInfo->timeInfo.flags & kSamplePositionValid) != 0;
+    if (hasDriverPosition) {
+        const std::uint64_t driverPosition =
+                AsioSamplesToUint64(timeInfo->timeInfo.samplePosition);
+        if (hasDriverSamplePosition_) {
+            if (driverPosition < lastDriverSamplePosition_) {
+                LatchFault(L"ASIO sample position moved backwards.", true);
+                return false;
+            }
+            const std::uint64_t delta = driverPosition - lastDriverSamplePosition_;
+            if (delta > (std::numeric_limits<std::uint64_t>::max)() -
+                                normalizedDacPosition_) {
+                LatchFault(L"ASIO sample position overflowed the DAC clock.", true);
+                return false;
+            }
+            normalizedDacPosition_ += delta;
+        } else {
+            const std::int64_t confirmed = ConfirmedOutputFrames();
+            normalizedDacPosition_ = confirmed > 0
+                    ? static_cast<std::uint64_t>(confirmed)
+                    : 0;
+            hasDriverSamplePosition_ = true;
+        }
+        lastDriverSamplePosition_ = driverPosition;
+    } else {
+        // Drivers that keep using the legacy bufferSwitch callback still give
+        // us a DAC-paced page boundary. The confirmed output ledger is the
+        // normalized position of the page that starts at this callback.
+        const std::int64_t confirmed = ConfirmedOutputFrames();
+        normalizedDacPosition_ = confirmed > 0
+                ? static_cast<std::uint64_t>(confirmed)
+                : 0;
+        hasDriverSamplePosition_ = false;
+        lastDriverSamplePosition_ = 0;
+    }
+
+    dacClockSequence_.fetch_add(1, std::memory_order_acq_rel);
+    dacPositionFrames_.store(normalizedDacPosition_, std::memory_order_relaxed);
+    dacAnchorQpc_.store(callbackQpc, std::memory_order_relaxed);
+    dacClockBufferFrames_.store(bufferFrames_, std::memory_order_relaxed);
+    dacClockValid_.store(bufferFrames_ != 0 && callbackQpc > 0,
+                         std::memory_order_relaxed);
+    dacClockSequence_.fetch_add(1, std::memory_order_release);
+    return true;
+}
+
+void AsioRenderer::ResetDacClock() {
+    hasDriverSamplePosition_ = false;
+    lastDriverSamplePosition_ = 0;
+    normalizedDacPosition_ = 0;
+    dacClockSequence_.fetch_add(1, std::memory_order_acq_rel);
+    dacPositionFrames_.store(0, std::memory_order_relaxed);
+    dacAnchorQpc_.store(0, std::memory_order_relaxed);
+    dacClockBufferFrames_.store(0, std::memory_order_relaxed);
+    dacClockValid_.store(false, std::memory_order_relaxed);
+    dacClockSequence_.fetch_add(1, std::memory_order_release);
 }
 
 bool AsioRenderer::LatchFault(const std::wstring& message, bool fromOutputCallback) {
@@ -1916,7 +1909,6 @@ bool AsioRenderer::LatchFault(const std::wstring& message, bool fromOutputCallba
     }
 
     faultStopRequested_.store(true, std::memory_order_release);
-    paddingCv_.notify_all();
     controlCv_.notify_all();
     startCv_.notify_all();
     return true;
@@ -1930,8 +1922,40 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
         return;
     }
 
-    const RawFrameRingBuffer::DispatchResult dispatched =
-            ringBuffer_.Dispatch(callbackBuffer_.data(), bufferFrames_);
+    const bool draining = capturedDrainActive_.load(std::memory_order_acquire);
+    const std::uint32_t availableFrames = ringBuffer_.AvailableReadFrames();
+    bool holdForPrebuffer = false;
+    if (!draining && prebufferFrames_ > 0) {
+        bool prebuffering = prebuffering_.load(std::memory_order_acquire);
+        if (!prebuffering && maxBufferAdvanceFrames_ < prebufferFrames_) {
+            const std::uint32_t triggerFrames =
+                    prebufferFrames_ - maxBufferAdvanceFrames_;
+            if (availableFrames < triggerFrames) {
+                prebuffering_.store(true, std::memory_order_release);
+                prebuffering = true;
+            }
+        }
+
+        if (prebuffering) {
+            const std::uint32_t startThreshold = (std::max<std::uint32_t>)(
+                    prebufferFrames_, bufferFrames_ * 2U);
+            if (availableFrames < startThreshold) {
+                holdForPrebuffer = true;
+            } else {
+                prebuffering_.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    RawFrameRingBuffer::DispatchResult dispatched{};
+    if (holdForPrebuffer) {
+        // Prebuffering is a DAC-side hold, not queued PCM. The callback keeps
+        // the driver clock moving with a local silent page while every captured
+        // frame remains available for the next real output page.
+        dispatched.endIndex = ringBuffer_.DispatchPosition();
+    } else {
+        dispatched = ringBuffer_.Dispatch(callbackBuffer_.data(), bufferFrames_);
+    }
     const std::uint32_t underrunSilentFrames = bufferFrames_ - dispatched.frames;
     if (underrunSilentFrames > 0) {
         std::memset(callbackBuffer_.data() +
@@ -1946,9 +1970,10 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
     page.sequence = nextDispatchSequence_++;
     page.dispatchEndIndex = dispatched.endIndex;
     page.outputFrames = bufferFrames_;
-    page.paddingSilentFrames = dispatched.paddingSilentFrames;
-    page.capturedFrames = dispatched.frames - dispatched.paddingSilentFrames;
-    page.underrunSilentFrames = underrunSilentFrames;
+    page.capturedFrames = dispatched.frames;
+    const bool managedSilence = holdForPrebuffer || draining;
+    page.managedSilentFrames = managedSilence ? underrunSilentFrames : 0;
+    page.underrunSilentFrames = managedSilence ? 0 : underrunSilentFrames;
 }
 
 void AsioRenderer::FillOutputBufferWithSilence(long doubleBufferIndex) {
@@ -2075,6 +2100,7 @@ std::int32_t AsioRenderer::ReadSourceInt32(const std::uint8_t* interleaved,
 }
 
 void AsioRenderer::ResetStats() {
+    ResetDacClock();
     {
         std::lock_guard<std::mutex> lock(faultMutex_);
         faultMessage_.clear();

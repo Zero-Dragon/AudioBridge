@@ -1895,6 +1895,7 @@ void AudioBridgeCore::PublishRendererCounters() {
     std::lock_guard<std::mutex> controlLock(controlStateMutex_);
     const auto captured = renderer_.ConfirmedCapturedFrames();
     const auto output = renderer_.ConfirmedOutputFrames();
+    const auto dacClock = renderer_.GetDacClockSnapshot();
     InterlockedIncrement(&control_->counterSequence);
     MemoryBarrier();
     InterlockedExchange(&control_->consumedCapturedLow,
@@ -1905,6 +1906,19 @@ void AudioBridgeCore::PublishRendererCounters() {
                         hook_protocol::CounterLow(output));
     InterlockedExchange(&control_->consumedOutputHigh,
                         hook_protocol::CounterHigh(output));
+    InterlockedExchange(&control_->dacPositionLow,
+                        hook_protocol::CounterLow(dacClock.positionFrames));
+    InterlockedExchange(&control_->dacPositionHigh,
+                        hook_protocol::CounterHigh(dacClock.positionFrames));
+    InterlockedExchange(&control_->dacAnchorQpcLow,
+                        hook_protocol::CounterLow(
+                                static_cast<std::uint64_t>(dacClock.anchorQpc)));
+    InterlockedExchange(&control_->dacAnchorQpcHigh,
+                        hook_protocol::CounterHigh(
+                                static_cast<std::uint64_t>(dacClock.anchorQpc)));
+    InterlockedExchange(&control_->dacBufferFrames,
+                        static_cast<LONG>(dacClock.bufferFrames));
+    InterlockedExchange(&control_->dacClockValid, dacClock.valid ? 1 : 0);
     MemoryBarrier();
     InterlockedIncrement(&control_->counterSequence);
 }
@@ -1957,6 +1971,7 @@ bool AudioBridgeCore::WaitForCapturedDrainLocked(std::wstring* outError) {
     const auto timeout = std::chrono::milliseconds(
             static_cast<std::int64_t>((std::max)(drainPrebufferMs, 0)) + 5000);
     const auto deadline = std::chrono::steady_clock::now() + timeout;
+    renderer_.BeginCapturedDrain();
     while (renderer_.PendingCapturedFrames() > 0) {
         if (pipelineFaulted_.load(std::memory_order_acquire) ||
             renderer_.HasFault()) {
@@ -1965,6 +1980,7 @@ bool AudioBridgeCore::WaitForCapturedDrainLocked(std::wstring* outError) {
                         ? L"ASIO renderer faulted while draining accepted audio."
                         : renderer_.FaultMessage();
             }
+            renderer_.EndCapturedDrain();
             return false;
         }
         if (!running_.load(std::memory_order_acquire) ||
@@ -1972,10 +1988,12 @@ bool AudioBridgeCore::WaitForCapturedDrainLocked(std::wstring* outError) {
             if (outError != nullptr) {
                 *outError = L"Timed out while preserving accepted audio before ASIO reconfiguration.";
             }
+            renderer_.EndCapturedDrain();
             return false;
         }
         Sleep(1);
     }
+    renderer_.EndCapturedDrain();
     return true;
 }
 

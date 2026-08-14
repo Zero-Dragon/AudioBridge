@@ -209,7 +209,7 @@
                        Value="100"
                        SpinButtonPlacementMode="Inline"
                        ValueChanged="MaxBufferAdvanceBox_ValueChanged"
-                       ToolTipService.ToolTip="When buffered audio falls below Prebuffer minus this value, AudioBridge pads the queue with silence to restore the configured Prebuffer." />
+                       ToolTipService.ToolTip="When real buffered audio falls below Prebuffer minus this value, AudioBridge keeps ASIO running with callback-local silence until the real queue returns to Prebuffer. Generated silence is never added to Buffer Fill." />
 
             <CheckBox x:Name="FakeOutputCheckBox"
                       Grid.Row="1"

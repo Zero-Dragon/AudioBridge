@@ -15,8 +15,8 @@
 
 namespace audiobridge::hook_protocol {
 
-constexpr LONG kControlProtocolVersion = 2;
-constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControlV2";
+constexpr LONG kControlProtocolVersion = 3;
+constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControlV3";
 
 constexpr DWORD kPipeMagic = 0x48504241;  // ABPH
 constexpr DWORD kPipeText = 1;
@@ -81,6 +81,12 @@ struct HookControlBlock {
     volatile LONG consumedCapturedBaselineHigh = 0;
     volatile LONG consumedCapturedOffsetLow = 0;
     volatile LONG consumedCapturedOffsetHigh = 0;
+    volatile LONG dacPositionLow = 0;
+    volatile LONG dacPositionHigh = 0;
+    volatile LONG dacAnchorQpcLow = 0;
+    volatile LONG dacAnchorQpcHigh = 0;
+    volatile LONG dacBufferFrames = 0;
+    volatile LONG dacClockValid = 0;
 };
 
 static_assert(sizeof(PipeMessageHeader) == 24);
@@ -93,11 +99,13 @@ static_assert(offsetof(PipePcmMessage, sequence) == 8);
 static_assert(offsetof(PipePcmMessage, submittedFrames) == 16);
 static_assert(offsetof(PipePcmMessage, frameCount) == 24);
 static_assert(offsetof(PipePcmMessage, flags) == 28);
-static_assert(sizeof(HookControlBlock) == 76);
+static_assert(sizeof(HookControlBlock) == 100);
 static_assert(alignof(HookControlBlock) == alignof(LONG));
 static_assert(offsetof(HookControlBlock, configSequence) == 16);
 static_assert(offsetof(HookControlBlock, counterSequence) == 40);
 static_assert(offsetof(HookControlBlock, consumedCapturedOffsetHigh) == 72);
+static_assert(offsetof(HookControlBlock, dacPositionLow) == 76);
+static_assert(offsetof(HookControlBlock, dacClockValid) == 96);
 
 inline std::uint64_t ReadStreamId(const HookControlBlock& control) noexcept {
     const auto low = static_cast<std::uint32_t>(control.streamIdLow);

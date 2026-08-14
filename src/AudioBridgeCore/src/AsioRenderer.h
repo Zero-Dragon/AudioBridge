@@ -68,29 +68,27 @@ struct AsioClockSourceInfo {
     std::wstring name;
 };
 
+struct DacClockSnapshot {
+    bool valid = false;
+    std::uint64_t positionFrames = 0;
+    std::int64_t anchorQpc = 0;
+    std::uint32_t bufferFrames = 0;
+};
+
 bool QueryAsioClockSources(const std::wstring& deviceId,
                            std::vector<AsioClockSourceInfo>* sources,
                            std::wstring* outError);
 
 class RawFrameRingBuffer {
 public:
-    enum class FrameOrigin : std::uint8_t {
-        Captured,
-        PaddingSilence,
-    };
-
     struct DispatchResult {
         std::uint32_t frames = 0;
-        std::uint32_t paddingSilentFrames = 0;
         std::uint64_t endIndex = 0;
     };
 
     bool Reset(std::uint32_t bytesPerFrame, std::uint32_t capacityFrames);
     void Clear();
-    std::uint32_t Push(const std::uint8_t* data,
-                       std::uint32_t frameCount,
-                       FrameOrigin origin = FrameOrigin::Captured);
-    std::uint32_t PushSilence(std::uint32_t frameCount);
+    std::uint32_t Push(const std::uint8_t* data, std::uint32_t frameCount);
     std::uint32_t PushCapturedSilence(std::uint32_t frameCount);
     DispatchResult Dispatch(std::uint8_t* data, std::uint32_t frameCount);
     bool ConfirmDispatch(std::uint64_t endIndex);
@@ -113,14 +111,8 @@ private:
                   std::size_t bytes);
     void ZeroInto(std::uint64_t writeIndex, std::size_t bytes);
     void CopyOut(std::uint64_t readIndex, std::uint8_t* data, std::size_t bytes) const;
-    void CopyOriginsInto(std::uint64_t writeIndex,
-                         std::uint32_t frameCount,
-                         FrameOrigin origin);
-    std::uint32_t CountPaddingOrigins(std::uint64_t readIndex,
-                                      std::uint32_t frameCount) const;
 
     std::vector<std::uint8_t> bytes_;
-    std::vector<FrameOrigin> frameOrigins_;
     std::size_t byteMask_ = 0;
     std::atomic<std::uint64_t> confirmedReadIndex_{0};
     std::atomic<std::uint64_t> dispatchReadIndex_{0};
@@ -170,10 +162,13 @@ public:
     std::int64_t ConfirmedCapturedFrames() const;
     std::int64_t ConfirmedOutputFrames() const;
     std::int64_t PendingCapturedFrames() const;
+    void BeginCapturedDrain();
+    void EndCapturedDrain();
+    DacClockSnapshot GetDacClockSnapshot() const;
     bool HasFault() const;
     std::wstring FaultMessage() const;
 
-    void OnAsioBufferSwitch(long doubleBufferIndex);
+    void OnAsioBufferSwitch(long doubleBufferIndex, const ASIOTime* timeInfo = nullptr);
     void OnAsioSampleRateChanged(ASIOSampleRate sampleRate);
     long OnAsioMessage(long selector, long value, void* message, double* opt);
 
@@ -184,7 +179,7 @@ private:
         std::uint64_t dispatchEndIndex = 0;
         std::uint32_t outputFrames = 0;
         std::uint32_t capturedFrames = 0;
-        std::uint32_t paddingSilentFrames = 0;
+        std::uint32_t managedSilentFrames = 0;
         std::uint32_t underrunSilentFrames = 0;
     };
 
@@ -217,13 +212,13 @@ private:
                                      std::uint32_t frameCount,
                                      bool silence,
                                      std::wstring* outError);
-    void PaddingLoop();
-    void MaintainPadding();
     bool ConfirmOutputPage(long doubleBufferIndex);
     void RollbackOutputPages();
     bool LatchFault(const std::wstring& message, bool fromOutputCallback = false);
     void FillOutputBuffer(long doubleBufferIndex);
     void FillOutputBufferWithSilence(long doubleBufferIndex);
+    bool PublishDacClock(const ASIOTime* timeInfo, std::int64_t callbackQpc);
+    void ResetDacClock();
     void WriteConvertedOutput(const std::uint8_t* interleaved,
                               std::uint32_t frameCount,
                               long doubleBufferIndex);
@@ -239,13 +234,10 @@ private:
 
     mutable std::mutex mutex_;
     std::thread controlThread_;
-    std::thread paddingThread_;
     std::mutex controlMutex_;
     std::condition_variable initCv_;
     std::condition_variable controlCv_;
     std::condition_variable startCv_;
-    std::mutex paddingWaitMutex_;
-    std::condition_variable paddingCv_;
     std::mutex producerMutex_;
     std::mutex callbackWaitMutex_;
     std::condition_variable callbackIdleCv_;
@@ -295,13 +287,15 @@ private:
     std::int32_t prebufferMs_ = 300;
     std::uint32_t maxBufferAdvanceFrames_ = 0;
     std::int32_t maxBufferAdvanceMs_ = 100;
-    bool paddingActive_ = false;
     RawFrameRingBuffer ringBuffer_;
     std::vector<std::uint8_t> callbackBuffer_;
     std::array<OutputPageLedger, 2> outputPageLedgers_{};
     std::uint64_t nextDispatchSequence_ = 1;
     std::uint64_t nextConfirmSequence_ = 1;
     bool awaitingFirstBufferSwitch_ = true;
+    bool hasDriverSamplePosition_ = false;
+    std::uint64_t lastDriverSamplePosition_ = 0;
+    std::uint64_t normalizedDacPosition_ = 0;
 
     std::atomic<std::int64_t> totalFramesQueued_{0};
     std::atomic<std::int64_t> totalFramesPlayed_{0};
@@ -309,6 +303,12 @@ private:
     std::atomic<std::int64_t> totalOutputFrames_{0};
     std::atomic<std::int64_t> totalSilentFrames_{0};
     std::atomic<std::int64_t> underrunCount_{0};
+    std::atomic<bool> capturedDrainActive_{false};
+    std::atomic<std::uint32_t> dacClockSequence_{0};
+    std::atomic<std::uint64_t> dacPositionFrames_{0};
+    std::atomic<std::int64_t> dacAnchorQpc_{0};
+    std::atomic<std::uint32_t> dacClockBufferFrames_{0};
+    std::atomic<bool> dacClockValid_{false};
     std::atomic<std::int64_t> asioResetRequests_{0};
     std::atomic<std::int64_t> asioBufferSizeChanges_{0};
     std::atomic<std::int64_t> asioLatencyChanges_{0};

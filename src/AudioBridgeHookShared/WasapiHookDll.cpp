@@ -68,6 +68,7 @@ struct AudioClientState {
     REFERENCE_TIME fakeMinPeriod = 30000;
     HANDLE fakeEvent = nullptr;
     std::uint64_t fakeDevicePosition = 0;
+    LONGLONG fakeDevicePositionQpc = 0;
     std::uint64_t fakeQueuedFrames = 0;
     std::uint64_t fakeReservedFrames = 0;
     std::uint64_t fakeFrameRemainder = 0;
@@ -79,8 +80,10 @@ struct AudioClientState {
     std::uint64_t nextPcmSequence = 0;
     std::uint64_t confirmedCapturedFrames = 0;
     std::uint64_t lastRawConsumedOutputFrames = 0;
+    std::uint64_t lastRawDacPositionFrames = 0;
+    std::uint64_t lastManagedDacPositionFrames = 0;
     LONG managedOutputGeneration = 0;
-    bool hasManagedOutputBaseline = false;
+    bool hasManagedDacBaseline = false;
     bool fakeBridgeManaged = false;
     bool fakeFaulted = false;
     bool submissionInFlight = false;
@@ -134,6 +137,10 @@ struct ControlSnapshot {
     std::uint64_t consumedOutputFrames = 0;
     std::uint64_t consumedCapturedBaseline = 0;
     std::uint64_t consumedCapturedOffset = 0;
+    std::uint64_t dacPositionFrames = 0;
+    std::uint64_t dacAnchorQpc = 0;
+    std::uint32_t dacBufferFrames = 0;
+    bool dacClockValid = false;
 };
 
 struct FakeRenderClient {
@@ -295,6 +302,12 @@ bool ReadControlSnapshot(ControlSnapshot* snapshot) {
         const LONG baselineHigh = control->consumedCapturedBaselineHigh;
         const LONG offsetLow = control->consumedCapturedOffsetLow;
         const LONG offsetHigh = control->consumedCapturedOffsetHigh;
+        const LONG dacPositionLow = control->dacPositionLow;
+        const LONG dacPositionHigh = control->dacPositionHigh;
+        const LONG dacAnchorQpcLow = control->dacAnchorQpcLow;
+        const LONG dacAnchorQpcHigh = control->dacAnchorQpcHigh;
+        const LONG dacBufferFrames = control->dacBufferFrames;
+        const LONG dacClockValid = control->dacClockValid;
         MemoryBarrier();
         const LONG counterAfter = control->counterSequence;
         const LONG configFinal = control->configSequence;
@@ -317,6 +330,15 @@ bool ReadControlSnapshot(ControlSnapshot* snapshot) {
                 audiobridge::hook_protocol::JoinCounter(baselineLow, baselineHigh);
         candidate.consumedCapturedOffset =
                 audiobridge::hook_protocol::JoinCounter(offsetLow, offsetHigh);
+        candidate.dacPositionFrames = audiobridge::hook_protocol::JoinCounter(
+                dacPositionLow, dacPositionHigh);
+        candidate.dacAnchorQpc = audiobridge::hook_protocol::JoinCounter(
+                dacAnchorQpcLow, dacAnchorQpcHigh);
+        candidate.dacBufferFrames = dacBufferFrames > 0
+                ? static_cast<std::uint32_t>(dacBufferFrames)
+                : 0;
+        candidate.dacClockValid = dacClockValid != 0 &&
+                candidate.dacAnchorQpc != 0 && candidate.dacBufferFrames != 0;
         candidate.valid = true;
         *snapshot = candidate;
         return true;
@@ -566,7 +588,44 @@ std::uint64_t QpcToHns(LONGLONG qpc) {
             ((ticks % frequency) * 10000000ull) / frequency;
 }
 
-bool ApplyAuthoritativeProgressLocked(AudioClientState& state) {
+bool EstimateDacPosition(const ControlSnapshot& snapshot,
+                         LONGLONG nowQpc,
+                         std::uint64_t* positionFrames) {
+    if (positionFrames == nullptr || !snapshot.dacClockValid ||
+        snapshot.sampleRate == 0 || snapshot.dacBufferFrames == 0 ||
+        snapshot.dacAnchorQpc == 0 ||
+        snapshot.dacAnchorQpc >
+                static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)())) {
+        return false;
+    }
+
+    const LONGLONG anchorQpc = static_cast<LONGLONG>(snapshot.dacAnchorQpc);
+    std::uint64_t advancedFrames = 0;
+    if (nowQpc > anchorQpc) {
+        const auto frequency = static_cast<std::uint64_t>(QpcFrequency());
+        const auto sampleRate = static_cast<std::uint64_t>(snapshot.sampleRate);
+        const auto maximumAdvance =
+                static_cast<std::uint64_t>(snapshot.dacBufferFrames);
+        const auto pageTicks =
+                (maximumAdvance * frequency + sampleRate - 1U) / sampleRate;
+        const auto elapsedTicks = (std::min)(
+                static_cast<std::uint64_t>(nowQpc - anchorQpc), pageTicks);
+        const auto wholeSeconds = elapsedTicks / frequency;
+        const auto partialTicks = elapsedTicks % frequency;
+        advancedFrames = wholeSeconds * sampleRate +
+                (partialTicks * sampleRate) / frequency;
+        advancedFrames = (std::min)(advancedFrames, maximumAdvance);
+    }
+
+    if (advancedFrames > (std::numeric_limits<std::uint64_t>::max)() -
+                                 snapshot.dacPositionFrames) {
+        return false;
+    }
+    *positionFrames = snapshot.dacPositionFrames + advancedFrames;
+    return true;
+}
+
+bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) {
     ControlSnapshot snapshot{};
     const bool hasSnapshot = ReadControlSnapshot(&snapshot);
     const bool selectedProcess = hasSnapshot && snapshot.valid &&
@@ -574,24 +633,23 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state) {
     if (selectedProcess && snapshot.rendererState == RendererState::Faulted &&
         state.fakeOutput) {
         // Faulted describes the selected PID's whole renderer pipeline. It can
-        // be published before Core has a usable stream id (for example after a
-        // missing format), so every fake client in that PID must fail closed.
+        // be published before Core has a usable stream id, so every fake
+        // client in that PID must fail closed.
         state.fakeFaulted = true;
         return true;
     }
 
     const bool matchesStream = selectedProcess &&
             snapshot.streamId != 0 && snapshot.streamId == state.streamId;
-
     if (!matchesStream) {
-        // Once Core has taken custody of this stream, loss of a matching
-        // snapshot must freeze it rather than falling back to synthetic time.
+        // Once Core has taken custody of this stream, loss of a matching route
+        // freezes it rather than falling back to an unrelated wall clock.
         return state.fakeBridgeManaged;
     }
 
     state.fakeBridgeManaged = true;
     if (snapshot.rendererState != RendererState::Running) {
-        // Idle and Reconfiguring both preserve the last confirmed progress.
+        // Reconfiguration and idle periods do not consume virtual WASAPI data.
         return true;
     }
 
@@ -613,49 +671,77 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state) {
             ? state.pendingSubmittedFrames
             : state.successfulSubmittedFrames;
     if (confirmedCaptured < state.confirmedCapturedFrames ||
-        confirmedCaptured > submittedCeiling) {
+        confirmedCaptured > submittedCeiling ||
+        state.fakeQueuedFrames > state.fakeBufferFrames) {
         state.fakeFaulted = true;
         return true;
     }
-
     state.confirmedCapturedFrames = confirmedCaptured;
-    if (confirmedCaptured <= state.successfulSubmittedFrames) {
-        state.fakeQueuedFrames = state.successfulSubmittedFrames - confirmedCaptured;
-    }
-    if (state.fakeQueuedFrames > state.fakeBufferFrames) {
-        state.fakeFaulted = true;
+
+    std::uint64_t dacPositionFrames = 0;
+    const bool hasDacPosition = EstimateDacPosition(
+            snapshot, nowQpc, &dacPositionFrames);
+    const bool newGeneration = !state.hasManagedDacBaseline ||
+            state.managedOutputGeneration != snapshot.streamGeneration;
+    if (newGeneration) {
+        // ASIO counters and sample positions may restart during a format or
+        // device rebuild. The new generation is a fresh DAC anchor, never a
+        // jump in the already-published virtual IAudioClock.
+        state.lastRawConsumedOutputFrames = snapshot.consumedOutputFrames;
+        state.lastRawDacPositionFrames = snapshot.dacPositionFrames;
+        state.lastManagedDacPositionFrames = dacPositionFrames;
+        state.managedOutputGeneration = snapshot.streamGeneration;
+        state.hasManagedDacBaseline = hasDacPosition;
+        if (state.fakeDevicePositionQpc <= 0) {
+            state.fakeDevicePositionQpc = nowQpc;
+        }
         return true;
     }
 
-    if (!state.hasManagedOutputBaseline ||
-        state.managedOutputGeneration != snapshot.streamGeneration) {
-        // Core resets the raw renderer counter when ASIO is rebuilt. A new
-        // generation establishes a baseline; it must never move the client's
-        // already-published IAudioClock position backwards or invent a jump.
-        state.lastRawConsumedOutputFrames = snapshot.consumedOutputFrames;
-        state.managedOutputGeneration = snapshot.streamGeneration;
-        state.hasManagedOutputBaseline = true;
-    } else if (snapshot.consumedOutputFrames < state.lastRawConsumedOutputFrames) {
+    if (snapshot.consumedOutputFrames < state.lastRawConsumedOutputFrames) {
         state.fakeFaulted = true;
         return true;
-    } else {
-        const std::uint64_t outputDelta =
-                snapshot.consumedOutputFrames - state.lastRawConsumedOutputFrames;
-        if (state.fakeStarted) {
-            if (outputDelta > (std::numeric_limits<std::uint64_t>::max)() -
-                                      state.fakeDevicePosition) {
-                state.fakeFaulted = true;
-                return true;
-            }
-            state.fakeDevicePosition += outputDelta;
-        }
-        state.lastRawConsumedOutputFrames = snapshot.consumedOutputFrames;
+    }
+    state.lastRawConsumedOutputFrames = snapshot.consumedOutputFrames;
+    if (!hasDacPosition) {
+        // Running without a valid DAC anchor must freeze instead of inventing
+        // consumption from QPC alone.
+        return true;
+    }
+    if (snapshot.dacPositionFrames < state.lastRawDacPositionFrames) {
+        state.fakeFaulted = true;
+        return true;
+    }
+    state.lastRawDacPositionFrames = snapshot.dacPositionFrames;
+
+    if (!state.fakeStarted) {
+        // Output produced while this virtual client is stopped establishes a
+        // baseline only; it cannot become future application capacity.
+        state.lastManagedDacPositionFrames = dacPositionFrames;
+        return true;
+    }
+
+    const std::uint64_t monotonicDacPosition = (std::max)(
+            dacPositionFrames, state.lastManagedDacPositionFrames);
+    const std::uint64_t releasedFrames =
+            monotonicDacPosition - state.lastManagedDacPositionFrames;
+    state.lastManagedDacPositionFrames = monotonicDacPosition;
+    state.fakeQueuedFrames -=
+            (std::min)(state.fakeQueuedFrames, releasedFrames);
+    if (releasedFrames > (std::numeric_limits<std::uint64_t>::max)() -
+                                 state.fakeDevicePosition) {
+        state.fakeFaulted = true;
+        return true;
+    }
+    state.fakeDevicePosition += releasedFrames;
+    if (releasedFrames > 0) {
+        state.fakeDevicePositionQpc = nowQpc;
     }
     return true;
 }
 
 void AdvanceFakePlaybackLocked(AudioClientState& state, LONGLONG nowQpc) {
-    if (ApplyAuthoritativeProgressLocked(state)) {
+    if (ApplyAuthoritativeProgressLocked(state, nowQpc)) {
         return;
     }
     if (!state.fakeStarted) {
@@ -683,6 +769,9 @@ void AdvanceFakePlaybackLocked(AudioClientState& state, LONGLONG nowQpc) {
     state.fakeFrameRemainder = partialNumerator % frequency;
     state.fakeLastUpdateQpc = nowQpc;
     state.fakeDevicePosition += advancedFrames;
+    if (advancedFrames > 0) {
+        state.fakeDevicePositionQpc = nowQpc;
+    }
     state.fakeQueuedFrames -=
             (std::min)(state.fakeQueuedFrames, advancedFrames);
 }
@@ -951,6 +1040,7 @@ void StoreFakeInitialization(IAudioClient* client,
                             sampleRate,
                             30000);
     state.fakeDevicePosition = 0;
+    state.fakeDevicePositionQpc = 0;
     state.fakeQueuedFrames = 0;
     state.fakeReservedFrames = 0;
     state.fakeFrameRemainder = 0;
@@ -961,8 +1051,10 @@ void StoreFakeInitialization(IAudioClient* client,
     state.nextPcmSequence = 0;
     state.confirmedCapturedFrames = 0;
     state.lastRawConsumedOutputFrames = 0;
+    state.lastRawDacPositionFrames = 0;
+    state.lastManagedDacPositionFrames = 0;
     state.managedOutputGeneration = 0;
-    state.hasManagedOutputBaseline = false;
+    state.hasManagedDacBaseline = false;
     state.fakeBridgeManaged = false;
     state.fakeFaulted = existingFault;
     state.submissionInFlight = false;
@@ -1224,6 +1316,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
 
     bool sendAttempted = false;
     bool sendSucceeded = false;
+    bool queuedBeforeSend = false;
     const bool canSend = captureEnabled && frameCount > 0 && hasReleaseState &&
             audioState.hasFormat && renderState.streamId != 0 &&
             !audioState.fakeFaulted && !pipelineFaulted &&
@@ -1234,6 +1327,13 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
         if (audioIt != g_audioClients.end()) {
             audioIt->second.pendingSubmittedFrames = nextSubmittedFrames;
             audioIt->second.submissionInFlight = true;
+            // ReleaseBuffer has transferred ownership to the endpoint. Make
+            // the frames visible to the DAC-paced virtual queue before the
+            // synchronous pipe write so its duration never pauses the clock.
+            // A failed write invalidates the endpoint instead of rolling back
+            // data that another thread may already have observed as consumed.
+            audioIt->second.fakeQueuedFrames += frameCount;
+            queuedBeforeSend = frameCount > 0;
         }
     }
     if (canSend) {
@@ -1264,6 +1364,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             if (state.fakeOutput &&
                 (state.fakeFaulted || submittedOverflow || sequenceOverflow ||
                  pipelineFaulted ||
+                 (queuedBeforeSend && !sendSucceeded) ||
                  (authoritativeStream && captureEnabled && frameCount > 0 &&
                   (!sendAttempted || !sendSucceeded)))) {
                 state.fakeFaulted = true;
@@ -1277,11 +1378,11 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                     if (state.confirmedCapturedFrames > state.successfulSubmittedFrames) {
                         state.fakeFaulted = true;
                         fakeDeviceInvalidated = true;
-                    } else {
-                        state.fakeQueuedFrames = state.successfulSubmittedFrames -
-                                state.confirmedCapturedFrames;
+                    } else if (sendSucceeded && frameCount > 0 &&
+                               !queuedBeforeSend) {
+                        state.fakeQueuedFrames += frameCount;
                     }
-                } else if (frameCount > 0) {
+                } else if (frameCount > 0 && !queuedBeforeSend) {
                     state.fakeQueuedFrames += frameCount;
                 }
             } else if (!state.fakeOutput && sendSucceeded) {
@@ -1579,6 +1680,7 @@ HRESULT STDMETHODCALLTYPE FakeClockGetPosition(IAudioClock* self, UINT64* positi
     }
     const auto* fake = reinterpret_cast<FakeAudioClock*>(self);
     const LONGLONG nowQpc = QpcNow();
+    LONGLONG positionQpc = nowQpc;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         const auto audioIt = g_audioClients.find(fake->audioClient);
@@ -1590,9 +1692,12 @@ HRESULT STDMETHODCALLTYPE FakeClockGetPosition(IAudioClock* self, UINT64* positi
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
         *position = audioIt->second.fakeDevicePosition;
+        if (audioIt->second.fakeDevicePositionQpc > 0) {
+            positionQpc = audioIt->second.fakeDevicePositionQpc;
+        }
     }
     if (qpcPosition != nullptr) {
-        *qpcPosition = QpcToHns(nowQpc);
+        *qpcPosition = QpcToHns(positionQpc);
     }
     return S_OK;
 }
@@ -2357,9 +2462,8 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentPadding(IAudioClient* self, UINT32* padd
                 AdvanceFakePlaybackLocked(state, QpcNow());
                 faulted = state.fakeFaulted;
                 if (!faulted) {
-                    // Managed streams are driven exclusively by Core's
-                    // confirmed captured-frame counter. Probe streams retain
-                    // the legacy QPC-backed queue maintained above.
+                    // Managed streams are paced by Core's DAC sample position.
+                    // Probe streams retain the legacy QPC-backed queue.
                     *paddingFrames = static_cast<UINT32>(state.fakeQueuedFrames);
                 }
                 initialized = true;
@@ -2458,6 +2562,7 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
                 const LONGLONG nowQpc = QpcNow();
                 state.fakeStarted = true;
                 state.fakeLastUpdateQpc = nowQpc;
+                state.fakeDevicePositionQpc = nowQpc;
                 state.fakeNextEventQpc = nowQpc + QpcTicksForFakePeriod(state);
                 if (state.fakeEvent != nullptr && FakeEventReadyLocked(state)) {
                     SetEvent(state.fakeEvent);
@@ -2500,10 +2605,12 @@ HRESULT STDMETHODCALLTYPE HookReset(IAudioClient* self) {
                 return AUDCLNT_E_DEVICE_INVALIDATED;
             }
             state.fakeDevicePosition = 0;
+            state.fakeDevicePositionQpc = nowQpc;
             state.fakeQueuedFrames = 0;
             state.fakeReservedFrames = 0;
             state.fakeFrameRemainder = 0;
             state.fakeLastUpdateQpc = state.fakeStarted ? nowQpc : 0;
+            state.hasManagedDacBaseline = false;
             state.fakeNextEventQpc = state.fakeStarted
                     ? nowQpc + QpcTicksForFakePeriod(state)
                     : 0;
