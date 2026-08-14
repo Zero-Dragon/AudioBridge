@@ -638,20 +638,26 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
     }
     lock.unlock();
 
-    std::wstring startError;
-    if (!TryStartStreamIfReady(&startError)) {
-        Stop();
-        if (outError != nullptr) {
-            *outError = startError;
-        }
-        return false;
-    }
     try {
         paddingThread_ = std::thread(&AsioRenderer::PaddingLoop, this);
     } catch (const std::exception&) {
         Stop();
         if (outError != nullptr) {
             *outError = L"Failed to start buffer padding thread.";
+        }
+        return false;
+    }
+
+    // Prime the normal tagged-silence path before ASIO starts. The driver's
+    // first two pages can then be filled without waiting for captured audio or
+    // blocking its real-time callback.
+    MaintainPadding();
+
+    std::wstring startError;
+    if (!TryStartStreamIfReady(&startError)) {
+        Stop();
+        if (outError != nullptr) {
+            *outError = startError;
         }
         return false;
     }
@@ -1142,12 +1148,7 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
 
     running_.store(true, std::memory_order_release);
     streamActive_.store(false, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const std::uint32_t startThreshold =
-                prebufferFrames_ > 0 ? (std::max<std::uint32_t>)(prebufferFrames_, bufferFrames_ * 2U) : 0;
-        prebuffering_.store(startThreshold > 0, std::memory_order_release);
-    }
+    prebuffering_.store(false, std::memory_order_release);
     return true;
 }
 
@@ -1218,17 +1219,6 @@ bool AsioRenderer::TryStartStreamIfReady(std::wstring* outError) {
         return true;
     }
 
-    std::uint32_t startThreshold = 0;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (prebufferFrames_ > 0) {
-            startThreshold = (std::max<std::uint32_t>)(prebufferFrames_, bufferFrames_ * 2U);
-        }
-    }
-    if (ringBuffer_.AvailableReadFrames() < startThreshold) {
-        return true;
-    }
-
     std::unique_lock<std::mutex> lock(controlMutex_);
     if (shutdownRequested_) {
         if (outError != nullptr) {
@@ -1275,14 +1265,13 @@ void AsioRenderer::PaddingLoop() {
 }
 
 void AsioRenderer::MaintainPadding() {
-    if (!streamActive_.load(std::memory_order_acquire) || prebufferFrames_ == 0 ||
+    if (!running_.load(std::memory_order_acquire) || prebufferFrames_ == 0 ||
         maxBufferOffsetFrames_ >= prebufferFrames_) {
         return;
     }
 
     std::lock_guard<std::mutex> producerLock(producerMutex_);
-    if (!running_.load(std::memory_order_acquire) ||
-        !streamActive_.load(std::memory_order_acquire)) {
+    if (!running_.load(std::memory_order_acquire)) {
         return;
     }
 
