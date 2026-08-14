@@ -117,7 +117,15 @@ struct PipeFormatMessage {
     DWORD streamFlags = 0;
     DWORD shareMode = 0;
     DWORD periodFrames = 0;
+    std::uint64_t streamId = 0;
 };
+
+struct PipePcmMessage {
+    std::uint64_t streamId = 0;
+};
+
+static_assert(sizeof(PipeFormatMessage) == 64);
+static_assert(sizeof(PipePcmMessage) == 8);
 
 struct HookControlBlock {
     volatile LONG lockedPid = 0;
@@ -255,6 +263,45 @@ void SendPipeMessage(DWORD type, const void* payload, std::uint64_t payloadBytes
                        &written,
                        nullptr) &&
              written == payloadBytes;
+    }
+    if (!ok) {
+        ClosePipeLocked();
+    }
+}
+
+void SendPcmMessage(std::uint64_t streamId,
+                    const void* pcm,
+                    std::uint64_t pcmBytes) {
+    if (streamId == 0 || pcm == nullptr || pcmBytes == 0 ||
+        pcmBytes > static_cast<std::uint64_t>(MAXDWORD) - sizeof(PipePcmMessage)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_pipeMutex);
+    if (!EnsurePipeConnectedLocked()) {
+        return;
+    }
+
+    PipeMessageHeader header{};
+    header.type = kPipePcm;
+    header.pid = GetCurrentProcessId();
+    header.payloadBytes = sizeof(PipePcmMessage) + pcmBytes;
+    const PipePcmMessage message{streamId};
+
+    DWORD written = 0;
+    bool ok = WriteFile(g_pipe, &header, sizeof(header), &written, nullptr) &&
+              written == sizeof(header);
+    if (ok) {
+        ok = WriteFile(g_pipe, &message, sizeof(message), &written, nullptr) &&
+             written == sizeof(message);
+    }
+    if (ok) {
+        ok = WriteFile(g_pipe,
+                       pcm,
+                       static_cast<DWORD>(pcmBytes),
+                       &written,
+                       nullptr) &&
+             written == pcmBytes;
     }
     if (!ok) {
         ClosePipeLocked();
@@ -616,6 +663,8 @@ void LogWaveFormat(const char* source,
     message.streamFlags = streamFlags;
     message.shareMode = static_cast<DWORD>(shareMode);
     message.periodFrames = periodInFrames;
+    message.streamId = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(client));
     SendPipeMessage(kPipeFormat, &message, sizeof(message));
 }
 
@@ -911,7 +960,13 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             g_lockedAudioPid.load() == GetCurrentProcessId() &&
             !g_finishCapture.load();
     if (captureEnabled && bytes > 0 && audioState.hasFormat) {
-        SendPipeMessage(kPipePcm, renderState.pendingBuffer, bytes);
+        const void* streamClient = renderState.audioClient != nullptr
+                ? static_cast<const void*>(renderState.audioClient)
+                : static_cast<const void*>(self);
+        SendPcmMessage(static_cast<std::uint64_t>(
+                               reinterpret_cast<std::uintptr_t>(streamClient)),
+                       renderState.pendingBuffer,
+                       bytes);
     }
     if (shouldLogPcm) {
         Log("PCM captured once. render=%p audio=%p frames=%u bytes=%llu sampleRate=%u channels=%u bits=%u blockAlign=%u sampleType=%s formatSource=%s inspectedBytes=%llu nonZeroBytes=%llu checksum=0x%08X formatTag=0x%04X renderClients=%u audioClients=%u fakeOutput=%s",
@@ -1664,22 +1719,25 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
         return S_OK;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        auto& state = g_audioClients[self];
-        CopyWaveFormat(format, &state);
-        state.shareMode = shareMode;
-        state.streamFlags = streamFlags;
+    const HRESULT hr = g_originalInitialize(
+            self, shareMode, streamFlags, bufferDuration, periodicity, format, sessionGuid);
+    if (SUCCEEDED(hr)) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto& state = g_audioClients[self];
+            CopyWaveFormat(format, &state);
+            state.shareMode = shareMode;
+            state.streamFlags = streamFlags;
+        }
+
+        LogWaveFormat("IAudioClient::Initialize",
+                      self,
+                      format,
+                      shareMode,
+                      streamFlags,
+                      0);
     }
-
-    LogWaveFormat("IAudioClient::Initialize",
-                  self,
-                  format,
-                  shareMode,
-                  streamFlags,
-                  0);
-
-    return g_originalInitialize(self, shareMode, streamFlags, bufferDuration, periodicity, format, sessionGuid);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
@@ -1702,7 +1760,7 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                                 periodInFrames);
         const AudioClientState state = SnapshotAudioClient(audioClient);
         LogWaveFormat("Fake IAudioClient3::InitializeSharedAudioStream",
-                      self,
+                      audioClient,
                       format,
                       AUDCLNT_SHAREMODE_SHARED,
                       streamFlags,
@@ -1716,26 +1774,28 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
         return S_OK;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        auto& state = g_audioClients[audioClient];
-        CopyWaveFormat(format, &state);
-        state.shareMode = AUDCLNT_SHAREMODE_SHARED;
-        state.streamFlags = streamFlags;
+    const HRESULT hr = g_originalInitializeSharedAudioStream(self,
+                                                             streamFlags,
+                                                             periodInFrames,
+                                                             format,
+                                                             audioSessionGuid);
+    if (SUCCEEDED(hr)) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto& state = g_audioClients[audioClient];
+            CopyWaveFormat(format, &state);
+            state.shareMode = AUDCLNT_SHAREMODE_SHARED;
+            state.streamFlags = streamFlags;
+        }
+
+        LogWaveFormat("IAudioClient3::InitializeSharedAudioStream",
+                      audioClient,
+                      format,
+                      AUDCLNT_SHAREMODE_SHARED,
+                      streamFlags,
+                      periodInFrames);
     }
-
-    LogWaveFormat("IAudioClient3::InitializeSharedAudioStream",
-                  self,
-                  format,
-                  AUDCLNT_SHAREMODE_SHARED,
-                  streamFlags,
-                  periodInFrames);
-
-    return g_originalInitializeSharedAudioStream(self,
-                                                 streamFlags,
-                                                 periodInFrames,
-                                                 format,
-                                                 audioSessionGuid);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookGetService(IAudioClient* self, REFIID iid, void** service) {

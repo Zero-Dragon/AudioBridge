@@ -113,6 +113,13 @@ std::uint32_t NormalizePrebufferMs(std::int32_t prebufferMs) {
     return (std::min<std::uint32_t>)(static_cast<std::uint32_t>(prebufferMs), 10000U);
 }
 
+std::uint32_t NormalizeMaxBufferOffsetMs(std::int32_t maxBufferOffsetMs) {
+    if (maxBufferOffsetMs < 50) {
+        return 100;
+    }
+    return (std::min<std::uint32_t>)(static_cast<std::uint32_t>(maxBufferOffsetMs), 10000U);
+}
+
 std::uint32_t FramesFromMs(std::uint32_t sampleRate, std::uint32_t ms) {
     if (sampleRate == 0 || ms == 0) {
         return 0;
@@ -357,6 +364,7 @@ bool RawFrameRingBuffer::Reset(std::uint32_t bytesPerFrame, std::uint32_t capaci
             static_cast<std::size_t>(bytesPerFrame) * static_cast<std::size_t>(capacityFrames);
     const std::size_t capacityBytes = NextPowerOfTwo(requestedBytes);
     bytes_.assign(capacityBytes, 0);
+    frameOrigins_.assign(capacityBytes / bytesPerFrame, FrameOrigin::Captured);
     byteMask_ = capacityBytes - 1;
     readIndex_.store(0, std::memory_order_relaxed);
     writeIndex_.store(0, std::memory_order_relaxed);
@@ -367,9 +375,12 @@ void RawFrameRingBuffer::Clear() {
     readIndex_.store(0, std::memory_order_release);
     writeIndex_.store(0, std::memory_order_release);
     std::fill(bytes_.begin(), bytes_.end(), static_cast<std::uint8_t>(0));
+    std::fill(frameOrigins_.begin(), frameOrigins_.end(), FrameOrigin::Captured);
 }
 
-std::uint32_t RawFrameRingBuffer::Push(const std::uint8_t* data, std::uint32_t frameCount) {
+std::uint32_t RawFrameRingBuffer::Push(const std::uint8_t* data,
+                                       std::uint32_t frameCount,
+                                       FrameOrigin origin) {
     if (data == nullptr || frameCount == 0 || bytesPerFrame_ == 0 || bytes_.empty()) {
         return 0;
     }
@@ -386,13 +397,41 @@ std::uint32_t RawFrameRingBuffer::Push(const std::uint8_t* data, std::uint32_t f
     }
 
     CopyInto(writeIndex, data, writableBytes);
+    CopyOriginsInto(writeIndex,
+                    static_cast<std::uint32_t>(writableBytes / bytesPerFrame_),
+                    origin);
     writeIndex_.store(writeIndex + writableBytes, std::memory_order_release);
     return static_cast<std::uint32_t>(writableBytes / bytesPerFrame_);
 }
 
-std::uint32_t RawFrameRingBuffer::Pop(std::uint8_t* data, std::uint32_t frameCount) {
-    if (data == nullptr || frameCount == 0 || bytesPerFrame_ == 0 || bytes_.empty()) {
+std::uint32_t RawFrameRingBuffer::PushSilence(std::uint32_t frameCount) {
+    if (frameCount == 0 || bytesPerFrame_ == 0 || bytes_.empty()) {
         return 0;
+    }
+
+    const std::size_t readIndex = readIndex_.load(std::memory_order_acquire);
+    const std::size_t writeIndex = writeIndex_.load(std::memory_order_relaxed);
+    const std::size_t requestedBytes =
+            static_cast<std::size_t>(frameCount) * static_cast<std::size_t>(bytesPerFrame_);
+    const std::size_t writableBytes =
+            (std::min)(requestedBytes, AvailableWriteBytes(readIndex, writeIndex)) /
+            bytesPerFrame_ * bytesPerFrame_;
+    if (writableBytes == 0) {
+        return 0;
+    }
+
+    const auto writableFrames = static_cast<std::uint32_t>(writableBytes / bytesPerFrame_);
+    ZeroInto(writeIndex, writableBytes);
+    CopyOriginsInto(writeIndex, writableFrames, FrameOrigin::PaddingSilence);
+    writeIndex_.store(writeIndex + writableBytes, std::memory_order_release);
+    return writableFrames;
+}
+
+RawFrameRingBuffer::PopResult RawFrameRingBuffer::Pop(std::uint8_t* data,
+                                                       std::uint32_t frameCount) {
+    PopResult result{};
+    if (data == nullptr || frameCount == 0 || bytesPerFrame_ == 0 || bytes_.empty()) {
+        return result;
     }
 
     const std::size_t writeIndex = writeIndex_.load(std::memory_order_acquire);
@@ -403,12 +442,14 @@ std::uint32_t RawFrameRingBuffer::Pop(std::uint8_t* data, std::uint32_t frameCou
             (std::min)(requestedBytes, AvailableReadBytes(readIndex, writeIndex)) /
             bytesPerFrame_ * bytesPerFrame_;
     if (readableBytes == 0) {
-        return 0;
+        return result;
     }
 
     CopyOut(readIndex, data, readableBytes);
+    result.frames = static_cast<std::uint32_t>(readableBytes / bytesPerFrame_);
+    result.paddingSilentFrames = CountPaddingOrigins(readIndex, result.frames);
     readIndex_.store(readIndex + readableBytes, std::memory_order_release);
-    return static_cast<std::uint32_t>(readableBytes / bytesPerFrame_);
+    return result;
 }
 
 std::uint32_t RawFrameRingBuffer::AvailableReadFrames() const {
@@ -456,6 +497,15 @@ void RawFrameRingBuffer::CopyInto(std::size_t writeIndex,
     }
 }
 
+void RawFrameRingBuffer::ZeroInto(std::size_t writeIndex, std::size_t bytes) {
+    const std::size_t offset = writeIndex & byteMask_;
+    const std::size_t firstChunk = (std::min)(bytes, bytes_.size() - offset);
+    std::memset(bytes_.data() + offset, 0, firstChunk);
+    if (bytes > firstChunk) {
+        std::memset(bytes_.data(), 0, bytes - firstChunk);
+    }
+}
+
 void RawFrameRingBuffer::CopyOut(std::size_t readIndex,
                                  std::uint8_t* data,
                                  std::size_t bytes) const {
@@ -467,6 +517,47 @@ void RawFrameRingBuffer::CopyOut(std::size_t readIndex,
     }
 }
 
+void RawFrameRingBuffer::CopyOriginsInto(std::size_t writeIndex,
+                                         std::uint32_t frameCount,
+                                         FrameOrigin origin) {
+    if (frameCount == 0 || bytesPerFrame_ == 0 || frameOrigins_.empty()) {
+        return;
+    }
+    const std::size_t frameIndex = writeIndex / bytesPerFrame_;
+    const std::size_t offset = frameIndex % frameOrigins_.size();
+    const std::size_t firstChunk =
+            (std::min)(static_cast<std::size_t>(frameCount), frameOrigins_.size() - offset);
+    std::fill_n(frameOrigins_.begin() + static_cast<std::ptrdiff_t>(offset), firstChunk, origin);
+    if (static_cast<std::size_t>(frameCount) > firstChunk) {
+        std::fill_n(frameOrigins_.begin(),
+                    static_cast<std::size_t>(frameCount) - firstChunk,
+                    origin);
+    }
+}
+
+std::uint32_t RawFrameRingBuffer::CountPaddingOrigins(std::size_t readIndex,
+                                                       std::uint32_t frameCount) const {
+    if (frameCount == 0 || bytesPerFrame_ == 0 || frameOrigins_.empty()) {
+        return 0;
+    }
+    const std::size_t frameIndex = readIndex / bytesPerFrame_;
+    const std::size_t offset = frameIndex % frameOrigins_.size();
+    const std::size_t firstChunk =
+            (std::min)(static_cast<std::size_t>(frameCount), frameOrigins_.size() - offset);
+    std::uint32_t paddingFrames = static_cast<std::uint32_t>(
+            std::count(frameOrigins_.begin() + static_cast<std::ptrdiff_t>(offset),
+                       frameOrigins_.begin() + static_cast<std::ptrdiff_t>(offset + firstChunk),
+                       FrameOrigin::PaddingSilence));
+    if (static_cast<std::size_t>(frameCount) > firstChunk) {
+        paddingFrames += static_cast<std::uint32_t>(
+                std::count(frameOrigins_.begin(),
+                           frameOrigins_.begin() +
+                                   static_cast<std::ptrdiff_t>(frameCount - firstChunk),
+                           FrameOrigin::PaddingSilence));
+    }
+    return paddingFrames;
+}
+
 AsioRenderer::~AsioRenderer() {
     Stop();
 }
@@ -474,6 +565,7 @@ AsioRenderer::~AsioRenderer() {
 bool AsioRenderer::Start(const std::wstring& deviceId,
                          const WAVEFORMATEXTENSIBLE& format,
                          std::int32_t prebufferMs,
+                         std::int32_t maxBufferOffsetMs,
                          std::uint32_t requestedBufferFrames,
                          std::wstring* outError) {
     Stop();
@@ -490,6 +582,10 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
         sourceKind_ = SourceKindFromWave(format_);
         prebufferMs_ = static_cast<std::int32_t>(NormalizePrebufferMs(prebufferMs));
         prebufferFrames_ = FramesFromMs(sampleRate_, static_cast<std::uint32_t>(prebufferMs_));
+        maxBufferOffsetMs_ =
+                static_cast<std::int32_t>(NormalizeMaxBufferOffsetMs(maxBufferOffsetMs));
+        maxBufferOffsetFrames_ =
+                FramesFromMs(sampleRate_, static_cast<std::uint32_t>(maxBufferOffsetMs_));
         requestedBufferFrames_ = requestedBufferFrames;
         minBufferFrames_ = 0;
         maxBufferFrames_ = 0;
@@ -550,11 +646,21 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
         }
         return false;
     }
+    try {
+        paddingThread_ = std::thread(&AsioRenderer::PaddingLoop, this);
+    } catch (const std::exception&) {
+        Stop();
+        if (outError != nullptr) {
+            *outError = L"Failed to start buffer padding thread.";
+        }
+        return false;
+    }
     return true;
 }
 
 void AsioRenderer::Stop() {
     running_.store(false, std::memory_order_release);
+    paddingCv_.notify_all();
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
         shutdownRequested_ = true;
@@ -563,10 +669,14 @@ void AsioRenderer::Stop() {
     startCv_.notify_all();
     initCv_.notify_all();
 
+    if (paddingThread_.joinable()) {
+        paddingThread_.join();
+    }
     if (controlThread_.joinable()) {
         controlThread_.join();
     }
 
+    std::lock_guard<std::mutex> producerLock(producerMutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     streamActive_.store(false, std::memory_order_release);
     prebuffering_.store(false, std::memory_order_release);
@@ -582,6 +692,7 @@ void AsioRenderer::Stop() {
     outputKind_ = OutputSampleKind::Unknown;
     outputAsioSampleType_ = ASIOSTLastEntry;
     outputRightShift_ = 0;
+    paddingActive_ = false;
     pendingResetMask_.store(0, std::memory_order_release);
 }
 
@@ -592,7 +703,16 @@ std::uint32_t AsioRenderer::PushPcm(const std::uint8_t* data,
         return 0;
     }
 
-    const std::uint32_t written = ringBuffer_.Push(data, frameCount);
+    std::uint32_t written = 0;
+    {
+        std::lock_guard<std::mutex> producerLock(producerMutex_);
+        if (!running_.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        paddingActive_ = false;
+        written = ringBuffer_.Push(data, frameCount);
+    }
+    paddingCv_.notify_one();
     totalFramesQueued_.fetch_add(written, std::memory_order_relaxed);
     if (written < frameCount) {
         totalFramesDropped_.fetch_add(frameCount - written, std::memory_order_relaxed);
@@ -1140,6 +1260,44 @@ bool AsioRenderer::TryStartStreamIfReady(std::wstring* outError) {
     return true;
 }
 
+void AsioRenderer::PaddingLoop() {
+    while (running_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> waitLock(paddingWaitMutex_);
+        paddingCv_.wait_for(waitLock, std::chrono::milliseconds(5), [this] {
+            return !running_.load(std::memory_order_acquire);
+        });
+        waitLock.unlock();
+        if (!running_.load(std::memory_order_acquire)) {
+            break;
+        }
+        MaintainPadding();
+    }
+}
+
+void AsioRenderer::MaintainPadding() {
+    if (!streamActive_.load(std::memory_order_acquire) || prebufferFrames_ == 0 ||
+        maxBufferOffsetFrames_ >= prebufferFrames_) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> producerLock(producerMutex_);
+    if (!running_.load(std::memory_order_acquire) ||
+        !streamActive_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const std::uint32_t bufferedFrames = ringBuffer_.AvailableReadFrames();
+    const std::uint32_t triggerFrames = prebufferFrames_ - maxBufferOffsetFrames_;
+    if (!paddingActive_ && bufferedFrames < triggerFrames) {
+        paddingActive_ = true;
+    }
+    if (!paddingActive_ || bufferedFrames >= prebufferFrames_) {
+        return;
+    }
+
+    ringBuffer_.PushSilence(prebufferFrames_ - bufferedFrames);
+}
+
 void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
     if (doubleBufferIndex < 0 || doubleBufferIndex > 1 ||
         bufferFrames_ == 0 || bytesPerFrame_ == 0 || callbackBuffer_.empty()) {
@@ -1147,20 +1305,24 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
         return;
     }
 
-    const std::uint32_t popped = ringBuffer_.Pop(callbackBuffer_.data(), bufferFrames_);
-    const std::uint32_t silentFrames = bufferFrames_ - popped;
-    if (silentFrames > 0) {
-        std::memset(callbackBuffer_.data() + static_cast<std::size_t>(popped) * bytesPerFrame_,
+    const RawFrameRingBuffer::PopResult popped =
+            ringBuffer_.Pop(callbackBuffer_.data(), bufferFrames_);
+    const std::uint32_t underrunSilentFrames = bufferFrames_ - popped.frames;
+    if (underrunSilentFrames > 0) {
+        std::memset(callbackBuffer_.data() +
+                            static_cast<std::size_t>(popped.frames) * bytesPerFrame_,
                     0,
-                    static_cast<std::size_t>(silentFrames) * bytesPerFrame_);
+                    static_cast<std::size_t>(underrunSilentFrames) * bytesPerFrame_);
         underrunCount_.fetch_add(1, std::memory_order_relaxed);
     }
 
     WriteConvertedOutput(callbackBuffer_.data(), bufferFrames_, doubleBufferIndex);
-    if (popped > 0) {
-        totalFramesPlayed_.fetch_add(popped, std::memory_order_relaxed);
+    const std::uint32_t capturedFrames = popped.frames - popped.paddingSilentFrames;
+    if (capturedFrames > 0) {
+        totalFramesPlayed_.fetch_add(capturedFrames, std::memory_order_relaxed);
     }
-    RecordOutputFrames(bufferFrames_, silentFrames);
+    RecordOutputFrames(bufferFrames_,
+                       underrunSilentFrames + popped.paddingSilentFrames);
 }
 
 void AsioRenderer::FillOutputBufferWithSilence(long doubleBufferIndex) {

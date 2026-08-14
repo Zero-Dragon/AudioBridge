@@ -61,21 +61,41 @@ struct RendererStats {
 
 class RawFrameRingBuffer {
 public:
+    enum class FrameOrigin : std::uint8_t {
+        Captured,
+        PaddingSilence,
+    };
+
+    struct PopResult {
+        std::uint32_t frames = 0;
+        std::uint32_t paddingSilentFrames = 0;
+    };
+
     bool Reset(std::uint32_t bytesPerFrame, std::uint32_t capacityFrames);
     void Clear();
-    std::uint32_t Push(const std::uint8_t* data, std::uint32_t frameCount);
-    std::uint32_t Pop(std::uint8_t* data, std::uint32_t frameCount);
+    std::uint32_t Push(const std::uint8_t* data,
+                       std::uint32_t frameCount,
+                       FrameOrigin origin = FrameOrigin::Captured);
+    std::uint32_t PushSilence(std::uint32_t frameCount);
+    PopResult Pop(std::uint8_t* data, std::uint32_t frameCount);
     std::uint32_t AvailableReadFrames() const;
     std::uint32_t CapacityFrames() const;
 
 private:
-    // Single producer (pipe reader) / single consumer (ASIO callback).
+    // Single serialized producer / single consumer (ASIO callback).
     std::size_t AvailableReadBytes(std::size_t readIndex, std::size_t writeIndex) const;
     std::size_t AvailableWriteBytes(std::size_t readIndex, std::size_t writeIndex) const;
     void CopyInto(std::size_t writeIndex, const std::uint8_t* data, std::size_t bytes);
+    void ZeroInto(std::size_t writeIndex, std::size_t bytes);
     void CopyOut(std::size_t readIndex, std::uint8_t* data, std::size_t bytes) const;
+    void CopyOriginsInto(std::size_t writeIndex,
+                         std::uint32_t frameCount,
+                         FrameOrigin origin);
+    std::uint32_t CountPaddingOrigins(std::size_t readIndex,
+                                      std::uint32_t frameCount) const;
 
     std::vector<std::uint8_t> bytes_;
+    std::vector<FrameOrigin> frameOrigins_;
     std::size_t byteMask_ = 0;
     std::atomic<std::size_t> readIndex_{0};
     std::atomic<std::size_t> writeIndex_{0};
@@ -109,6 +129,7 @@ public:
     bool Start(const std::wstring& deviceId,
                const WAVEFORMATEXTENSIBLE& format,
                std::int32_t prebufferMs,
+               std::int32_t maxBufferOffsetMs,
                std::uint32_t requestedBufferFrames,
                std::wstring* outError);
     void Stop();
@@ -153,6 +174,8 @@ private:
     void DisposeBuffersOnControlThread();
     void CloseDriverOnControlThread();
     bool TryStartStreamIfReady(std::wstring* outError);
+    void PaddingLoop();
+    void MaintainPadding();
     void FillOutputBuffer(long doubleBufferIndex);
     void FillOutputBufferWithSilence(long doubleBufferIndex);
     void WriteConvertedOutput(const std::uint8_t* interleaved,
@@ -170,10 +193,14 @@ private:
 
     mutable std::mutex mutex_;
     std::thread controlThread_;
+    std::thread paddingThread_;
     std::mutex controlMutex_;
     std::condition_variable initCv_;
     std::condition_variable controlCv_;
     std::condition_variable startCv_;
+    std::mutex paddingWaitMutex_;
+    std::condition_variable paddingCv_;
+    std::mutex producerMutex_;
     bool initComplete_ = false;
     bool initSucceeded_ = false;
     bool shutdownRequested_ = false;
@@ -213,6 +240,9 @@ private:
     std::uint32_t asioSampleRate_ = 0;
     std::uint32_t prebufferFrames_ = 0;
     std::int32_t prebufferMs_ = 300;
+    std::uint32_t maxBufferOffsetFrames_ = 0;
+    std::int32_t maxBufferOffsetMs_ = 100;
+    bool paddingActive_ = false;
     RawFrameRingBuffer ringBuffer_;
     std::vector<std::uint8_t> callbackBuffer_;
 

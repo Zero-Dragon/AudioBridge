@@ -58,6 +58,8 @@ constexpr int32_t kError = -1;
 constexpr int32_t kInvalidArgument = -2;
 constexpr int32_t kNotRunning = -3;
 constexpr int32_t kDefaultPrebufferMs = 300;
+constexpr int32_t kDefaultMaxBufferOffsetMs = 100;
+constexpr int32_t kMinimumMaxBufferOffsetMs = 50;
 constexpr int32_t kDefaultAsioBufferFrames = 0;
 #if defined(_WIN64)
 constexpr REGSAM kAsioRegistryView = KEY_WOW64_64KEY;
@@ -79,7 +81,15 @@ struct PipeFormatMessage {
     DWORD streamFlags = 0;
     DWORD shareMode = 0;
     DWORD periodFrames = 0;
+    std::uint64_t streamId = 0;
 };
+
+struct PipePcmMessage {
+    std::uint64_t streamId = 0;
+};
+
+static_assert(sizeof(PipeFormatMessage) == 64);
+static_assert(sizeof(PipePcmMessage) == 8);
 
 struct HookControlBlock {
     volatile LONG lockedPid = 0;
@@ -97,6 +107,7 @@ struct AudioPidState {
     WAVEFORMATEXTENSIBLE format{};
     bool hasFormat = false;
     std::uint32_t bytesPerFrame = 0;
+    std::uint64_t streamId = 0;
     std::uint64_t lastFormatMs = 0;
     std::uint64_t lastPcmMs = 0;
 };
@@ -1009,6 +1020,8 @@ public:
     int32_t SetOutputDevice(const wchar_t* outputDeviceId);
     int32_t SetPrebufferMs(std::int32_t prebufferMs);
     int32_t GetPrebufferMs() const;
+    int32_t SetMaxBufferOffsetMs(std::int32_t maxBufferOffsetMs);
+    int32_t GetMaxBufferOffsetMs() const;
     int32_t SelectAudioPid(std::uint32_t pid);
     int32_t RefreshDevices();
     int32_t GetDeviceCount() const;
@@ -1059,6 +1072,7 @@ private:
     int32_t defaultDeviceIndex_ = -1;
     std::wstring selectedDeviceId_;
     std::int32_t prebufferMs_ = kDefaultPrebufferMs;
+    std::int32_t maxBufferOffsetMs_ = kDefaultMaxBufferOffsetMs;
     std::int32_t asioBufferFrames_ = kDefaultAsioBufferFrames;
     std::atomic<bool> fakeOutput_{false};
     std::unordered_map<std::uint32_t, AudioPidState> audioPids_;
@@ -1067,6 +1081,7 @@ private:
     std::wstring rendererDeviceId_;
     WAVEFORMATEXTENSIBLE rendererFormat_{};
     std::int32_t rendererPrebufferMs_ = kDefaultPrebufferMs;
+    std::int32_t rendererMaxBufferOffsetMs_ = kDefaultMaxBufferOffsetMs;
     std::int32_t rendererAsioBufferFrames_ = kDefaultAsioBufferFrames;
 
     std::atomic<bool> running_{false};
@@ -1179,6 +1194,7 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         rendererDeviceId_.clear();
         rendererFormat_ = {};
         rendererPrebufferMs_ = prebufferMs_;
+        rendererMaxBufferOffsetMs_ = maxBufferOffsetMs_;
         rendererAsioBufferFrames_ = asioBufferFrames_;
         targetPid_ = 0;
         targetExited_.store(false);
@@ -1306,6 +1322,7 @@ void AudioBridgeCore::Stop() {
         rendererDeviceId_.clear();
         rendererFormat_ = {};
         rendererPrebufferMs_ = prebufferMs_;
+        rendererMaxBufferOffsetMs_ = maxBufferOffsetMs_;
         rendererAsioBufferFrames_ = asioBufferFrames_;
     }
 }
@@ -1358,6 +1375,37 @@ int32_t AudioBridgeCore::SetPrebufferMs(std::int32_t prebufferMs) {
 int32_t AudioBridgeCore::GetPrebufferMs() const {
     std::lock_guard<std::mutex> lock(stateMutex_);
     return prebufferMs_;
+}
+
+int32_t AudioBridgeCore::SetMaxBufferOffsetMs(std::int32_t maxBufferOffsetMs) {
+    if (maxBufferOffsetMs < kMinimumMaxBufferOffsetMs || maxBufferOffsetMs > 10000) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        SetLastErrorLocked(L"Max buffer offset must be between 50 and 10000 ms.");
+        return kInvalidArgument;
+    }
+
+    WAVEFORMATEXTENSIBLE format{};
+    std::uint32_t pid = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        maxBufferOffsetMs_ = maxBufferOffsetMs;
+        pid = lockedAudioPid_.load();
+        auto it = audioPids_.find(pid);
+        if (it != audioPids_.end() && it->second.hasFormat) {
+            format = it->second.format;
+        }
+        SetLastErrorLocked(L"OK");
+    }
+
+    if (pid != 0 && format.Format.nSamplesPerSec != 0) {
+        StartRendererForFormat(pid, format);
+    }
+    return kOk;
+}
+
+int32_t AudioBridgeCore::GetMaxBufferOffsetMs() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return maxBufferOffsetMs_;
 }
 
 int32_t AudioBridgeCore::SelectAudioPid(std::uint32_t pid) {
@@ -1636,7 +1684,8 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
     const auto* message = static_cast<const PipeFormatMessage*>(payload);
     const WAVEFORMATEX& format = message->format.Format;
     const std::uint32_t bytesPerFrame = BytesPerFrame(format);
-    if (pid == 0 || format.nSamplesPerSec == 0 || format.nChannels == 0 ||
+    if (pid == 0 || message->streamId == 0 ||
+        format.nSamplesPerSec == 0 || format.nChannels == 0 ||
         format.wBitsPerSample == 0 || bytesPerFrame == 0) {
         Log(L"Ignored invalid format from pid=%u", pid);
         return;
@@ -1650,6 +1699,7 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
         state.format = message->format;
         state.hasFormat = true;
         state.bytesPerFrame = bytesPerFrame;
+        state.streamId = message->streamId;
         state.lastFormatMs = NowMs();
 
         std::uint32_t expected = 0;
@@ -1674,15 +1724,22 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
 }
 
 void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::size_t bytes) {
-    if (pid == 0 || data == nullptr || bytes == 0 || pid != lockedAudioPid_.load()) {
+    if (pid == 0 || data == nullptr || bytes <= sizeof(PipePcmMessage) ||
+        pid != lockedAudioPid_.load()) {
         return;
     }
+
+    const auto* message = reinterpret_cast<const PipePcmMessage*>(data);
+    const std::uint8_t* pcm = data + sizeof(PipePcmMessage);
+    const std::size_t pcmBytes = bytes - sizeof(PipePcmMessage);
 
     std::uint32_t bytesPerFrame = 0;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto it = audioPids_.find(pid);
-        if (it != audioPids_.end()) {
+        if (it != audioPids_.end() &&
+            message->streamId != 0 &&
+            message->streamId == it->second.streamId) {
             it->second.lastPcmMs = NowMs();
             bytesPerFrame = it->second.bytesPerFrame;
         }
@@ -1691,12 +1748,12 @@ void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std:
     if (bytesPerFrame == 0) {
         return;
     }
-    const auto frameCount = static_cast<std::uint32_t>(bytes / bytesPerFrame);
+    const auto frameCount = static_cast<std::uint32_t>(pcmBytes / bytesPerFrame);
     if (frameCount == 0) {
         return;
     }
     std::wstring renderError;
-    const auto written = renderer_.PushPcm(data, frameCount, &renderError);
+    const auto written = renderer_.PushPcm(pcm, frameCount, &renderError);
     if (!renderError.empty()) {
         std::lock_guard<std::mutex> lock(stateMutex_);
         SetLastErrorLocked(renderError);
@@ -1714,17 +1771,20 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
                                              const WAVEFORMATEXTENSIBLE& format) {
     std::wstring deviceId;
     std::int32_t prebufferMs = kDefaultPrebufferMs;
+    std::int32_t maxBufferOffsetMs = kDefaultMaxBufferOffsetMs;
     std::int32_t asioBufferFrames = kDefaultAsioBufferFrames;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         deviceId = selectedDeviceId_;
         prebufferMs = prebufferMs_;
+        maxBufferOffsetMs = maxBufferOffsetMs_;
         asioBufferFrames = asioBufferFrames_;
         if (renderer_.IsRunning() &&
             rendererHasFormat_ &&
             rendererPid_ == pid &&
             rendererDeviceId_ == deviceId &&
             rendererPrebufferMs_ == prebufferMs &&
+            rendererMaxBufferOffsetMs_ == maxBufferOffsetMs &&
             rendererAsioBufferFrames_ == asioBufferFrames &&
             WaveFormatsEqual(rendererFormat_, format)) {
             return;
@@ -1736,6 +1796,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
                 deviceId,
                 format,
                 prebufferMs,
+                maxBufferOffsetMs,
                 static_cast<std::uint32_t>(asioBufferFrames),
                 &error)) {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -1755,6 +1816,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
         rendererDeviceId_ = deviceId;
         rendererFormat_ = format;
         rendererPrebufferMs_ = prebufferMs;
+        rendererMaxBufferOffsetMs_ = maxBufferOffsetMs;
         rendererAsioBufferFrames_ = asioBufferFrames;
         SetLastErrorLocked(L"OK");
     }
@@ -1766,6 +1828,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
         format.Format.wBitsPerSample,
         BytesPerFrame(format.Format));
     Log(L"Renderer prebuffer target=%d ms", prebufferMs);
+    Log(L"Renderer max buffer offset=%d ms", maxBufferOffsetMs);
     Log(L"Renderer ASIO buffer request=%d frames (0=driver preferred)", asioBufferFrames);
 }
 
@@ -2645,6 +2708,18 @@ ABC_API int32_t ABC_CALL ABC_SetPrebufferMs(int32_t prebufferMs) {
 ABC_API int32_t ABC_CALL ABC_GetPrebufferMs(void) {
     auto* core = audiobridge::Core();
     return core != nullptr ? core->GetPrebufferMs() : audiobridge::kDefaultPrebufferMs;
+}
+
+ABC_API int32_t ABC_CALL ABC_SetMaxBufferOffsetMs(int32_t maxBufferOffsetMs) {
+    auto* core = audiobridge::Core();
+    return core != nullptr ? core->SetMaxBufferOffsetMs(maxBufferOffsetMs) : -1;
+}
+
+ABC_API int32_t ABC_CALL ABC_GetMaxBufferOffsetMs(void) {
+    auto* core = audiobridge::Core();
+    return core != nullptr
+            ? core->GetMaxBufferOffsetMs()
+            : audiobridge::kDefaultMaxBufferOffsetMs;
 }
 
 ABC_API int32_t ABC_CALL ABC_SelectAudioPid(uint32_t pid) {

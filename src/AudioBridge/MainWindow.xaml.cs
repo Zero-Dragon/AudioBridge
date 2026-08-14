@@ -72,6 +72,7 @@ public sealed partial class MainWindow : Window
 
             RefreshDevices();
             AudioBridgeNative.ABC_SetPrebufferMs((int)PrebufferBox.Value);
+            AudioBridgeNative.ABC_SetMaxBufferOffsetMs((int)MaxBufferOffsetBox.Value);
             pollTimer.Start();
             AppendLog("AudioBridge ready.");
         }
@@ -294,8 +295,17 @@ public sealed partial class MainWindow : Window
 
         var deviceId = (DeviceComboBox.SelectedItem as AudioDeviceView)?.Id;
         var prebufferMs = ReadPrebufferMs();
+        var maxBufferOffsetMs = ReadMaxBufferOffsetMs();
         var asioBufferFrames = ReadAsioBufferFrames();
         var fakeOutput = FakeOutputCheckBox.IsChecked == true;
+        var offsetResult = AudioBridgeNative.ABC_SetMaxBufferOffsetMs(maxBufferOffsetMs);
+        if (offsetResult != 0)
+        {
+            var error = AudioBridgeNative.LastError();
+            LastErrorText.Text = error;
+            AppendLog($"Max buffer offset update failed: {error}");
+            return;
+        }
         var result = AudioBridgeNative.ABC_StartTargetWithOptions3(
             exePath,
             null,
@@ -318,6 +328,7 @@ public sealed partial class MainWindow : Window
         RememberSuccessfulTarget(exePath);
         settings.SelectedAsioDeviceId = (DeviceComboBox.SelectedItem as AudioDeviceView)?.Id;
         settings.PrebufferMs = prebufferMs;
+        settings.MaxBufferOffsetMs = maxBufferOffsetMs;
         settings.AsioBufferFrames = asioBufferFrames;
         PersistSettings("Could not remember the current settings");
         AppendLog($"Opened target: {exePath} (Fake Output {(fakeOutput ? "on" : "off")})");
@@ -380,6 +391,28 @@ public sealed partial class MainWindow : Window
         settings.SelectedAsioDeviceId = (DeviceComboBox.SelectedItem as AudioDeviceView)?.Id;
         settings.AsioBufferFrames = ReadAsioBufferFrames();
         PersistSettings("Could not remember the ASIO buffer setting");
+    }
+
+    private void MaxBufferOffsetBox_ValueChanged(
+        NumberBox sender,
+        NumberBoxValueChangedEventArgs args)
+    {
+        if (!nativeReady || double.IsNaN(args.NewValue))
+        {
+            return;
+        }
+
+        var result = AudioBridgeNative.ABC_SetMaxBufferOffsetMs(ReadMaxBufferOffsetMs());
+        if (result != 0)
+        {
+            AppendLog($"Max buffer offset update failed: {AudioBridgeNative.LastError()}");
+        }
+
+        if (!suppressSettingsPersistence)
+        {
+            settings.MaxBufferOffsetMs = ReadMaxBufferOffsetMs();
+            PersistSettings("Could not remember the max buffer offset setting");
+        }
     }
 
     private void PidListView_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -590,6 +623,16 @@ public sealed partial class MainWindow : Window
         return (int)Math.Clamp(Math.Round(AsioBufferBox.Value), 0, 8192);
     }
 
+    private int ReadMaxBufferOffsetMs()
+    {
+        if (double.IsNaN(MaxBufferOffsetBox.Value))
+        {
+            return 100;
+        }
+
+        return (int)Math.Clamp(Math.Round(MaxBufferOffsetBox.Value), 50, 10000);
+    }
+
     private void LoadSettingsIntoControls()
     {
         settings = AppSettingsService.Load();
@@ -599,6 +642,7 @@ public sealed partial class MainWindow : Window
         }
         suppressSettingsPersistence = true;
         PrebufferBox.Value = settings.PrebufferMs;
+        MaxBufferOffsetBox.Value = settings.MaxBufferOffsetMs;
         AsioBufferBox.Value = settings.AsioBufferFrames;
 
         recentTargets.Clear();
