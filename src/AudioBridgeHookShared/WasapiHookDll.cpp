@@ -76,6 +76,8 @@ struct RenderClientState {
     IAudioClient* audioClient = nullptr;
     BYTE* pendingBuffer = nullptr;
     UINT32 pendingFrames = 0;
+    bool lateAttached = false;
+    bool formatAnnounced = false;
     bool loggedPcm = false;
     bool pcmActive = false;
     ULONGLONG lastPcmTick = 0;
@@ -86,7 +88,7 @@ struct RenderClientState {
 
 HMODULE g_module = nullptr;
 #ifndef AUDIOBRIDGE_WASAPI_HOOK_PIPE_NAME
-#define AUDIOBRIDGE_WASAPI_HOOK_PIPE_NAME L"\\\\.\\pipe\\AudioBridgeWasapiHook"
+#define AUDIOBRIDGE_WASAPI_HOOK_PIPE_NAME L"\\\\.\\pipe\\LOCAL\\AudioBridgeWasapiHook"
 #endif
 #ifndef AUDIOBRIDGE_WASAPI_HOOK_CONTROL_MAP_NAME
 #define AUDIOBRIDGE_WASAPI_HOOK_CONTROL_MAP_NAME L"Local\\AudioBridgeWasapiHookControl"
@@ -138,6 +140,25 @@ struct FakeAudioClock {
     IAudioClient* audioClient = nullptr;
 };
 
+struct FakeAudioStreamVolume {
+    void** vtable = nullptr;
+    std::atomic<ULONG> refs{1};
+    IAudioClient* audioClient = nullptr;
+    std::mutex mutex;
+    std::vector<float> volumes;
+};
+
+struct FakeAudioSessionControl {
+    void** vtable = nullptr;
+    std::atomic<ULONG> refs{1};
+    IAudioClient* audioClient = nullptr;
+    std::mutex mutex;
+    std::wstring displayName;
+    std::wstring iconPath;
+    GUID groupingParam{};
+    std::vector<IAudioSessionEvents*> notifications;
+};
+
 std::mutex g_logMutex;
 std::mutex g_pipeMutex;
 std::mutex g_stateMutex;
@@ -145,6 +166,7 @@ std::unordered_map<void**, void*> g_patchedSlots;
 std::unordered_set<HMODULE> g_scannedModules;
 std::unordered_map<IAudioClient*, AudioClientState> g_audioClients;
 std::unordered_map<IAudioRenderClient*, RenderClientState> g_renderClients;
+AudioClientState g_bootstrapAudioState;
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_hooksDisabled{false};
 std::atomic<DWORD> g_lockedAudioPid{0};
@@ -793,6 +815,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
     bool shouldLogPcm = false;
     bool shouldLogActive = false;
     bool shouldLogResume = false;
+    bool shouldAnnounceFallbackFormat = false;
     std::uint64_t activeFrames = 0;
     std::uint64_t activeBytes = 0;
     std::uint64_t bytes = 0;
@@ -831,6 +854,12 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                     }
                 }
                 audioState = state;
+            } else if (renderState.lateAttached && g_bootstrapAudioState.hasFormat) {
+                audioState = g_bootstrapAudioState;
+                if (!renderIt->second.formatAnnounced) {
+                    renderIt->second.formatAnnounced = true;
+                    shouldAnnounceFallbackFormat = true;
+                }
             }
 
             const bool hasPcm =
@@ -866,6 +895,15 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             renderIt->second.pendingBuffer = nullptr;
             renderIt->second.pendingFrames = 0;
         }
+    }
+
+    if (shouldAnnounceFallbackFormat) {
+        LogWaveFormat("Late-attached IAudioRenderClient fallback format",
+                      self,
+                      &audioState.format.Format,
+                      audioState.shareMode,
+                      audioState.streamFlags,
+                      0);
     }
 
     const PcmBufferStats stats = InspectPcmBuffer(renderState.pendingBuffer, bytes);
@@ -1162,6 +1200,295 @@ HRESULT STDMETHODCALLTYPE FakeClockGetCharacteristics(IAudioClock*, DWORD* chara
     return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE FakeStreamVolumeQueryInterface(IAudioStreamVolume* self,
+                                                          REFIID iid,
+                                                          void** out) {
+    if (out == nullptr) {
+        return E_POINTER;
+    }
+    *out = nullptr;
+    if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioStreamVolume)) {
+        *out = self;
+        reinterpret_cast<FakeAudioStreamVolume*>(self)->refs.fetch_add(1);
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE FakeStreamVolumeAddRef(IAudioStreamVolume* self) {
+    return reinterpret_cast<FakeAudioStreamVolume*>(self)->refs.fetch_add(1) + 1;
+}
+
+ULONG STDMETHODCALLTYPE FakeStreamVolumeRelease(IAudioStreamVolume* self) {
+    auto* fake = reinterpret_cast<FakeAudioStreamVolume*>(self);
+    const ULONG refs = fake->refs.fetch_sub(1) - 1;
+    if (refs == 0) {
+        Log("Fake IAudioStreamVolume released. volume=%p audio=%p", self, fake->audioClient);
+        delete fake;
+    }
+    return refs;
+}
+
+HRESULT STDMETHODCALLTYPE FakeStreamVolumeGetChannelCount(IAudioStreamVolume* self,
+                                                           UINT32* channelCount) {
+    if (channelCount == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioStreamVolume*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    *channelCount = static_cast<UINT32>(fake->volumes.size());
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeStreamVolumeSetChannelVolume(IAudioStreamVolume* self,
+                                                            UINT32 channelIndex,
+                                                            float level) {
+    auto* fake = reinterpret_cast<FakeAudioStreamVolume*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    if (channelIndex >= fake->volumes.size() || level < 0.0f || level > 1.0f) {
+        return E_INVALIDARG;
+    }
+    fake->volumes[channelIndex] = level;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeStreamVolumeGetChannelVolume(IAudioStreamVolume* self,
+                                                            UINT32 channelIndex,
+                                                            float* level) {
+    if (level == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioStreamVolume*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    if (channelIndex >= fake->volumes.size()) {
+        return E_INVALIDARG;
+    }
+    *level = fake->volumes[channelIndex];
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeStreamVolumeSetAllVolumes(IAudioStreamVolume* self,
+                                                         UINT32 channelCount,
+                                                         const float* levels) {
+    if (levels == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioStreamVolume*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    if (channelCount != fake->volumes.size()) {
+        return E_INVALIDARG;
+    }
+    for (UINT32 index = 0; index < channelCount; ++index) {
+        if (levels[index] < 0.0f || levels[index] > 1.0f) {
+            return E_INVALIDARG;
+        }
+    }
+    std::copy(levels, levels + channelCount, fake->volumes.begin());
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeStreamVolumeGetAllVolumes(IAudioStreamVolume* self,
+                                                         UINT32 channelCount,
+                                                         float* levels) {
+    if (levels == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioStreamVolume*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    if (channelCount != fake->volumes.size()) {
+        return E_INVALIDARG;
+    }
+    std::copy(fake->volumes.begin(), fake->volumes.end(), levels);
+    return S_OK;
+}
+
+HRESULT CopyComString(const std::wstring& value, LPWSTR* out) {
+    if (out == nullptr) {
+        return E_POINTER;
+    }
+    *out = nullptr;
+    const std::size_t bytes = (value.size() + 1) * sizeof(wchar_t);
+    auto* copy = static_cast<LPWSTR>(CoTaskMemAlloc(bytes));
+    if (copy == nullptr) {
+        return E_OUTOFMEMORY;
+    }
+    std::memcpy(copy, value.c_str(), bytes);
+    *out = copy;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionQueryInterface(IAudioSessionControl2* self,
+                                                     REFIID iid,
+                                                     void** out) {
+    if (out == nullptr) {
+        return E_POINTER;
+    }
+    *out = nullptr;
+    if (iid == __uuidof(IUnknown) ||
+        iid == __uuidof(IAudioSessionControl) ||
+        iid == __uuidof(IAudioSessionControl2)) {
+        *out = self;
+        reinterpret_cast<FakeAudioSessionControl*>(self)->refs.fetch_add(1);
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE FakeSessionAddRef(IAudioSessionControl2* self) {
+    return reinterpret_cast<FakeAudioSessionControl*>(self)->refs.fetch_add(1) + 1;
+}
+
+ULONG STDMETHODCALLTYPE FakeSessionRelease(IAudioSessionControl2* self) {
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    const ULONG refs = fake->refs.fetch_sub(1) - 1;
+    if (refs == 0) {
+        for (auto* notification : fake->notifications) {
+            notification->Release();
+        }
+        Log("Fake IAudioSessionControl released. session=%p audio=%p", self, fake->audioClient);
+        delete fake;
+    }
+    return refs;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionGetState(IAudioSessionControl2* self,
+                                               AudioSessionState* state) {
+    if (state == nullptr) {
+        return E_POINTER;
+    }
+    const auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    const AudioClientState audioState = SnapshotAudioClient(fake->audioClient);
+    *state = audioState.fakeStarted
+            ? AudioSessionStateActive
+            : AudioSessionStateInactive;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionGetDisplayName(IAudioSessionControl2* self,
+                                                     LPWSTR* displayName) {
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    return CopyComString(fake->displayName, displayName);
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionSetDisplayName(IAudioSessionControl2* self,
+                                                     LPCWSTR displayName,
+                                                     LPCGUID) {
+    if (displayName == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    fake->displayName = displayName;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionGetIconPath(IAudioSessionControl2* self,
+                                                  LPWSTR* iconPath) {
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    return CopyComString(fake->iconPath, iconPath);
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionSetIconPath(IAudioSessionControl2* self,
+                                                  LPCWSTR iconPath,
+                                                  LPCGUID) {
+    if (iconPath == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    fake->iconPath = iconPath;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionGetGroupingParam(IAudioSessionControl2* self,
+                                                       GUID* groupingParam) {
+    if (groupingParam == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    *groupingParam = fake->groupingParam;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionSetGroupingParam(IAudioSessionControl2* self,
+                                                       LPCGUID groupingParam,
+                                                       LPCGUID) {
+    if (groupingParam == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    fake->groupingParam = *groupingParam;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionRegisterNotification(IAudioSessionControl2* self,
+                                                          IAudioSessionEvents* notification) {
+    if (notification == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    if (std::find(fake->notifications.begin(), fake->notifications.end(), notification) ==
+        fake->notifications.end()) {
+        notification->AddRef();
+        fake->notifications.push_back(notification);
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionUnregisterNotification(IAudioSessionControl2* self,
+                                                            IAudioSessionEvents* notification) {
+    if (notification == nullptr) {
+        return E_POINTER;
+    }
+    auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    std::lock_guard<std::mutex> lock(fake->mutex);
+    const auto it = std::find(fake->notifications.begin(), fake->notifications.end(), notification);
+    if (it != fake->notifications.end()) {
+        (*it)->Release();
+        fake->notifications.erase(it);
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionGetIdentifier(IAudioSessionControl2* self,
+                                                    LPWSTR* identifier) {
+    const auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    return CopyComString(L"AudioBridge.Session." +
+                         std::to_wstring(GetCurrentProcessId()) + L"." +
+                         std::to_wstring(reinterpret_cast<std::uintptr_t>(fake->audioClient)),
+                         identifier);
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionGetInstanceIdentifier(IAudioSessionControl2* self,
+                                                            LPWSTR* identifier) {
+    const auto* fake = reinterpret_cast<FakeAudioSessionControl*>(self);
+    return CopyComString(L"AudioBridge.Instance." +
+                         std::to_wstring(GetCurrentProcessId()) + L"." +
+                         std::to_wstring(reinterpret_cast<std::uintptr_t>(fake->audioClient)),
+                         identifier);
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionGetProcessId(IAudioSessionControl2*, DWORD* processId) {
+    if (processId == nullptr) {
+        return E_POINTER;
+    }
+    *processId = GetCurrentProcessId();
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionIsSystemSounds(IAudioSessionControl2*) {
+    return S_FALSE;
+}
+
+HRESULT STDMETHODCALLTYPE FakeSessionSetDuckingPreference(IAudioSessionControl2*, BOOL) {
+    return S_OK;
+}
+
 void* g_fakeRenderVtable[] = {
         reinterpret_cast<void*>(&FakeRenderQueryInterface),
         reinterpret_cast<void*>(&FakeRenderAddRef),
@@ -1177,6 +1504,37 @@ void* g_fakeClockVtable[] = {
         reinterpret_cast<void*>(&FakeClockGetFrequency),
         reinterpret_cast<void*>(&FakeClockGetPosition),
         reinterpret_cast<void*>(&FakeClockGetCharacteristics),
+};
+
+void* g_fakeStreamVolumeVtable[] = {
+        reinterpret_cast<void*>(&FakeStreamVolumeQueryInterface),
+        reinterpret_cast<void*>(&FakeStreamVolumeAddRef),
+        reinterpret_cast<void*>(&FakeStreamVolumeRelease),
+        reinterpret_cast<void*>(&FakeStreamVolumeGetChannelCount),
+        reinterpret_cast<void*>(&FakeStreamVolumeSetChannelVolume),
+        reinterpret_cast<void*>(&FakeStreamVolumeGetChannelVolume),
+        reinterpret_cast<void*>(&FakeStreamVolumeSetAllVolumes),
+        reinterpret_cast<void*>(&FakeStreamVolumeGetAllVolumes),
+};
+
+void* g_fakeSessionControlVtable[] = {
+        reinterpret_cast<void*>(&FakeSessionQueryInterface),
+        reinterpret_cast<void*>(&FakeSessionAddRef),
+        reinterpret_cast<void*>(&FakeSessionRelease),
+        reinterpret_cast<void*>(&FakeSessionGetState),
+        reinterpret_cast<void*>(&FakeSessionGetDisplayName),
+        reinterpret_cast<void*>(&FakeSessionSetDisplayName),
+        reinterpret_cast<void*>(&FakeSessionGetIconPath),
+        reinterpret_cast<void*>(&FakeSessionSetIconPath),
+        reinterpret_cast<void*>(&FakeSessionGetGroupingParam),
+        reinterpret_cast<void*>(&FakeSessionSetGroupingParam),
+        reinterpret_cast<void*>(&FakeSessionRegisterNotification),
+        reinterpret_cast<void*>(&FakeSessionUnregisterNotification),
+        reinterpret_cast<void*>(&FakeSessionGetIdentifier),
+        reinterpret_cast<void*>(&FakeSessionGetInstanceIdentifier),
+        reinterpret_cast<void*>(&FakeSessionGetProcessId),
+        reinterpret_cast<void*>(&FakeSessionIsSystemSounds),
+        reinterpret_cast<void*>(&FakeSessionSetDuckingPreference),
 };
 
 HRESULT STDMETHODCALLTYPE HookEnumAudioEndpoints(IMMDeviceEnumerator* self,
@@ -1424,6 +1782,51 @@ HRESULT STDMETHODCALLTYPE HookGetService(IAudioClient* self, REFIID iid, void** 
             fake->audioClient = self;
             *service = reinterpret_cast<IAudioClock*>(fake);
             Log("Fake IAudioClock acquired. clock=%p audio=%p", *service, self);
+            return S_OK;
+        }
+        if (iid == __uuidof(IAudioStreamVolume)) {
+            if (!audioState.fakeInitialized) {
+                Log("Fake output GetService(IAudioStreamVolume) before Initialize. audio=%p", self);
+                return AUDCLNT_E_NOT_INITIALIZED;
+            }
+            auto* fake = new (std::nothrow) FakeAudioStreamVolume();
+            if (fake == nullptr) {
+                return E_OUTOFMEMORY;
+            }
+            fake->vtable = g_fakeStreamVolumeVtable;
+            fake->audioClient = self;
+            const UINT32 channelCount = audioState.format.Format.nChannels != 0
+                    ? audioState.format.Format.nChannels
+                    : 2;
+            try {
+                fake->volumes.assign(channelCount, 1.0f);
+            } catch (...) {
+                delete fake;
+                return E_OUTOFMEMORY;
+            }
+            *service = reinterpret_cast<IAudioStreamVolume*>(fake);
+            Log("Fake IAudioStreamVolume acquired. volume=%p audio=%p channels=%u",
+                *service,
+                self,
+                channelCount);
+            return S_OK;
+        }
+        if (iid == __uuidof(IAudioSessionControl) ||
+            iid == __uuidof(IAudioSessionControl2)) {
+            if (!audioState.fakeInitialized) {
+                Log("Fake output GetService(IAudioSessionControl) before Initialize. audio=%p", self);
+                return AUDCLNT_E_NOT_INITIALIZED;
+            }
+            auto* fake = new (std::nothrow) FakeAudioSessionControl();
+            if (fake == nullptr) {
+                return E_OUTOFMEMORY;
+            }
+            fake->vtable = g_fakeSessionControlVtable;
+            fake->audioClient = self;
+            *service = reinterpret_cast<IAudioSessionControl2*>(fake);
+            Log("Fake IAudioSessionControl acquired. session=%p audio=%p",
+                *service,
+                self);
             return S_OK;
         }
 
@@ -1730,11 +2133,25 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentSharedModeEnginePeriod(IAudioClient3* se
 
 HRESULT STDMETHODCALLTYPE HookGetBuffer(IAudioRenderClient* self, UINT32 frameCount, BYTE** data) {
     const HRESULT hr = g_originalGetBuffer(self, frameCount, data);
+    bool lateAttached = false;
     if (SUCCEEDED(hr) && data != nullptr) {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        auto& state = g_renderClients[self];
-        state.pendingBuffer = *data;
-        state.pendingFrames = frameCount;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto [it, inserted] = g_renderClients.try_emplace(self);
+            auto& state = it->second;
+            if (inserted) {
+                state.lateAttached = true;
+                lateAttached = true;
+            }
+            state.pendingBuffer = *data;
+            state.pendingFrames = frameCount;
+        }
+        if (lateAttached) {
+            const auto count = ++g_renderClientCount;
+            Log("Late-attached IAudioRenderClient observed. active renderClients=%u render=%p",
+                count,
+                self);
+        }
     }
     return hr;
 }
@@ -2387,6 +2804,44 @@ void BootstrapAudioClientVtables(IMMDevice* device) {
         audioClient3 != nullptr) {
         PatchAudioClient3(audioClient3);
         audioClient3->Release();
+    }
+
+    WAVEFORMATEX* mixFormat = nullptr;
+    const HRESULT mixFormatResult = audioClient->GetMixFormat(&mixFormat);
+    if (SUCCEEDED(mixFormatResult) && mixFormat != nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            CopyWaveFormat(mixFormat, &g_bootstrapAudioState);
+            g_bootstrapAudioState.shareMode = AUDCLNT_SHAREMODE_SHARED;
+            g_bootstrapAudioState.streamFlags = 0;
+        }
+
+        const HRESULT initializeResult = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                                                 0,
+                                                                 100000,
+                                                                 0,
+                                                                 mixFormat,
+                                                                 nullptr);
+        if (SUCCEEDED(initializeResult)) {
+            IAudioRenderClient* renderClient = nullptr;
+            const HRESULT serviceResult = audioClient->GetService(
+                    __uuidof(IAudioRenderClient),
+                    reinterpret_cast<void**>(&renderClient));
+            if (SUCCEEDED(serviceResult) && renderClient != nullptr) {
+                renderClient->Release();
+                Log("IAudioRenderClient bootstrap patched for late attachment.");
+            } else {
+                Log("IAudioRenderClient bootstrap GetService failed. hr=0x%08lX",
+                    static_cast<unsigned long>(serviceResult));
+            }
+        } else {
+            Log("IAudioRenderClient bootstrap Initialize failed. hr=0x%08lX",
+                static_cast<unsigned long>(initializeResult));
+        }
+        CoTaskMemFree(mixFormat);
+    } else {
+        Log("IAudioRenderClient bootstrap GetMixFormat failed. hr=0x%08lX",
+            static_cast<unsigned long>(mixFormatResult));
     }
 
     Log("IAudioClient bootstrap patched. audio=%p", audioClient);

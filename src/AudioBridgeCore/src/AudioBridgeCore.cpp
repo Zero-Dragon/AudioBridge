@@ -10,9 +10,15 @@
 #endif
 
 #include <windows.h>
+#include <appmodel.h>
+#include <audiopolicy.h>
 #include <ks.h>
 #include <ksmedia.h>
+#include <mmdeviceapi.h>
+#include <sddl.h>
+#include <shobjidl_core.h>
 #include <tlhelp32.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +31,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -36,7 +43,7 @@
 namespace audiobridge {
 namespace {
 
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\AudioBridgeWasapiHook";
+constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\LOCAL\\AudioBridgeWasapiHook";
 constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControl";
 constexpr wchar_t kHookReadyEventPrefix[] = L"Local\\AudioBridgeHookReady_";
 constexpr DWORD kHookReadyTimeoutMs = 5000;
@@ -97,6 +104,279 @@ struct AudioPidState {
 struct ProcessSnapshotEntry {
     DWORD pid = 0;
     DWORD parentPid = 0;
+};
+
+enum class PackageIdentityQueryResult {
+    NoPackage,
+    Found,
+    Failed,
+};
+
+std::wstring HResultMessage(const wchar_t* action, HRESULT result);
+
+class IpcSecurityAttributes final {
+public:
+    IpcSecurityAttributes() {
+        // Packaged processes perform an additional restricted-token access check.
+        // Keep IPC session-local and grant the interactive user plus the Windows
+        // packaged-application group access to objects created by AudioBridge.
+        constexpr wchar_t kSecurityDescriptor[] =
+                L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GA;;;AC)";
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    kSecurityDescriptor,
+                    SDDL_REVISION_1,
+                    &descriptor_,
+                    nullptr)) {
+            attributes_.nLength = sizeof(attributes_);
+            attributes_.lpSecurityDescriptor = descriptor_;
+            attributes_.bInheritHandle = FALSE;
+        }
+    }
+
+    ~IpcSecurityAttributes() {
+        if (descriptor_ != nullptr) {
+            LocalFree(descriptor_);
+        }
+    }
+
+    IpcSecurityAttributes(const IpcSecurityAttributes&) = delete;
+    IpcSecurityAttributes& operator=(const IpcSecurityAttributes&) = delete;
+
+    SECURITY_ATTRIBUTES* Get() {
+        return descriptor_ != nullptr ? &attributes_ : nullptr;
+    }
+
+private:
+    PSECURITY_DESCRIPTOR descriptor_ = nullptr;
+    SECURITY_ATTRIBUTES attributes_{};
+};
+
+class AudioSessionPidEvidence final {
+public:
+    void Record(IAudioSessionControl* session) {
+        if (session == nullptr) {
+            return;
+        }
+
+        Microsoft::WRL::ComPtr<IAudioSessionControl2> sessionControl;
+        if (FAILED(session->QueryInterface(IID_PPV_ARGS(&sessionControl)))) {
+            return;
+        }
+
+        DWORD pid = 0;
+        if (SUCCEEDED(sessionControl->GetProcessId(&pid)) && pid != 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pids_.insert(pid);
+        }
+    }
+
+    std::unordered_set<DWORD> Snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pids_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_set<DWORD> pids_;
+};
+
+class AudioSessionNotification final : public IAudioSessionNotification {
+public:
+    explicit AudioSessionNotification(std::shared_ptr<AudioSessionPidEvidence> evidence)
+        : evidence_(std::move(evidence)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID interfaceId, void** object) override {
+        if (object == nullptr) {
+            return E_POINTER;
+        }
+        *object = nullptr;
+        if (interfaceId == __uuidof(IUnknown) ||
+            interfaceId == __uuidof(IAudioSessionNotification)) {
+            *object = static_cast<IAudioSessionNotification*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return referenceCount_.fetch_add(1) + 1;
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG remaining = referenceCount_.fetch_sub(1) - 1;
+        if (remaining == 0) {
+            delete this;
+        }
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnSessionCreated(IAudioSessionControl* newSession) override {
+        evidence_->Record(newSession);
+        return S_OK;
+    }
+
+private:
+    ~AudioSessionNotification() = default;
+
+    std::atomic<ULONG> referenceCount_{1};
+    std::shared_ptr<AudioSessionPidEvidence> evidence_;
+};
+
+class RenderAudioSessionTracker final {
+public:
+    RenderAudioSessionTracker()
+        : evidence_(std::make_shared<AudioSessionPidEvidence>()) {}
+
+    ~RenderAudioSessionTracker() {
+        for (auto& registration : registrations_) {
+            registration.manager->UnregisterSessionNotification(registration.notification);
+            registration.notification->Release();
+        }
+    }
+
+    RenderAudioSessionTracker(const RenderAudioSessionTracker&) = delete;
+    RenderAudioSessionTracker& operator=(const RenderAudioSessionTracker&) = delete;
+
+    bool Initialize(std::wstring* outError) {
+        const HRESULT result = CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                                nullptr,
+                                                CLSCTX_ALL,
+                                                IID_PPV_ARGS(&deviceEnumerator_));
+        if (FAILED(result)) {
+            if (outError != nullptr) {
+                *outError = HResultMessage(L"CoCreateInstance(MMDeviceEnumerator)", result);
+            }
+            return false;
+        }
+        return RefreshEndpoints(outError);
+    }
+
+    void Refresh() {
+        RefreshEndpoints(nullptr);
+        for (const auto& registration : registrations_) {
+            EnumerateSessions(registration.manager.Get());
+        }
+    }
+
+    std::unordered_set<DWORD> SnapshotPids() const {
+        return evidence_->Snapshot();
+    }
+
+    std::size_t EndpointCount() const {
+        return registrations_.size();
+    }
+
+private:
+    struct Registration {
+        std::wstring deviceId;
+        Microsoft::WRL::ComPtr<IAudioSessionManager2> manager;
+        AudioSessionNotification* notification = nullptr;
+    };
+
+    bool RefreshEndpoints(std::wstring* outError) {
+        Microsoft::WRL::ComPtr<IMMDeviceCollection> devices;
+        HRESULT result = deviceEnumerator_->EnumAudioEndpoints(
+                eRender, DEVICE_STATE_ACTIVE, &devices);
+        if (FAILED(result)) {
+            if (outError != nullptr) {
+                *outError = HResultMessage(L"EnumAudioEndpoints(render)", result);
+            }
+            return false;
+        }
+
+        UINT count = 0;
+        result = devices->GetCount(&count);
+        if (FAILED(result)) {
+            if (outError != nullptr) {
+                *outError = HResultMessage(L"IMMDeviceCollection::GetCount", result);
+            }
+            return false;
+        }
+
+        bool foundEndpoint = !registrations_.empty();
+        for (UINT index = 0; index < count; ++index) {
+            Microsoft::WRL::ComPtr<IMMDevice> device;
+            if (FAILED(devices->Item(index, &device))) {
+                continue;
+            }
+
+            LPWSTR rawDeviceId = nullptr;
+            if (FAILED(device->GetId(&rawDeviceId)) || rawDeviceId == nullptr) {
+                CoTaskMemFree(rawDeviceId);
+                continue;
+            }
+            const std::wstring deviceId(rawDeviceId);
+            CoTaskMemFree(rawDeviceId);
+
+            const bool alreadyRegistered = std::any_of(
+                    registrations_.begin(),
+                    registrations_.end(),
+                    [&deviceId](const Registration& registration) {
+                        return registration.deviceId == deviceId;
+                    });
+            if (alreadyRegistered) {
+                foundEndpoint = true;
+                continue;
+            }
+
+            Microsoft::WRL::ComPtr<IAudioSessionManager2> manager;
+            result = device->Activate(__uuidof(IAudioSessionManager2),
+                                      CLSCTX_ALL,
+                                      nullptr,
+                                      &manager);
+            if (FAILED(result)) {
+                continue;
+            }
+
+            auto* notification = new (std::nothrow) AudioSessionNotification(evidence_);
+            if (notification == nullptr) {
+                continue;
+            }
+            result = manager->RegisterSessionNotification(notification);
+            if (FAILED(result)) {
+                notification->Release();
+                continue;
+            }
+
+            // GetCount is required after registration before Windows begins
+            // delivering new-session notifications. Enumerating here also
+            // captures sessions that existed before AudioBridge started.
+            EnumerateSessions(manager.Get());
+            registrations_.push_back({deviceId, std::move(manager), notification});
+            foundEndpoint = true;
+        }
+
+        if (!foundEndpoint && outError != nullptr) {
+            *outError = L"No active Windows render endpoint was available for audio-session tracking.";
+        }
+        return foundEndpoint;
+    }
+
+    void EnumerateSessions(IAudioSessionManager2* manager) {
+        if (manager == nullptr) {
+            return;
+        }
+
+        Microsoft::WRL::ComPtr<IAudioSessionEnumerator> sessions;
+        if (FAILED(manager->GetSessionEnumerator(&sessions))) {
+            return;
+        }
+        int count = 0;
+        if (FAILED(sessions->GetCount(&count))) {
+            return;
+        }
+        for (int index = 0; index < count; ++index) {
+            Microsoft::WRL::ComPtr<IAudioSessionControl> session;
+            if (SUCCEEDED(sessions->GetSession(index, &session))) {
+                evidence_->Record(session.Get());
+            }
+        }
+    }
+
+    std::shared_ptr<AudioSessionPidEvidence> evidence_;
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> deviceEnumerator_;
+    std::vector<Registration> registrations_;
 };
 
 std::uint64_t NowMs() {
@@ -181,6 +461,10 @@ std::wstring Win32Message(const wchar_t* action, DWORD error = GetLastError()) {
                   error,
                   systemMessage);
     return buffer;
+}
+
+std::wstring HResultMessage(const wchar_t* action, HRESULT result) {
+    return Win32Message(action, static_cast<DWORD>(result));
 }
 
 std::wstring QuoteCommandArgument(const std::wstring& value) {
@@ -395,6 +679,173 @@ std::wstring QueryProcessImagePath(DWORD pid) {
     CloseHandle(process);
     path.resize(chars);
     return path;
+}
+
+PackageIdentityQueryResult QueryProcessPackageFullName(HANDLE process,
+                                                       std::wstring* packageFullName,
+                                                       LONG* queryError = nullptr) {
+    if (packageFullName != nullptr) {
+        packageFullName->clear();
+    }
+    if (queryError != nullptr) {
+        *queryError = ERROR_SUCCESS;
+    }
+    if (process == nullptr || process == INVALID_HANDLE_VALUE) {
+        if (queryError != nullptr) {
+            *queryError = ERROR_INVALID_HANDLE;
+        }
+        return PackageIdentityQueryResult::Failed;
+    }
+
+    UINT32 chars = 0;
+    LONG result = GetPackageFullName(process, &chars, nullptr);
+    if (result == APPMODEL_ERROR_NO_PACKAGE) {
+        return PackageIdentityQueryResult::NoPackage;
+    }
+    if (result != ERROR_INSUFFICIENT_BUFFER || chars == 0) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return PackageIdentityQueryResult::Failed;
+    }
+
+    std::wstring value(chars, L'\0');
+    result = GetPackageFullName(process, &chars, value.data());
+    if (result != ERROR_SUCCESS) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return PackageIdentityQueryResult::Failed;
+    }
+    if (!value.empty() && value.back() == L'\0') {
+        value.pop_back();
+    }
+    if (value.empty()) {
+        if (queryError != nullptr) {
+            *queryError = ERROR_INVALID_DATA;
+        }
+        return PackageIdentityQueryResult::Failed;
+    }
+
+    if (packageFullName != nullptr) {
+        *packageFullName = std::move(value);
+    }
+    return PackageIdentityQueryResult::Found;
+}
+
+PackageIdentityQueryResult QueryProcessPackageFullName(DWORD pid,
+                                                       std::wstring* packageFullName,
+                                                       LONG* queryError = nullptr) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) {
+        if (packageFullName != nullptr) {
+            packageFullName->clear();
+        }
+        if (queryError != nullptr) {
+            *queryError = static_cast<LONG>(GetLastError());
+        }
+        return PackageIdentityQueryResult::Failed;
+    }
+
+    const auto result = QueryProcessPackageFullName(process, packageFullName, queryError);
+    CloseHandle(process);
+    return result;
+}
+
+bool QueryProcessApplicationUserModelId(HANDLE process,
+                                        std::wstring* applicationUserModelId,
+                                        LONG* queryError = nullptr) {
+    if (applicationUserModelId != nullptr) {
+        applicationUserModelId->clear();
+    }
+    if (queryError != nullptr) {
+        *queryError = ERROR_SUCCESS;
+    }
+    if (process == nullptr || process == INVALID_HANDLE_VALUE) {
+        if (queryError != nullptr) {
+            *queryError = ERROR_INVALID_HANDLE;
+        }
+        return false;
+    }
+
+    UINT32 chars = 0;
+    LONG result = GetApplicationUserModelId(process, &chars, nullptr);
+    if (result != ERROR_INSUFFICIENT_BUFFER || chars == 0) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+
+    std::wstring value(chars, L'\0');
+    result = GetApplicationUserModelId(process, &chars, value.data());
+    if (result != ERROR_SUCCESS) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+    if (!value.empty() && value.back() == L'\0') {
+        value.pop_back();
+    }
+    if (value.empty()) {
+        if (queryError != nullptr) {
+            *queryError = ERROR_INVALID_DATA;
+        }
+        return false;
+    }
+
+    if (applicationUserModelId != nullptr) {
+        *applicationUserModelId = std::move(value);
+    }
+    return true;
+}
+
+bool ActivatePackagedApplication(const std::wstring& applicationUserModelId,
+                                 DWORD* processId,
+                                 std::wstring* outError) {
+    if (processId == nullptr || applicationUserModelId.empty()) {
+        if (outError != nullptr) {
+            *outError = L"A packaged application requires a valid AUMID.";
+        }
+        return false;
+    }
+    *processId = 0;
+
+    const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool uninitialize = SUCCEEDED(initializeResult);
+    if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
+        if (outError != nullptr) {
+            *outError = HResultMessage(L"CoInitializeEx(package activation)", initializeResult);
+        }
+        return false;
+    }
+
+    IApplicationActivationManager* activationManager = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_ApplicationActivationManager,
+                                      nullptr,
+                                      CLSCTX_LOCAL_SERVER,
+                                      IID_PPV_ARGS(&activationManager));
+    if (SUCCEEDED(result)) {
+        result = activationManager->ActivateApplication(applicationUserModelId.c_str(),
+                                                        nullptr,
+                                                        AO_NONE,
+                                                        processId);
+        activationManager->Release();
+    }
+    if (uninitialize) {
+        CoUninitialize();
+    }
+
+    if (FAILED(result) || *processId == 0) {
+        if (outError != nullptr) {
+            *outError = FAILED(result)
+                    ? HResultMessage(L"ActivateApplication", result)
+                    : L"ActivateApplication returned no process ID.";
+        }
+        return false;
+    }
+    return true;
 }
 
 std::vector<ProcessSnapshotEntry> SnapshotProcesses() {
@@ -619,10 +1070,12 @@ private:
     std::int32_t rendererAsioBufferFrames_ = kDefaultAsioBufferFrames;
 
     std::atomic<bool> running_{false};
+    std::atomic<bool> targetExited_{false};
     std::atomic<std::uint32_t> lockedAudioPid_{0};
     std::uint32_t targetPid_ = 0;
     HANDLE targetProcess_ = nullptr;
     std::filesystem::path targetExePath_;
+    std::wstring targetPackageFullName_;
     std::unordered_set<DWORD> injectedPids_;
     std::unordered_map<DWORD, int> injectionAttempts_;
     std::mutex processMonitorMutex_;
@@ -728,13 +1181,15 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         rendererPrebufferMs_ = prebufferMs_;
         rendererAsioBufferFrames_ = asioBufferFrames_;
         targetPid_ = 0;
+        targetExited_.store(false);
         lockedAudioPid_ = 0;
         logBuffer_.clear();
         SetLastErrorLocked(L"OK");
     }
 
+    IpcSecurityAttributes ipcSecurity;
     controlMapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE,
-                                         nullptr,
+                                         ipcSecurity.Get(),
                                          PAGE_READWRITE,
                                          0,
                                          sizeof(HookControlBlock),
@@ -768,14 +1223,16 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         return kError;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(processMonitorMutex_);
-        targetExePath_ = std::filesystem::absolute(targetPath);
-        injectedPids_.clear();
-        injectedPids_.insert(targetPid_);
-        injectionAttempts_.clear();
+    if (!processMonitorThread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(processMonitorMutex_);
+            targetExePath_ = std::filesystem::absolute(targetPath);
+            injectedPids_.clear();
+            injectedPids_.insert(targetPid_);
+            injectionAttempts_.clear();
+        }
+        StartProcessMonitor();
     }
-    StartProcessMonitor();
 
     Log(L"Started target. pid=%u fakeOutput=%s exe=\"%s\"",
         targetPid_,
@@ -825,6 +1282,7 @@ void AudioBridgeCore::Stop() {
     {
         std::lock_guard<std::mutex> lock(processMonitorMutex_);
         targetExePath_.clear();
+        targetPackageFullName_.clear();
         injectedPids_.clear();
         injectionAttempts_.clear();
     }
@@ -840,6 +1298,7 @@ void AudioBridgeCore::Stop() {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         targetPid_ = 0;
+        targetExited_.store(false);
         lockedAudioPid_ = 0;
         audioPids_.clear();
         rendererHasFormat_ = false;
@@ -989,8 +1448,9 @@ int32_t AudioBridgeCore::GetStatus(ABC_Status* status) const {
     }
     const RendererStats stats = renderer_.GetStats();
     std::lock_guard<std::mutex> lock(stateMutex_);
-    status->running = running_.load() ? 1 : 0;
-    status->targetPid = targetPid_;
+    const bool targetExited = targetExited_.load();
+    status->running = running_.load() && !targetExited ? 1 : 0;
+    status->targetPid = targetExited ? 0 : targetPid_;
     status->lockedAudioPid = lockedAudioPid_.load();
     status->streamActive = stats.streamActive ? 1 : 0;
     status->prebuffering = stats.prebuffering ? 1 : 0;
@@ -1093,6 +1553,7 @@ bool AudioBridgeCore::StartPipeServer(std::wstring* outError) {
 }
 
 void AudioBridgeCore::PipeServerThread() {
+    IpcSecurityAttributes ipcSecurity;
     while (running_.load()) {
         HANDLE pipe = CreateNamedPipeW(kPipeName,
                                        PIPE_ACCESS_INBOUND,
@@ -1101,7 +1562,7 @@ void AudioBridgeCore::PipeServerThread() {
                                        1 << 20,
                                        1 << 20,
                                        1000,
-                                       nullptr);
+                                       ipcSecurity.Get());
         if (pipe == INVALID_HANDLE_VALUE) {
             Sleep(100);
             continue;
@@ -1309,8 +1770,8 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
 }
 
 bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath,
-                                            const std::filesystem::path& hookDllPath,
-                                            std::wstring* outError) {
+                                             const std::filesystem::path& hookDllPath,
+                                             std::wstring* outError) {
     const std::wstring targetExe = std::filesystem::absolute(exePath).wstring();
     std::wstring commandLine = QuoteCommandArgument(targetExe);
     std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
@@ -1339,8 +1800,77 @@ bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath
         return false;
     }
 
-    targetPid_ = processInfo.dwProcessId;
-    targetProcess_ = processInfo.hProcess;
+    std::wstring targetPackageFullName;
+    LONG packageQueryError = ERROR_SUCCESS;
+    const auto packageIdentityResult = QueryProcessPackageFullName(
+            processInfo.hProcess, &targetPackageFullName, &packageQueryError);
+    const bool isPackagedTarget = packageIdentityResult == PackageIdentityQueryResult::Found;
+
+    if (isPackagedTarget) {
+        std::wstring applicationUserModelId;
+        LONG applicationIdQueryError = ERROR_SUCCESS;
+        if (!QueryProcessApplicationUserModelId(processInfo.hProcess,
+                                                &applicationUserModelId,
+                                                &applicationIdQueryError)) {
+            if (outError != nullptr) {
+                *outError = L"The selected packaged application could not be resolved to an AUMID (error " +
+                            std::to_wstring(applicationIdQueryError) +
+                            L"). AudioBridge did not launch it as a plain executable.";
+            }
+            TerminateProcess(processInfo.hProcess, 1);
+            CloseHandle(processInfo.hThread);
+            CloseHandle(processInfo.hProcess);
+            return false;
+        }
+
+        // CreateProcess is only a suspended identity probe. Resuming a packaged
+        // executable directly bypasses its manifest activation contract and can
+        // break app-model state such as licensing. Discard the probe and ask
+        // Windows to activate the declared application by AUMID instead.
+        TerminateProcess(processInfo.hProcess, 0);
+        WaitForSingleObject(processInfo.hProcess, 1000);
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        processInfo = {};
+
+        DWORD activatedProcessId = 0;
+        if (!ActivatePackagedApplication(applicationUserModelId, &activatedProcessId, outError)) {
+            return false;
+        }
+
+        constexpr DWORD kInjectionProcessAccess = PROCESS_QUERY_LIMITED_INFORMATION |
+                PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+                PROCESS_VM_READ | PROCESS_TERMINATE | SYNCHRONIZE;
+        HANDLE activatedProcess = OpenProcess(kInjectionProcessAccess, FALSE, activatedProcessId);
+        if (activatedProcess == nullptr) {
+            if (outError != nullptr) {
+                *outError = Win32Message(L"OpenProcess(activated packaged target)");
+            }
+            return false;
+        }
+
+        targetPid_ = activatedProcessId;
+        targetProcess_ = activatedProcess;
+        Log(L"Packaged target activated through Windows. aumid=\"%s\" pid=%u",
+            applicationUserModelId.c_str(),
+            targetPid_);
+    } else {
+        targetPid_ = processInfo.dwProcessId;
+        targetProcess_ = processInfo.hProcess;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(processMonitorMutex_);
+        targetPackageFullName_ = isPackagedTarget ? targetPackageFullName : std::wstring();
+    }
+    if (isPackagedTarget) {
+        Log(L"Packaged target detected. packageFullName=\"%s\" additional package process monitoring=on",
+            targetPackageFullName.c_str());
+    } else if (packageIdentityResult == PackageIdentityQueryResult::Failed) {
+        Log(L"Package identity query failed. targetPid=%u error=%ld; using standard process monitoring.",
+            targetPid_,
+            packageQueryError);
+    }
 
     USHORT targetMachine = IMAGE_FILE_MACHINE_UNKNOWN;
     if (!EffectiveMachine(targetProcess_, &targetMachine)) {
@@ -1355,7 +1885,9 @@ bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath
                             L" Use the win64 package to open a 64-bit target process.";
             }
             TerminateProcess(targetProcess_, 1);
-            CloseHandle(processInfo.hThread);
+            if (processInfo.hThread != nullptr) {
+                CloseHandle(processInfo.hThread);
+            }
             CloseHandle(targetProcess_);
             targetProcess_ = nullptr;
             targetPid_ = 0;
@@ -1370,21 +1902,38 @@ bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath
             *outError = L"Hook DLL does not exist: " + selectedHookPath.wstring();
         }
         TerminateProcess(targetProcess_, 1);
-        CloseHandle(processInfo.hThread);
+        if (processInfo.hThread != nullptr) {
+            CloseHandle(processInfo.hThread);
+        }
         CloseHandle(targetProcess_);
         targetProcess_ = nullptr;
         targetPid_ = 0;
         return false;
     }
 
+    if (isPackagedTarget) {
+        {
+            std::lock_guard<std::mutex> lock(processMonitorMutex_);
+            targetExePath_ = std::filesystem::absolute(exePath);
+            injectedPids_.clear();
+            injectedPids_.insert(targetPid_);
+            injectionAttempts_.clear();
+        }
+        StartProcessMonitor();
+        Log(L"Package process monitor armed after system activation and before root injection.");
+    }
+
     const auto readyEventName = HookReadyEventName(targetPid_);
-    HANDLE readyEvent = CreateEventW(nullptr, TRUE, FALSE, readyEventName.c_str());
+    IpcSecurityAttributes ipcSecurity;
+    HANDLE readyEvent = CreateEventW(ipcSecurity.Get(), TRUE, FALSE, readyEventName.c_str());
     if (readyEvent == nullptr) {
         if (outError != nullptr) {
             *outError = Win32Message(L"CreateEventW(hook ready)");
         }
         TerminateProcess(targetProcess_, 1);
-        CloseHandle(processInfo.hThread);
+        if (processInfo.hThread != nullptr) {
+            CloseHandle(processInfo.hThread);
+        }
         CloseHandle(targetProcess_);
         targetProcess_ = nullptr;
         targetPid_ = 0;
@@ -1408,7 +1957,9 @@ bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath
     if (!injected) {
         CloseHandle(readyEvent);
         TerminateProcess(targetProcess_, 1);
-        CloseHandle(processInfo.hThread);
+        if (processInfo.hThread != nullptr) {
+            CloseHandle(processInfo.hThread);
+        }
         CloseHandle(targetProcess_);
         targetProcess_ = nullptr;
         targetPid_ = 0;
@@ -1418,7 +1969,9 @@ bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath
     if (!WaitForHookReady(readyEvent, targetPid_, outError)) {
         CloseHandle(readyEvent);
         TerminateProcess(targetProcess_, 1);
-        CloseHandle(processInfo.hThread);
+        if (processInfo.hThread != nullptr) {
+            CloseHandle(processInfo.hThread);
+        }
         CloseHandle(targetProcess_);
         targetProcess_ = nullptr;
         targetPid_ = 0;
@@ -1430,8 +1983,10 @@ bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath
         targetPid_,
         targetMachine,
         selectedHookPath.wstring().c_str());
-    ResumeThread(processInfo.hThread);
-    CloseHandle(processInfo.hThread);
+    if (!isPackagedTarget) {
+        ResumeThread(processInfo.hThread);
+        CloseHandle(processInfo.hThread);
+    }
     return true;
 }
 
@@ -1447,22 +2002,110 @@ void AudioBridgeCore::ProcessMonitorThread() {
     constexpr auto kMonitorDuration = std::chrono::seconds(30);
     constexpr int kMaxInjectionAttempts = 3;
 
-    while (running_.load() && std::chrono::steady_clock::now() - startedAt < kMonitorDuration) {
+    DWORD rootPid = 0;
+    std::filesystem::path targetPath;
+    std::wstring targetPackageFullName;
+    {
+        std::lock_guard<std::mutex> lock(processMonitorMutex_);
+        rootPid = targetPid_;
+        targetPath = targetExePath_;
+        targetPackageFullName = targetPackageFullName_;
+    }
+    const auto normalizedTargetPath = NormalizePathForComparison(targetPath);
+    DWORD targetSessionId = 0;
+    const bool hasTargetSession = ProcessIdToSessionId(rootPid, &targetSessionId) != FALSE;
+    const bool monitorPackageProcesses =
+            !targetPackageFullName.empty() && hasTargetSession;
+    if (!targetPackageFullName.empty() && !hasTargetSession) {
+        Log(L"Package process monitoring could not resolve the target session; using standard process monitoring.");
+    }
+    std::unordered_map<DWORD, std::wstring> packageIdentityCache;
+    std::unordered_map<DWORD, PackageIdentityQueryResult> packageIdentityResults;
+    std::unordered_set<DWORD> loggedPackageCandidates;
+
+    bool uninitializeCom = false;
+    std::unique_ptr<RenderAudioSessionTracker> audioSessionTracker;
+    auto lastAudioSessionRefresh = std::chrono::steady_clock::time_point::min();
+    if (monitorPackageProcesses) {
+        const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        uninitializeCom = SUCCEEDED(initializeResult);
+        if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
+            Log(L"Package audio-session tracking could not initialize COM: %s",
+                HResultMessage(L"CoInitializeEx(MTA)", initializeResult).c_str());
+        } else {
+            auto tracker = std::make_unique<RenderAudioSessionTracker>();
+            std::wstring trackingError;
+            if (tracker->Initialize(&trackingError)) {
+                Log(L"Package audio-session tracking armed across %zu active render endpoint(s).",
+                    tracker->EndpointCount());
+                audioSessionTracker = std::move(tracker);
+                lastAudioSessionRefresh = std::chrono::steady_clock::now();
+            } else {
+                Log(L"Package audio-session tracking is unavailable: %s",
+                    trackingError.c_str());
+            }
+        }
+    }
+
+    while (running_.load() &&
+           (monitorPackageProcesses ||
+            std::chrono::steady_clock::now() - startedAt < kMonitorDuration)) {
+        if (targetProcess_ != nullptr &&
+            WaitForSingleObject(targetProcess_, 0) == WAIT_OBJECT_0) {
+            targetExited_.store(true);
+            Log(L"Target process exited. pid=%u; package monitoring stopped.", rootPid);
+            break;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (audioSessionTracker != nullptr &&
+            now - lastAudioSessionRefresh >= std::chrono::seconds(1)) {
+            audioSessionTracker->Refresh();
+            lastAudioSessionRefresh = now;
+        }
+        const auto audioSessionPids = audioSessionTracker != nullptr
+                ? audioSessionTracker->SnapshotPids()
+                : std::unordered_set<DWORD>();
+
         const auto processes = SnapshotProcesses();
         std::unordered_map<DWORD, DWORD> parents;
         parents.reserve(processes.size());
+        std::unordered_set<DWORD> livePids;
+        if (monitorPackageProcesses) {
+            livePids.reserve(processes.size());
+        }
         for (const auto& process : processes) {
             parents.emplace(process.pid, process.parentPid);
+            if (monitorPackageProcesses) {
+                livePids.insert(process.pid);
+            }
         }
 
-        DWORD rootPid = 0;
-        std::filesystem::path targetPath;
-        {
-            std::lock_guard<std::mutex> lock(processMonitorMutex_);
-            rootPid = targetPid_;
-            targetPath = targetExePath_;
+        if (monitorPackageProcesses) {
+            for (auto it = packageIdentityCache.begin(); it != packageIdentityCache.end();) {
+                if (livePids.find(it->first) == livePids.end()) {
+                    it = packageIdentityCache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto it = packageIdentityResults.begin();
+                 it != packageIdentityResults.end();) {
+                if (livePids.find(it->first) == livePids.end()) {
+                    it = packageIdentityResults.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto it = loggedPackageCandidates.begin();
+                 it != loggedPackageCandidates.end();) {
+                if (livePids.find(*it) == livePids.end()) {
+                    it = loggedPackageCandidates.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
-        const auto normalizedTargetPath = NormalizePathForComparison(targetPath);
 
         for (const auto& process : processes) {
             if (process.pid == 0 || process.pid == rootPid ||
@@ -1470,11 +2113,59 @@ void AudioBridgeCore::ProcessMonitorThread() {
                 continue;
             }
 
-            bool shouldInject = IsDescendantProcess(process.pid, rootPid, parents);
-            if (!shouldInject) {
-                const auto processPath = QueryProcessImagePath(process.pid);
-                shouldInject = !processPath.empty() &&
-                               NormalizePathForComparison(processPath) == normalizedTargetPath;
+            {
+                std::lock_guard<std::mutex> lock(processMonitorMutex_);
+                const auto attempts = injectionAttempts_.find(process.pid);
+                if (injectedPids_.find(process.pid) != injectedPids_.end() ||
+                    (attempts != injectionAttempts_.end() &&
+                     attempts->second >= kMaxInjectionAttempts)) {
+                    continue;
+                }
+            }
+
+            const bool isDescendant = IsDescendantProcess(process.pid, rootPid, parents);
+            const auto processPath = QueryProcessImagePath(process.pid);
+            const bool matchesTargetPath = !processPath.empty() &&
+                    NormalizePathForComparison(processPath) == normalizedTargetPath;
+            bool shouldInject = isDescendant || matchesTargetPath;
+            bool matchedByPackage = false;
+            bool packageCandidate = false;
+            if (monitorPackageProcesses) {
+                DWORD processSessionId = 0;
+                const bool sameSession =
+                        ProcessIdToSessionId(process.pid, &processSessionId) != FALSE &&
+                        processSessionId == targetSessionId;
+                if (sameSession) {
+                    auto resultIt = packageIdentityResults.find(process.pid);
+                    if (resultIt == packageIdentityResults.end()) {
+                        std::wstring packageFullName;
+                        const auto queryResult = QueryProcessPackageFullName(
+                                process.pid, &packageFullName);
+                        if (queryResult == PackageIdentityQueryResult::Found) {
+                            packageIdentityCache.emplace(process.pid, std::move(packageFullName));
+                        }
+                        resultIt = packageIdentityResults.emplace(process.pid, queryResult).first;
+                    }
+                    const auto packageIt = packageIdentityCache.find(process.pid);
+                    matchedByPackage =
+                            resultIt->second == PackageIdentityQueryResult::Found &&
+                            packageIt != packageIdentityCache.end() &&
+                            _wcsicmp(packageIt->second.c_str(),
+                                     targetPackageFullName.c_str()) == 0;
+                }
+
+                // For a packaged target, every additional related process is
+                // treated only as a candidate. Injection is allowed after the
+                // Windows render-session APIs report that exact PID. This
+                // avoids modifying UI, licensing, defaults, or other helpers
+                // merely because they share a package or process tree.
+                packageCandidate = matchedByPackage || isDescendant || matchesTargetPath;
+                shouldInject = packageCandidate &&
+                        audioSessionPids.find(process.pid) != audioSessionPids.end();
+                if (packageCandidate && loggedPackageCandidates.insert(process.pid).second) {
+                    Log(L"Related package process discovered. pid=%u; waiting for render audio-session evidence.",
+                        process.pid);
+                }
             }
             if (!shouldInject) {
                 continue;
@@ -1482,10 +2173,6 @@ void AudioBridgeCore::ProcessMonitorThread() {
 
             {
                 std::lock_guard<std::mutex> lock(processMonitorMutex_);
-                if (injectedPids_.find(process.pid) != injectedPids_.end() ||
-                    injectionAttempts_[process.pid] >= kMaxInjectionAttempts) {
-                    continue;
-                }
                 ++injectionAttempts_[process.pid];
             }
 
@@ -1495,14 +2182,29 @@ void AudioBridgeCore::ProcessMonitorThread() {
                     std::lock_guard<std::mutex> lock(processMonitorMutex_);
                     injectedPids_.insert(process.pid);
                 }
-                Log(L"Fallback process monitor ensured hook for pid=%u.", process.pid);
+                if (packageCandidate) {
+                    Log(L"Audio-session evidence confirmed related package pid=%u; hook ensured.",
+                        process.pid);
+                } else {
+                    Log(L"Fallback process monitor ensured hook for pid=%u.", process.pid);
+                }
             } else {
-                Log(L"Fallback process monitor could not inject pid=%u: %s",
-                    process.pid,
-                    error.c_str());
+                Log(packageCandidate
+                            ? L"Audio-confirmed package process could not inject pid=%u: %s"
+                            : L"Fallback process monitor could not inject pid=%u: %s",
+                    process.pid, error.c_str());
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+        const auto pollInterval = monitorPackageProcesses && elapsed < std::chrono::seconds(5)
+                                          ? std::chrono::milliseconds(10)
+                                          : std::chrono::milliseconds(200);
+        std::this_thread::sleep_for(pollInterval);
+    }
+
+    audioSessionTracker.reset();
+    if (uninitializeCom) {
+        CoUninitialize();
     }
 }
 
@@ -1537,7 +2239,8 @@ bool AudioBridgeCore::InjectProcessByPid(DWORD pid, std::wstring* outError) {
     }
 
     const auto readyEventName = HookReadyEventName(pid);
-    HANDLE readyEvent = CreateEventW(nullptr, TRUE, FALSE, readyEventName.c_str());
+    IpcSecurityAttributes ipcSecurity;
+    HANDLE readyEvent = CreateEventW(ipcSecurity.Get(), TRUE, FALSE, readyEventName.c_str());
     if (readyEvent == nullptr) {
         if (outError != nullptr) {
             *outError = Win32Message(L"CreateEventW(process monitor)");

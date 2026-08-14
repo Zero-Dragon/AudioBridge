@@ -19,6 +19,7 @@ public sealed partial class MainWindow : Window
     private bool suppressDeviceSelection;
     private bool suppressPidSelection;
     private bool nativeReady;
+    private bool bridgeActive;
 
     public MainWindow()
     {
@@ -178,6 +179,7 @@ public sealed partial class MainWindow : Window
 
         OpenButton.IsEnabled = false;
         StopButton.IsEnabled = true;
+        bridgeActive = true;
         LastErrorText.Text = string.Empty;
         try
         {
@@ -252,6 +254,13 @@ public sealed partial class MainWindow : Window
 
         if (AudioBridgeNative.ABC_GetStatus(out var status) == 0)
         {
+            if (bridgeActive && status.Running == 0)
+            {
+                bridgeActive = false;
+                AudioBridgeNative.ABC_Stop();
+                AppendLog("Target process exited; bridge stopped.");
+                AudioBridgeNative.ABC_GetStatus(out status);
+            }
             UpdateStatus(status);
             RefreshPids(status.LockedAudioPid);
         }
@@ -493,6 +502,7 @@ public sealed partial class MainWindow : Window
         }
 
         AudioBridgeNative.ABC_Stop();
+        bridgeActive = false;
         OpenButton.IsEnabled = true;
         StopButton.IsEnabled = false;
         AppendLog("Bridge stopped.");
@@ -507,6 +517,7 @@ public sealed partial class MainWindow : Window
         }
 
         AudioBridgeNative.ABC_Stop();
+        bridgeActive = false;
         AudioBridgeNative.ABC_Shutdown();
         nativeReady = false;
     }
