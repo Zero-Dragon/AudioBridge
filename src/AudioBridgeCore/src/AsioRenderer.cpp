@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <iterator>
 #include <limits>
 
@@ -157,8 +158,9 @@ std::wstring AnsiToWide(const char* value) {
         return {};
     }
 
-    std::wstring result(static_cast<std::size_t>(required - 1), L'\0');
+    std::wstring result(static_cast<std::size_t>(required), L'\0');
     MultiByteToWideChar(CP_ACP, 0, value, -1, result.data(), required);
+    result.resize(static_cast<std::size_t>(required - 1));
     return result;
 }
 
@@ -199,6 +201,118 @@ std::wstring AsioErrorMessage(IASIO* driver, ASIOError error, const wchar_t* act
         message += driverMessage;
     }
     return message;
+}
+
+bool ReadClockSourcesFromDriver(IASIO* driver,
+                                std::vector<AsioClockSourceInfo>* sources,
+                                std::wstring* outError) {
+    if (driver == nullptr || sources == nullptr) {
+        if (outError != nullptr) {
+            *outError = L"ASIO clock source query received an invalid argument.";
+        }
+        return false;
+    }
+
+    constexpr long kMaximumClockSources = 64;
+    std::array<ASIOClockSource, kMaximumClockSources> asioSources{};
+    long sourceCount = kMaximumClockSources;
+    const ASIOError result = driver->getClockSources(asioSources.data(), &sourceCount);
+    if (!IsAsioSuccess(result)) {
+        if (outError != nullptr) {
+            *outError = AsioErrorMessage(driver, result, L"IASIO::getClockSources");
+        }
+        return false;
+    }
+    if (sourceCount < 0 || sourceCount > kMaximumClockSources) {
+        if (outError != nullptr) {
+            *outError = L"ASIO driver returned an invalid clock source count.";
+        }
+        return false;
+    }
+
+    std::vector<AsioClockSourceInfo> resultSources;
+    resultSources.reserve(static_cast<std::size_t>(sourceCount));
+    for (long position = 0; position < sourceCount; ++position) {
+        const auto& source = asioSources[static_cast<std::size_t>(position)];
+        std::array<char, 33> terminatedName{};
+        std::memcpy(terminatedName.data(), source.name, sizeof(source.name));
+
+        AsioClockSourceInfo info{};
+        info.index = static_cast<std::int32_t>(source.index);
+        info.associatedChannel = static_cast<std::int32_t>(source.associatedChannel);
+        info.associatedGroup = static_cast<std::int32_t>(source.associatedGroup);
+        info.isCurrent = source.isCurrentSource == ASIOTrue;
+        info.name = AnsiToWide(terminatedName.data());
+        if (info.name.empty()) {
+            info.name = L"Clock source " + std::to_wstring(info.index);
+        }
+        resultSources.push_back(std::move(info));
+    }
+
+    *sources = std::move(resultSources);
+    if (outError != nullptr) {
+        outError->clear();
+    }
+    return true;
+}
+
+bool QueryAsioClockSourcesOnThread(const std::wstring& deviceId,
+                                   std::vector<AsioClockSourceInfo>* sources,
+                                   std::wstring* outError) {
+    if (deviceId.empty()) {
+        if (outError != nullptr) {
+            *outError = L"No ASIO output device is selected.";
+        }
+        return false;
+    }
+
+    IASIO* driver = nullptr;
+    bool coInitialized = false;
+    bool succeeded = false;
+    std::wstring error;
+    do {
+        const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
+            error = HResultMessage(initializeResult, L"CoInitializeEx");
+            break;
+        }
+        coInitialized = SUCCEEDED(initializeResult);
+
+        CLSID clsid{};
+        HRESULT result = CLSIDFromString(deviceId.c_str(), &clsid);
+        if (FAILED(result)) {
+            error = L"ASIO device id is not a valid CLSID.";
+            break;
+        }
+
+        result = CoCreateInstance(clsid,
+                                  nullptr,
+                                  CLSCTX_INPROC_SERVER,
+                                  clsid,
+                                  reinterpret_cast<void**>(&driver));
+        if (FAILED(result) || driver == nullptr) {
+            error = HResultMessage(result, L"CoCreateInstance(ASIO driver)");
+            break;
+        }
+        if (driver->init(GetDesktopWindow()) == ASIOFalse) {
+            error = L"IASIO::init failed: " +
+                    AsioErrorMessage(driver, ASE_NotPresent, L"IASIO::init");
+            break;
+        }
+
+        succeeded = ReadClockSourcesFromDriver(driver, sources, &error);
+    } while (false);
+
+    if (driver != nullptr) {
+        driver->Release();
+    }
+    if (coInitialized) {
+        CoUninitialize();
+    }
+    if (!succeeded && outError != nullptr) {
+        *outError = error.empty() ? L"Failed to query ASIO clock sources." : error;
+    }
+    return succeeded;
 }
 
 const wchar_t* AsioSampleTypeName(ASIOSampleType sampleType) {
@@ -353,6 +467,51 @@ void WriteFloat32Sample(std::uint8_t* destination, std::uint32_t frameIndex, flo
 }
 
 }  // namespace
+
+bool QueryAsioClockSources(const std::wstring& deviceId,
+                           std::vector<AsioClockSourceInfo>* sources,
+                           std::wstring* outError) {
+    if (sources == nullptr) {
+        if (outError != nullptr) {
+            *outError = L"ASIO clock source output is null.";
+        }
+        return false;
+    }
+
+    std::vector<AsioClockSourceInfo> queriedSources;
+    std::wstring queryError;
+    bool succeeded = false;
+    try {
+        std::thread queryThread([&] {
+            try {
+                succeeded = QueryAsioClockSourcesOnThread(
+                        deviceId, &queriedSources, &queryError);
+            } catch (const std::exception&) {
+                queryError = L"ASIO clock source query failed with a C++ exception.";
+            } catch (...) {
+                queryError = L"ASIO clock source query failed with an unknown exception.";
+            }
+        });
+        queryThread.join();
+    } catch (const std::exception&) {
+        queryError = L"Failed to start ASIO clock source query thread.";
+    }
+
+    if (!succeeded) {
+        if (outError != nullptr) {
+            *outError = queryError.empty()
+                    ? L"Failed to query ASIO clock sources."
+                    : queryError;
+        }
+        return false;
+    }
+
+    *sources = std::move(queriedSources);
+    if (outError != nullptr) {
+        outError->clear();
+    }
+    return true;
+}
 
 bool RawFrameRingBuffer::Reset(std::uint32_t bytesPerFrame, std::uint32_t capacityFrames) {
     if (bytesPerFrame == 0 || capacityFrames == 0) {
@@ -567,6 +726,7 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
                          std::int32_t prebufferMs,
                          std::int32_t maxBufferOffsetMs,
                          std::uint32_t requestedBufferFrames,
+                         std::int32_t requestedClockSourceIndex,
                          std::wstring* outError) {
     Stop();
     {
@@ -591,6 +751,7 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
         maxBufferFrames_ = 0;
         preferredBufferFrames_ = 0;
         bufferGranularity_ = 0;
+        asioClockSourceIndex_ = -1;
 
         if (bytesPerFrame_ == 0 || sampleRate_ == 0 ||
             sourceChannels_ != 2 || sourceBytesPerSample_ == 0 ||
@@ -616,8 +777,11 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
     }
 
     try {
-        controlThread_ =
-                std::thread(&AsioRenderer::ControlLoop, this, deviceId, requestedBufferFrames);
+        controlThread_ = std::thread(&AsioRenderer::ControlLoop,
+                                     this,
+                                     deviceId,
+                                     requestedBufferFrames,
+                                     requestedClockSourceIndex);
     } catch (const std::exception&) {
         if (outError != nullptr) {
             *outError = L"Failed to start ASIO control thread.";
@@ -689,6 +853,7 @@ void AsioRenderer::Stop() {
     preferredBufferFrames_ = 0;
     bufferGranularity_ = 0;
     asioSampleRate_ = 0;
+    asioClockSourceIndex_ = -1;
     outputKind_ = OutputSampleKind::Unknown;
     outputAsioSampleType_ = ASIOSTLastEntry;
     outputRightShift_ = 0;
@@ -739,6 +904,7 @@ RendererStats AsioRenderer::GetStats() const {
     std::uint32_t preferredBufferFrames = 0;
     long bufferGranularity = 0;
     ASIOSampleType outputSampleType = ASIOSTLastEntry;
+    std::int32_t clockSourceIndex = -1;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         sampleRate = sampleRate_;
@@ -752,6 +918,7 @@ RendererStats AsioRenderer::GetStats() const {
         preferredBufferFrames = preferredBufferFrames_;
         bufferGranularity = bufferGranularity_;
         outputSampleType = outputAsioSampleType_;
+        clockSourceIndex = asioClockSourceIndex_;
     }
 
     stats.streamActive = streamActive_.load(std::memory_order_relaxed);
@@ -784,6 +951,7 @@ RendererStats AsioRenderer::GetStats() const {
     stats.asioLatencyChanges = asioLatencyChanges_.load(std::memory_order_relaxed);
     stats.asioRebuildCount = asioRebuildCount_.load(std::memory_order_relaxed);
     stats.asioLastMessage = asioLastMessage_.load(std::memory_order_relaxed);
+    stats.asioClockSourceIndex = clockSourceIndex;
     return stats;
 }
 
@@ -843,9 +1011,12 @@ long AsioRenderer::OnAsioMessage(long selector, long value, void* /*message*/, d
     }
 }
 
-void AsioRenderer::ControlLoop(std::wstring deviceId, std::uint32_t requestedBufferFrames) {
+void AsioRenderer::ControlLoop(std::wstring deviceId,
+                               std::uint32_t requestedBufferFrames,
+                               std::int32_t requestedClockSourceIndex) {
     std::wstring error;
-    const bool ok = OpenDriverOnControlThread(deviceId, requestedBufferFrames, &error);
+    const bool ok = OpenDriverOnControlThread(
+            deviceId, requestedBufferFrames, requestedClockSourceIndex, &error);
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
         initComplete_ = true;
@@ -929,6 +1100,7 @@ void AsioRenderer::ControlLoop(std::wstring deviceId, std::uint32_t requestedBuf
 
 bool AsioRenderer::OpenDriverOnControlThread(const std::wstring& deviceId,
                                              std::uint32_t requestedBufferFrames,
+                                             std::int32_t requestedClockSourceIndex,
                                              std::wstring* outError) {
     if (deviceId.empty()) {
         if (outError != nullptr) {
@@ -972,6 +1144,73 @@ bool AsioRenderer::OpenDriverOnControlThread(const std::wstring& deviceId,
             *outError = L"IASIO::init failed: " + AsioErrorMessage(asioDriver_, ASE_NotPresent, L"IASIO::init");
         }
         return false;
+    }
+
+    std::vector<AsioClockSourceInfo> clockSources;
+    std::wstring clockSourceError;
+    const bool clockSourcesAvailable =
+            ReadClockSourcesFromDriver(asioDriver_, &clockSources, &clockSourceError);
+    std::int32_t activeClockSourceIndex = -1;
+    if (clockSourcesAvailable) {
+        const auto current = std::find_if(
+                clockSources.begin(), clockSources.end(), [](const AsioClockSourceInfo& source) {
+                    return source.isCurrent;
+                });
+        if (current != clockSources.end()) {
+            activeClockSourceIndex = current->index;
+        }
+    }
+
+    if (requestedClockSourceIndex >= 0) {
+        if (!clockSourcesAvailable) {
+            if (outError != nullptr) {
+                *outError = clockSourceError.empty()
+                        ? L"The ASIO driver did not expose selectable clock sources."
+                        : clockSourceError;
+            }
+            return false;
+        }
+
+        const auto selected = std::find_if(
+                clockSources.begin(),
+                clockSources.end(),
+                [requestedClockSourceIndex](const AsioClockSourceInfo& source) {
+                    return source.index == requestedClockSourceIndex;
+                });
+        if (selected == clockSources.end()) {
+            if (outError != nullptr) {
+                *outError = L"The selected ASIO clock source is no longer available.";
+            }
+            return false;
+        }
+
+        if (!selected->isCurrent) {
+            const ASIOError setClockResult =
+                    asioDriver_->setClockSource(static_cast<long>(requestedClockSourceIndex));
+            if (!IsAsioSuccess(setClockResult)) {
+                if (outError != nullptr) {
+                    *outError = AsioErrorMessage(
+                            asioDriver_, setClockResult, L"IASIO::setClockSource");
+                }
+                return false;
+            }
+        }
+        activeClockSourceIndex = requestedClockSourceIndex;
+
+        std::vector<AsioClockSourceInfo> refreshedSources;
+        if (ReadClockSourcesFromDriver(asioDriver_, &refreshedSources, nullptr)) {
+            const auto refreshedCurrent = std::find_if(
+                    refreshedSources.begin(),
+                    refreshedSources.end(),
+                    [](const AsioClockSourceInfo& source) { return source.isCurrent; });
+            if (refreshedCurrent != refreshedSources.end()) {
+                activeClockSourceIndex = refreshedCurrent->index;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        asioClockSourceIndex_ = activeClockSourceIndex;
     }
 
     ASIOSampleRate currentRate = 0.0;

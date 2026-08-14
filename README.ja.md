@@ -33,7 +33,7 @@ ASIO 出力に対応していないアプリでの利用を想定しています
 
 1. 対象アプリを完全に終了します。
 2. AudioBridge を起動し、Browse で対象アプリの `.exe` を選択します。
-3. ASIO output で DAC の ASIO ドライバーを選択します。
+3. ASIO output で DAC の ASIO ドライバーを選択します。ドライバーに複数のクロックソースがある場合は、ASIO clock source で選択します。
 4. Open をクリックし、対象アプリで音声を再生します。
 5. Audio PIDs に PID が表示され、状態が `Output Active` になることを確認します。
 

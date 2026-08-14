@@ -1028,6 +1028,14 @@ public:
     int32_t GetDefaultDeviceIndex() const;
     int32_t GetDeviceId(int32_t index, wchar_t* buffer, int32_t bufferChars) const;
     int32_t GetDeviceName(int32_t index, wchar_t* buffer, int32_t bufferChars) const;
+    int32_t RefreshClockSources(const wchar_t* outputDeviceId);
+    int32_t GetClockSourceCount() const;
+    int32_t GetClockSourceInfo(int32_t position, ABC_ClockSourceInfo* info) const;
+    int32_t GetClockSourceName(int32_t position,
+                               wchar_t* buffer,
+                               int32_t bufferChars) const;
+    int32_t SetClockSource(std::int32_t clockSourceIndex);
+    int32_t GetClockSource() const;
     int32_t GetPidCount() const;
     int32_t GetPidInfo(int32_t index, ABC_PidInfo* info) const;
     int32_t GetStatus(ABC_Status* status) const;
@@ -1071,6 +1079,9 @@ private:
     std::vector<DeviceInfo> devices_;
     int32_t defaultDeviceIndex_ = -1;
     std::wstring selectedDeviceId_;
+    std::wstring clockSourceDeviceId_;
+    std::vector<AsioClockSourceInfo> clockSources_;
+    std::int32_t clockSourceIndex_ = -1;
     std::int32_t prebufferMs_ = kDefaultPrebufferMs;
     std::int32_t maxBufferOffsetMs_ = kDefaultMaxBufferOffsetMs;
     std::int32_t asioBufferFrames_ = kDefaultAsioBufferFrames;
@@ -1083,6 +1094,7 @@ private:
     std::int32_t rendererPrebufferMs_ = kDefaultPrebufferMs;
     std::int32_t rendererMaxBufferOffsetMs_ = kDefaultMaxBufferOffsetMs;
     std::int32_t rendererAsioBufferFrames_ = kDefaultAsioBufferFrames;
+    std::int32_t rendererClockSourceIndex_ = -1;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> targetExited_{false};
@@ -1181,7 +1193,11 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
 
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        selectedDeviceId_ = outputDeviceId != nullptr ? outputDeviceId : L"";
+        const std::wstring nextDeviceId = outputDeviceId != nullptr ? outputDeviceId : L"";
+        if (selectedDeviceId_ != nextDeviceId) {
+            clockSourceIndex_ = -1;
+        }
+        selectedDeviceId_ = nextDeviceId;
         prebufferMs_ = prebufferMs < 0
                 ? kDefaultPrebufferMs
                 : static_cast<std::int32_t>(
@@ -1196,6 +1212,7 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         rendererPrebufferMs_ = prebufferMs_;
         rendererMaxBufferOffsetMs_ = maxBufferOffsetMs_;
         rendererAsioBufferFrames_ = asioBufferFrames_;
+        rendererClockSourceIndex_ = clockSourceIndex_;
         targetPid_ = 0;
         targetExited_.store(false);
         lockedAudioPid_ = 0;
@@ -1324,6 +1341,7 @@ void AudioBridgeCore::Stop() {
         rendererPrebufferMs_ = prebufferMs_;
         rendererMaxBufferOffsetMs_ = maxBufferOffsetMs_;
         rendererAsioBufferFrames_ = asioBufferFrames_;
+        rendererClockSourceIndex_ = clockSourceIndex_;
     }
 }
 
@@ -1332,7 +1350,11 @@ int32_t AudioBridgeCore::SetOutputDevice(const wchar_t* outputDeviceId) {
     std::uint32_t pid = 0;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        selectedDeviceId_ = outputDeviceId != nullptr ? outputDeviceId : L"";
+        const std::wstring nextDeviceId = outputDeviceId != nullptr ? outputDeviceId : L"";
+        if (selectedDeviceId_ != nextDeviceId) {
+            clockSourceIndex_ = -1;
+        }
+        selectedDeviceId_ = nextDeviceId;
         pid = lockedAudioPid_.load();
         auto it = audioPids_.find(pid);
         if (it != audioPids_.end() && it->second.hasFormat) {
@@ -1472,6 +1494,129 @@ int32_t AudioBridgeCore::GetDeviceName(int32_t index, wchar_t* buffer, int32_t b
     return CopyWideString(devices_[static_cast<std::size_t>(index)].name, buffer, bufferChars);
 }
 
+int32_t AudioBridgeCore::RefreshClockSources(const wchar_t* outputDeviceId) {
+    const std::wstring deviceId = outputDeviceId != nullptr ? outputDeviceId : L"";
+    if (deviceId.empty()) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        clockSourceDeviceId_.clear();
+        clockSources_.clear();
+        SetLastErrorLocked(L"No ASIO output device is selected.");
+        return kInvalidArgument;
+    }
+
+    std::vector<AsioClockSourceInfo> sources;
+    std::wstring error;
+    if (!QueryAsioClockSources(deviceId, &sources, &error)) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        clockSourceDeviceId_ = deviceId;
+        clockSources_.clear();
+        SetLastErrorLocked(error);
+        return kError;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        clockSourceDeviceId_ = deviceId;
+        clockSources_ = std::move(sources);
+        if (clockSourceIndex_ >= 0) {
+            const bool selectionStillExists = std::any_of(
+                    clockSources_.begin(),
+                    clockSources_.end(),
+                    [this](const AsioClockSourceInfo& source) {
+                        return source.index == clockSourceIndex_;
+                    });
+            if (!selectionStillExists) {
+                clockSourceIndex_ = -1;
+            }
+        }
+        SetLastErrorLocked(L"OK");
+    }
+    return kOk;
+}
+
+int32_t AudioBridgeCore::GetClockSourceCount() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return static_cast<int32_t>(clockSources_.size());
+}
+
+int32_t AudioBridgeCore::GetClockSourceInfo(int32_t position,
+                                            ABC_ClockSourceInfo* info) const {
+    if (info == nullptr) {
+        return kInvalidArgument;
+    }
+
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (position < 0 || position >= static_cast<int32_t>(clockSources_.size())) {
+        return kInvalidArgument;
+    }
+    const auto& source = clockSources_[static_cast<std::size_t>(position)];
+    info->index = source.index;
+    info->associatedChannel = source.associatedChannel;
+    info->associatedGroup = source.associatedGroup;
+    info->isCurrent = source.isCurrent ? 1 : 0;
+    return kOk;
+}
+
+int32_t AudioBridgeCore::GetClockSourceName(int32_t position,
+                                            wchar_t* buffer,
+                                            int32_t bufferChars) const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (position < 0 || position >= static_cast<int32_t>(clockSources_.size())) {
+        return kInvalidArgument;
+    }
+    return CopyWideString(
+            clockSources_[static_cast<std::size_t>(position)].name, buffer, bufferChars);
+}
+
+int32_t AudioBridgeCore::SetClockSource(std::int32_t clockSourceIndex) {
+    if (clockSourceIndex < -1) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        SetLastErrorLocked(L"ASIO clock source index must be -1 or a driver-provided index.");
+        return kInvalidArgument;
+    }
+
+    WAVEFORMATEXTENSIBLE format{};
+    std::uint32_t pid = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (clockSourceIndex >= 0) {
+            if (clockSourceDeviceId_ != selectedDeviceId_) {
+                SetLastErrorLocked(L"Refresh clock sources for the selected ASIO device first.");
+                return kInvalidArgument;
+            }
+            const bool sourceExists = std::any_of(
+                    clockSources_.begin(),
+                    clockSources_.end(),
+                    [clockSourceIndex](const AsioClockSourceInfo& source) {
+                        return source.index == clockSourceIndex;
+                    });
+            if (!sourceExists) {
+                SetLastErrorLocked(L"The selected ASIO clock source is not available.");
+                return kInvalidArgument;
+            }
+        }
+
+        clockSourceIndex_ = clockSourceIndex;
+        pid = lockedAudioPid_.load();
+        const auto it = audioPids_.find(pid);
+        if (it != audioPids_.end() && it->second.hasFormat) {
+            format = it->second.format;
+        }
+        SetLastErrorLocked(L"OK");
+    }
+
+    if (pid != 0 && format.Format.nSamplesPerSec != 0) {
+        StartRendererForFormat(pid, format);
+    }
+    Log(L"ASIO clock source request=%d (-1=keep driver current)", clockSourceIndex);
+    return kOk;
+}
+
+int32_t AudioBridgeCore::GetClockSource() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return clockSourceIndex_;
+}
+
 int32_t AudioBridgeCore::GetPidCount() const {
     std::lock_guard<std::mutex> lock(stateMutex_);
     return static_cast<int32_t>(audioPids_.size());
@@ -1530,6 +1675,7 @@ int32_t AudioBridgeCore::GetStatus(ABC_Status* status) const {
     status->asioLatencyChanges = stats.asioLatencyChanges;
     status->asioRebuildCount = stats.asioRebuildCount;
     status->asioLastMessage = stats.asioLastMessage;
+    status->asioClockSourceIndex = stats.asioClockSourceIndex;
     return kOk;
 }
 
@@ -1773,12 +1919,14 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
     std::int32_t prebufferMs = kDefaultPrebufferMs;
     std::int32_t maxBufferOffsetMs = kDefaultMaxBufferOffsetMs;
     std::int32_t asioBufferFrames = kDefaultAsioBufferFrames;
+    std::int32_t clockSourceIndex = -1;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         deviceId = selectedDeviceId_;
         prebufferMs = prebufferMs_;
         maxBufferOffsetMs = maxBufferOffsetMs_;
         asioBufferFrames = asioBufferFrames_;
+        clockSourceIndex = clockSourceIndex_;
         if (renderer_.IsRunning() &&
             rendererHasFormat_ &&
             rendererPid_ == pid &&
@@ -1786,6 +1934,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
             rendererPrebufferMs_ == prebufferMs &&
             rendererMaxBufferOffsetMs_ == maxBufferOffsetMs &&
             rendererAsioBufferFrames_ == asioBufferFrames &&
+            rendererClockSourceIndex_ == clockSourceIndex &&
             WaveFormatsEqual(rendererFormat_, format)) {
             return;
         }
@@ -1798,6 +1947,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
                 prebufferMs,
                 maxBufferOffsetMs,
                 static_cast<std::uint32_t>(asioBufferFrames),
+                clockSourceIndex,
                 &error)) {
         std::lock_guard<std::mutex> lock(stateMutex_);
         rendererHasFormat_ = false;
@@ -1818,6 +1968,7 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
         rendererPrebufferMs_ = prebufferMs;
         rendererMaxBufferOffsetMs_ = maxBufferOffsetMs;
         rendererAsioBufferFrames_ = asioBufferFrames;
+        rendererClockSourceIndex_ = clockSourceIndex;
         SetLastErrorLocked(L"OK");
     }
 
@@ -1830,6 +1981,8 @@ void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
     Log(L"Renderer prebuffer target=%d ms", prebufferMs);
     Log(L"Renderer max buffer offset=%d ms", maxBufferOffsetMs);
     Log(L"Renderer ASIO buffer request=%d frames (0=driver preferred)", asioBufferFrames);
+    Log(L"Renderer ASIO clock source request=%d (-1=keep driver current)",
+        clockSourceIndex);
 }
 
 bool AudioBridgeCore::LaunchAndInjectTarget(const std::filesystem::path& exePath,
@@ -2754,6 +2907,42 @@ ABC_API int32_t ABC_CALL ABC_GetDeviceName(int32_t index, wchar_t* buffer, int32
     return core != nullptr
             ? core->GetDeviceName(index, buffer, bufferChars)
             : audiobridge::CopyStartupError(L"AudioBridgeCore is not initialized.", buffer, bufferChars);
+}
+
+ABC_API int32_t ABC_CALL ABC_RefreshClockSources(const wchar_t* outputDeviceId) {
+    auto* core = audiobridge::Core();
+    return core != nullptr ? core->RefreshClockSources(outputDeviceId) : -1;
+}
+
+ABC_API int32_t ABC_CALL ABC_GetClockSourceCount(void) {
+    auto* core = audiobridge::Core();
+    return core != nullptr ? core->GetClockSourceCount() : 0;
+}
+
+ABC_API int32_t ABC_CALL ABC_GetClockSourceInfo(int32_t position,
+                                                ABC_ClockSourceInfo* info) {
+    auto* core = audiobridge::Core();
+    return core != nullptr ? core->GetClockSourceInfo(position, info) : -1;
+}
+
+ABC_API int32_t ABC_CALL ABC_GetClockSourceName(int32_t position,
+                                                wchar_t* buffer,
+                                                int32_t bufferChars) {
+    auto* core = audiobridge::Core();
+    return core != nullptr
+            ? core->GetClockSourceName(position, buffer, bufferChars)
+            : audiobridge::CopyStartupError(
+                      L"AudioBridgeCore is not initialized.", buffer, bufferChars);
+}
+
+ABC_API int32_t ABC_CALL ABC_SetClockSource(int32_t clockSourceIndex) {
+    auto* core = audiobridge::Core();
+    return core != nullptr ? core->SetClockSource(clockSourceIndex) : -1;
+}
+
+ABC_API int32_t ABC_CALL ABC_GetClockSource(void) {
+    auto* core = audiobridge::Core();
+    return core != nullptr ? core->GetClockSource() : -1;
 }
 
 ABC_API int32_t ABC_CALL ABC_GetPidCount(void) {

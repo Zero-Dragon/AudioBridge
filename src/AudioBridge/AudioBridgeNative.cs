@@ -43,6 +43,16 @@ internal static partial class AudioBridgeNative
         public long AsioLatencyChanges;
         public long AsioRebuildCount;
         public int AsioLastMessage;
+        public int AsioClockSourceIndex;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ClockSourceInfo
+    {
+        public int Index;
+        public int AssociatedChannel;
+        public int AssociatedGroup;
+        public int IsCurrent;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -118,6 +128,27 @@ internal static partial class AudioBridgeNative
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
     internal static extern int ABC_GetDeviceName(int index, StringBuilder buffer, int bufferChars);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+    internal static extern int ABC_RefreshClockSources(string? outputDeviceId);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int ABC_GetClockSourceCount();
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int ABC_GetClockSourceInfo(int position, out ClockSourceInfo info);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+    internal static extern int ABC_GetClockSourceName(
+        int position,
+        StringBuilder buffer,
+        int bufferChars);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int ABC_SetClockSource(int clockSourceIndex);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int ABC_GetClockSource();
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int ABC_GetPidCount();

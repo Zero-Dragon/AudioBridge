@@ -56,6 +56,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
@@ -218,6 +219,18 @@
                       IsChecked="True"
                       VerticalAlignment="Bottom"
                       ToolTipService.ToolTip="Route the target into the bridge without opening the app's real shared output." />
+
+            <ComboBox x:Name="ClockSourceComboBox"
+                      Grid.Row="2"
+                      Grid.Column="0"
+                      Header="ASIO clock source"
+                      HorizontalAlignment="Stretch"
+                      MinWidth="420"
+                      DisplayMemberPath="Name"
+                      IsEnabled="False"
+                      PlaceholderText="Driver clock sources unavailable"
+                      SelectionChanged="ClockSourceComboBox_SelectionChanged"
+                      ToolTipService.ToolTip="Clock sources reported by the selected ASIO driver. Changing the source safely rebuilds the ASIO stream." />
         </Grid>
 
         <Grid Grid.Row="1" ColumnSpacing="16">
@@ -270,6 +283,7 @@
 
                 <Grid Grid.Row="1" ColumnSpacing="20" RowSpacing="10" Margin="0,2,0,0">
                     <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
@@ -339,6 +353,15 @@
                     <TextBlock x:Name="AsioRangeText" Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="3" Text="-" FontWeight="SemiBold" />
                     <TextBlock Grid.Row="5" Grid.Column="4" Text="ASIO Events" Opacity="0.72" />
                     <TextBlock x:Name="AsioEventsText" Grid.Row="5" Grid.Column="5" Text="-" FontWeight="SemiBold" />
+
+                    <TextBlock Grid.Row="6" Text="ASIO Clock" Opacity="0.72" />
+                    <TextBlock x:Name="AsioClockText"
+                               Grid.Row="6"
+                               Grid.Column="1"
+                               Grid.ColumnSpan="5"
+                               Text="-"
+                               TextTrimming="CharacterEllipsis"
+                               FontWeight="SemiBold" />
                 </Grid>
 
                 <TextBlock x:Name="LastErrorText"

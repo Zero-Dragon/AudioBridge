@@ -33,7 +33,7 @@ It is designed for applications without native ASIO output. Fake Output is enabl
 
 1. Fully exit the target application.
 2. Start AudioBridge and click Browse to select the application's `.exe`.
-3. Select the DAC driver under ASIO output.
+3. Select the DAC driver under ASIO output. If the driver exposes multiple clock sources, choose one under ASIO clock source.
 4. Click Open, then start playback in the target application.
 5. Confirm that a PID appears under Audio PIDs and the status reaches `Output Active`.
 

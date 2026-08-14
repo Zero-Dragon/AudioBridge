@@ -10,6 +10,15 @@ internal sealed class AudioDeviceView
     public required string Name { get; init; }
 }
 
+internal sealed class AsioClockSourceView
+{
+    public required int Index { get; init; }
+    public required string Name { get; init; }
+    public required int AssociatedChannel { get; init; }
+    public required int AssociatedGroup { get; init; }
+    public required bool IsCurrent { get; init; }
+}
+
 internal sealed class RecentTargetView
 {
     public required string Path { get; init; }

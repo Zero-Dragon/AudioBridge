@@ -33,7 +33,7 @@ AudioBridge 是一个 Windows 音频辅助工具。它可以从工具内启动�
 
 1. 完全退出目标应用。
 2. 启动 AudioBridge，点击 Browse 选择目标应用的 `.exe`。
-3. 在 ASIO output 中选择 DAC 的 ASIO 驱动。
+3. 在 ASIO output 中选择 DAC 的 ASIO 驱动；驱动提供多个时钟源时，可在 ASIO clock source 中选择。
 4. 点击 Open，再在目标应用中开始播放音频。
 5. 确认 Audio PIDs 中出现 PID，状态变为 `Output Active`。
 

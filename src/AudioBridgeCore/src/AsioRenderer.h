@@ -57,7 +57,20 @@ struct RendererStats {
     std::int64_t asioLatencyChanges = 0;
     std::int64_t asioRebuildCount = 0;
     std::int32_t asioLastMessage = 0;
+    std::int32_t asioClockSourceIndex = -1;
 };
+
+struct AsioClockSourceInfo {
+    std::int32_t index = -1;
+    std::int32_t associatedChannel = -1;
+    std::int32_t associatedGroup = -1;
+    bool isCurrent = false;
+    std::wstring name;
+};
+
+bool QueryAsioClockSources(const std::wstring& deviceId,
+                           std::vector<AsioClockSourceInfo>* sources,
+                           std::wstring* outError);
 
 class RawFrameRingBuffer {
 public:
@@ -131,6 +144,7 @@ public:
                std::int32_t prebufferMs,
                std::int32_t maxBufferOffsetMs,
                std::uint32_t requestedBufferFrames,
+               std::int32_t requestedClockSourceIndex,
                std::wstring* outError);
     void Stop();
     std::uint32_t PushPcm(const std::uint8_t* data,
@@ -162,9 +176,12 @@ private:
         kLatenciesChanged = 1U << 2U,
     };
 
-    void ControlLoop(std::wstring deviceId, std::uint32_t requestedBufferFrames);
+    void ControlLoop(std::wstring deviceId,
+                     std::uint32_t requestedBufferFrames,
+                     std::int32_t requestedClockSourceIndex);
     bool OpenDriverOnControlThread(const std::wstring& deviceId,
                                    std::uint32_t requestedBufferFrames,
+                                   std::int32_t requestedClockSourceIndex,
                                    std::wstring* outError);
     bool CreateBuffersOnControlThread(std::uint32_t requestedBufferFrames,
                                       bool resetRingBuffer,
@@ -238,6 +255,7 @@ private:
     long bufferGranularity_ = 0;
     std::uint32_t sampleRate_ = 0;
     std::uint32_t asioSampleRate_ = 0;
+    std::int32_t asioClockSourceIndex_ = -1;
     std::uint32_t prebufferFrames_ = 0;
     std::int32_t prebufferMs_ = 300;
     std::uint32_t maxBufferOffsetFrames_ = 0;

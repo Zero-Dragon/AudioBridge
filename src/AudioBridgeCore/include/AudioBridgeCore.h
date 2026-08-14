@@ -52,7 +52,15 @@ typedef struct ABC_Status {
     int64_t asioLatencyChanges;
     int64_t asioRebuildCount;
     int32_t asioLastMessage;
+    int32_t asioClockSourceIndex;
 } ABC_Status;
+
+typedef struct ABC_ClockSourceInfo {
+    int32_t index;
+    int32_t associatedChannel;
+    int32_t associatedGroup;
+    int32_t isCurrent;
+} ABC_ClockSourceInfo;
 
 typedef struct ABC_PidInfo {
     uint32_t pid;
@@ -99,6 +107,15 @@ ABC_API int32_t ABC_CALL ABC_GetDeviceCount(void);
 ABC_API int32_t ABC_CALL ABC_GetDefaultDeviceIndex(void);
 ABC_API int32_t ABC_CALL ABC_GetDeviceId(int32_t index, wchar_t* buffer, int32_t bufferChars);
 ABC_API int32_t ABC_CALL ABC_GetDeviceName(int32_t index, wchar_t* buffer, int32_t bufferChars);
+
+ABC_API int32_t ABC_CALL ABC_RefreshClockSources(const wchar_t* outputDeviceId);
+ABC_API int32_t ABC_CALL ABC_GetClockSourceCount(void);
+ABC_API int32_t ABC_CALL ABC_GetClockSourceInfo(int32_t position, ABC_ClockSourceInfo* info);
+ABC_API int32_t ABC_CALL ABC_GetClockSourceName(int32_t position,
+                                               wchar_t* buffer,
+                                               int32_t bufferChars);
+ABC_API int32_t ABC_CALL ABC_SetClockSource(int32_t clockSourceIndex);
+ABC_API int32_t ABC_CALL ABC_GetClockSource(void);
 
 ABC_API int32_t ABC_CALL ABC_GetPidCount(void);
 ABC_API int32_t ABC_CALL ABC_GetPidInfo(int32_t index, ABC_PidInfo* info);
