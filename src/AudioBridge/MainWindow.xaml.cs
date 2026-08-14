@@ -20,7 +20,7 @@ public sealed partial class MainWindow : Window
     private readonly ObservableCollection<RecentTargetView> recentTargets = new();
     private readonly ObservableCollection<AudioPidView> pids = new();
     private readonly DispatcherQueueTimer pollTimer;
-    private readonly StringBuilder logBuffer = new();
+    private readonly SessionLogWriter sessionLog;
     private readonly SemaphoreSlim clockSourceRefreshLock = new(1, 1);
     private AppSettingsState settings = new();
     private bool suppressDeviceSelection;
@@ -34,9 +34,11 @@ public sealed partial class MainWindow : Window
     private int probedCurrentClockSourceIndex = -1;
     private bool clockSourceRefreshInProgress;
     private string clockSourceAvailabilityText = "-";
+    private string lastLoggedPipelineError = "";
 
     public MainWindow()
     {
+        sessionLog = SessionLogWriter.Create();
         InitializeComponent();
         SetWindowIcon();
 
@@ -56,6 +58,9 @@ public sealed partial class MainWindow : Window
         pollTimer.Tick += (_, _) => PollNativeState();
 
         Closed += MainWindow_Closed;
+        AppendLog(sessionLog.FilePath is null
+            ? "Session log is unavailable."
+            : $"Session log: {sessionLog.FilePath}");
         InitializeNative();
     }
 
@@ -710,7 +715,17 @@ public sealed partial class MainWindow : Window
 
         if (status.StreamActive < 0)
         {
-            LastErrorText.Text = AudioBridgeNative.LastError();
+            var pipelineError = AudioBridgeNative.LastError();
+            LastErrorText.Text = pipelineError;
+            if (!string.Equals(lastLoggedPipelineError, pipelineError, StringComparison.Ordinal))
+            {
+                lastLoggedPipelineError = pipelineError;
+                AppendLog($"Pipeline fault: {pipelineError}");
+            }
+        }
+        else
+        {
+            lastLoggedPipelineError = "";
         }
 
         if (status.Running == 0)
@@ -821,14 +836,18 @@ public sealed partial class MainWindow : Window
 
     private void DrainNativeLog()
     {
-        var buffer = new StringBuilder(32768);
-        var result = AudioBridgeNative.ABC_DrainLog(buffer, buffer.Capacity);
-        if (result <= 0)
+        var buffer = new StringBuilder(256 * 1024);
+        for (var batch = 0; batch < 8; batch++)
         {
-            return;
-        }
+            buffer.Clear();
+            var result = AudioBridgeNative.ABC_DrainLog(buffer, buffer.Capacity);
+            if (result <= 0)
+            {
+                break;
+            }
 
-        AppendRawLog(buffer.ToString());
+            AppendRawLog(buffer.ToString());
+        }
     }
 
     private int ReadPrebufferMs()
@@ -1069,15 +1088,7 @@ public sealed partial class MainWindow : Window
 
     private void AppendRawLog(string text)
     {
-        logBuffer.Append(text);
-        const int maxChars = 160_000;
-        if (logBuffer.Length > maxChars)
-        {
-            logBuffer.Remove(0, logBuffer.Length - maxChars);
-        }
-
-        LogBox.Text = logBuffer.ToString();
-        LogBox.SelectionStart = LogBox.Text.Length;
+        sessionLog.Write(text);
     }
 
     private void StopBridge()
@@ -1100,14 +1111,21 @@ public sealed partial class MainWindow : Window
     private void MainWindow_Closed(object sender, WindowEventArgs args)
     {
         pollTimer.Stop();
-        if (!nativeReady)
+        try
         {
-            return;
-        }
+            if (!nativeReady)
+            {
+                return;
+            }
 
-        AudioBridgeNative.ABC_Stop();
-        bridgeActive = false;
-        AudioBridgeNative.ABC_Shutdown();
-        nativeReady = false;
+            AudioBridgeNative.ABC_Stop();
+            bridgeActive = false;
+            AudioBridgeNative.ABC_Shutdown();
+            nativeReady = false;
+        }
+        finally
+        {
+            sessionLog.Dispose();
+        }
     }
 }

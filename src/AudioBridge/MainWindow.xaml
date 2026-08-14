@@ -49,7 +49,6 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
-            <RowDefinition Height="220" />
         </Grid.RowDefinitions>
 
         <Grid Grid.Row="0" ColumnSpacing="12" RowSpacing="10">
@@ -367,21 +366,5 @@
             </Grid>
         </Grid>
 
-        <Grid Grid.Row="2" RowSpacing="8">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
-            </Grid.RowDefinitions>
-            <TextBlock Text="Debug Log" FontSize="16" FontWeight="SemiBold" />
-            <TextBox x:Name="LogBox"
-                     Grid.Row="1"
-                     FontFamily="Consolas"
-                     FontSize="12"
-                     IsReadOnly="True"
-                     AcceptsReturn="True"
-                     TextWrapping="NoWrap"
-                     ScrollViewer.VerticalScrollBarVisibility="Auto"
-                     ScrollViewer.HorizontalScrollBarVisibility="Auto" />
-        </Grid>
     </Grid>
 </Window>

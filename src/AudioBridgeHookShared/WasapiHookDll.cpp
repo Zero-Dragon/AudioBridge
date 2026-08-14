@@ -15,7 +15,9 @@
 #include "AudioBridgeHookProtocol.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -177,6 +179,28 @@ struct FakeAudioSessionControl {
     std::vector<IAudioSessionEvents*> notifications;
 };
 
+enum class FrequentLogEvent : std::size_t {
+    EnumeratorCreated,
+    AudioClientCreated,
+    AudioClientQueried,
+    FakeQueryInterface,
+    FakeInitializeFormat,
+    FakeInitializeAccepted,
+    FakeGetBufferSize,
+    FakeRenderAcquired,
+    FakeRenderReleased,
+    AudioClientReleased,
+    FakeGetMixFormat,
+    FakeGetDevicePeriod,
+    DeviceInvalidated,
+    Count
+};
+
+struct FrequentLogState {
+    ULONGLONG lastEmissionMs = 0;
+    std::uint32_t suppressed = 0;
+};
+
 std::mutex g_logMutex;
 std::mutex g_pipeMutex;
 std::mutex g_stateMutex;
@@ -195,6 +219,8 @@ std::atomic<bool> g_fakeOutput{false};
 std::atomic<std::uint32_t> g_audioClientCount{0};
 std::atomic<std::uint32_t> g_renderClientCount{0};
 std::atomic<std::uint64_t> g_nextStreamId{1};
+std::array<FrequentLogState,
+           static_cast<std::size_t>(FrequentLogEvent::Count)> g_frequentLogStates{};
 thread_local bool g_isBootstrapping = false;
 
 CoCreateInstanceFn g_originalCoCreateInstance = nullptr;
@@ -451,13 +477,7 @@ bool SendPcmMessage(std::uint64_t streamId,
     return ok;
 }
 
-void Log(const char* format, ...) {
-    char message[2048]{};
-    va_list args;
-    va_start(args, format);
-    std::vsnprintf(message, sizeof(message), format, args);
-    va_end(args);
-
+void EmitLogMessage(const char* message) {
     SYSTEMTIME now{};
     GetLocalTime(&now);
 
@@ -474,6 +494,107 @@ void Log(const char* format, ...) {
 
     OutputDebugStringA(line);
     SendPipeMessage(kPipeText, line, std::strlen(line));
+}
+
+const char* FrequentLogEventName(FrequentLogEvent event) {
+    switch (event) {
+    case FrequentLogEvent::EnumeratorCreated:
+        return "MMDeviceEnumerator creation";
+    case FrequentLogEvent::AudioClientCreated:
+        return "IAudioClient creation";
+    case FrequentLogEvent::AudioClientQueried:
+        return "IAudioClient query";
+    case FrequentLogEvent::FakeQueryInterface:
+        return "fake IAudioClient QueryInterface";
+    case FrequentLogEvent::FakeInitializeFormat:
+        return "fake IAudioClient initialization format";
+    case FrequentLogEvent::FakeInitializeAccepted:
+        return "fake IAudioClient initialization acceptance";
+    case FrequentLogEvent::FakeGetBufferSize:
+        return "fake GetBufferSize";
+    case FrequentLogEvent::FakeRenderAcquired:
+        return "fake IAudioRenderClient acquisition";
+    case FrequentLogEvent::FakeRenderReleased:
+        return "fake IAudioRenderClient release";
+    case FrequentLogEvent::AudioClientReleased:
+        return "IAudioClient release";
+    case FrequentLogEvent::FakeGetMixFormat:
+        return "fake GetMixFormat";
+    case FrequentLogEvent::FakeGetDevicePeriod:
+        return "fake GetDevicePeriod";
+    case FrequentLogEvent::DeviceInvalidated:
+        return "AUDCLNT_E_DEVICE_INVALIDATED";
+    default:
+        return "unknown event";
+    }
+}
+
+void EmitFrequentLogMessage(FrequentLogEvent event, const char* message) {
+    constexpr ULONGLONG kMinimumIntervalMs = 1000;
+    const ULONGLONG nowMs = GetTickCount64();
+    std::uint32_t suppressed = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        auto& state = g_frequentLogStates[static_cast<std::size_t>(event)];
+        if (state.lastEmissionMs != 0 &&
+            nowMs - state.lastEmissionMs < kMinimumIntervalMs) {
+            ++state.suppressed;
+            return;
+        }
+        state.lastEmissionMs = nowMs;
+        suppressed = state.suppressed;
+        state.suppressed = 0;
+    }
+
+    if (suppressed > 0) {
+        char summary[512]{};
+        std::snprintf(summary,
+                      sizeof(summary),
+                      "[log] Suppressed %u high-frequency %s message(s) during the previous interval.",
+                      suppressed,
+                      FrequentLogEventName(event));
+        EmitLogMessage(summary);
+    }
+    EmitLogMessage(message);
+}
+
+void Log(const char* format, ...) {
+    char message[2048]{};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    EmitLogMessage(message);
+}
+
+void LogFrequent(FrequentLogEvent event, const char* format, ...) {
+    char message[2048]{};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    EmitFrequentLogMessage(event, message);
+}
+
+void LogDeviceInvalidated(const char* operation,
+                          const void* audioClient,
+                          const AudioClientState& state) {
+    ControlSnapshot control{};
+    const bool hasControl = ReadControlSnapshot(&control) && control.valid;
+    LogFrequent(
+        FrequentLogEvent::DeviceInvalidated,
+        "%s returned AUDCLNT_E_DEVICE_INVALIDATED. audio=%p stream=%llu managed=%s queued=%llu submitted=%llu confirmed=%llu controlValid=%s controlPid=%lu controlStream=%llu rendererState=%ld",
+        operation,
+        audioClient,
+        static_cast<unsigned long long>(state.streamId),
+        state.fakeBridgeManaged ? "yes" : "no",
+        static_cast<unsigned long long>(state.fakeQueuedFrames),
+        static_cast<unsigned long long>(state.successfulSubmittedFrames),
+        static_cast<unsigned long long>(state.confirmedCapturedFrames),
+        hasControl ? "yes" : "no",
+        hasControl ? control.lockedPid : 0,
+        static_cast<unsigned long long>(hasControl ? control.streamId : 0),
+        hasControl ? static_cast<long>(control.rendererState) : -1L);
 }
 
 std::string GuidToString(REFGUID guid) {
@@ -904,13 +1025,23 @@ bool LogWaveFormat(const char* source,
                    DWORD streamFlags,
                    UINT32 periodInFrames,
                    std::uint64_t streamId) {
+    const bool frequentFakeInitialization =
+            source != nullptr && std::strncmp(source, "Fake ", 5) == 0;
     if (format == nullptr) {
-        Log("%s client=%p format=null shareMode=%u flags=0x%08lX periodFrames=%u",
-            source,
-            client,
-            static_cast<unsigned>(shareMode),
-            streamFlags,
-            periodInFrames);
+        char detail[2048]{};
+        std::snprintf(detail,
+                      sizeof(detail),
+                      "%s client=%p format=null shareMode=%u flags=0x%08lX periodFrames=%u",
+                      source,
+                      client,
+                      static_cast<unsigned>(shareMode),
+                      streamFlags,
+                      periodInFrames);
+        if (frequentFakeInitialization) {
+            EmitFrequentLogMessage(FrequentLogEvent::FakeInitializeFormat, detail);
+        } else {
+            EmitLogMessage(detail);
+        }
         return false;
     }
 
@@ -939,7 +1070,11 @@ bool LogWaveFormat(const char* source,
         sampleType = "pcm-int";
     }
 
-    Log("%s client=%p formatTag=0x%04X sampleRate=%u channels=%u bits=%u validBits=%u blockAlign=%u avgBytesPerSec=%u cbSize=%u sampleType=%s channelMask=0x%08lX subFormat=%s shareMode=%u flags=0x%08lX periodFrames=%u",
+    char detail[2048]{};
+    std::snprintf(
+        detail,
+        sizeof(detail),
+        "%s client=%p formatTag=0x%04X sampleRate=%u channels=%u bits=%u validBits=%u blockAlign=%u avgBytesPerSec=%u cbSize=%u sampleType=%s channelMask=0x%08lX subFormat=%s shareMode=%u flags=0x%08lX periodFrames=%u",
         source,
         client,
         format->wFormatTag,
@@ -956,6 +1091,11 @@ bool LogWaveFormat(const char* source,
         static_cast<unsigned>(shareMode),
         streamFlags,
         periodInFrames);
+    if (frequentFakeInitialization) {
+        EmitFrequentLogMessage(FrequentLogEvent::FakeInitializeFormat, detail);
+    } else {
+        EmitLogMessage(detail);
+    }
 
     PipeFormatMessage message{};
     CopyMemory(&message.format,
@@ -1494,7 +1634,9 @@ ULONG STDMETHODCALLTYPE FakeRenderRelease(IAudioRenderClient* self) {
         }
         if (removed) {
             const auto count = g_renderClientCount.fetch_sub(1) - 1;
-            Log("Fake IAudioRenderClient released. active renderClients=%u render=%p audio=%p",
+            LogFrequent(
+                FrequentLogEvent::FakeRenderReleased,
+                "Fake IAudioRenderClient released. active renderClients=%u render=%p audio=%p",
                 count,
                 self,
                 fake->audioClient);
@@ -1546,6 +1688,7 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
         return AUDCLNT_E_NOT_INITIALIZED;
     }
     if (faulted) {
+        LogDeviceInvalidated("Fake output GetBuffer", fake->audioClient, audioState);
         return AUDCLNT_E_DEVICE_INVALIDATED;
     }
     if (frameCount > availableFrames) {
@@ -2102,10 +2245,11 @@ HRESULT STDMETHODCALLTYPE HookActivate(IMMDevice* self,
         auto* client = AudioClientBaseForIid(*interfaceOut, iid);
         if (RegisterAudioClient(client)) {
             const auto count = ++g_audioClientCount;
-            Log("IAudioClient created. iid=%s active clients=%u ptr=%p",
-                GuidToString(iid).c_str(),
-                count,
-                client);
+            LogFrequent(FrequentLogEvent::AudioClientCreated,
+                        "IAudioClient created. iid=%s active clients=%u ptr=%p",
+                        GuidToString(iid).c_str(),
+                        count,
+                        client);
         }
     }
     return hr;
@@ -2114,12 +2258,13 @@ HRESULT STDMETHODCALLTYPE HookActivate(IMMDevice* self,
 HRESULT STDMETHODCALLTYPE HookAudioClientQueryInterface(IUnknown* self, REFIID iid, void** out) {
     const HRESULT hr = g_originalAudioClientQueryInterface(self, iid, out);
     if (!g_isBootstrapping && FakeOutputEnabled()) {
-        Log("Fake output observed IAudioClient::QueryInterface. self=%p iid=%s name=%s hr=0x%08lX out=%p",
-            self,
-            GuidToString(iid).c_str(),
-            KnownIidName(iid),
-            static_cast<unsigned long>(hr),
-            out != nullptr ? *out : nullptr);
+        LogFrequent(FrequentLogEvent::FakeQueryInterface,
+                    "Fake output observed IAudioClient::QueryInterface. self=%p iid=%s name=%s hr=0x%08lX out=%p",
+                    self,
+                    GuidToString(iid).c_str(),
+                    KnownIidName(iid),
+                    static_cast<unsigned long>(hr),
+                    out != nullptr ? *out : nullptr);
     }
     if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && IsAudioClientIid(iid)) {
         PatchAudioClientForIid(*out, iid);
@@ -2127,10 +2272,11 @@ HRESULT STDMETHODCALLTYPE HookAudioClientQueryInterface(IUnknown* self, REFIID i
             auto* client = AudioClientBaseForIid(*out, iid);
             if (RegisterAudioClient(client)) {
                 const auto count = ++g_audioClientCount;
-                Log("IAudioClient queried. iid=%s active clients=%u ptr=%p",
-                    GuidToString(iid).c_str(),
-                    count,
-                    client);
+                LogFrequent(FrequentLogEvent::AudioClientQueried,
+                            "IAudioClient queried. iid=%s active clients=%u ptr=%p",
+                            GuidToString(iid).c_str(),
+                            count,
+                            client);
             }
         }
     }
@@ -2158,6 +2304,7 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
                                 0);
         AudioClientState state = SnapshotAudioClient(self);
         if (state.fakeFaulted) {
+            LogDeviceInvalidated("Fake output IAudioClient::Initialize", self, state);
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
         if (!LogWaveFormat("Fake IAudioClient::Initialize",
@@ -2176,14 +2323,15 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
                 static_cast<unsigned long long>(state.streamId));
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
-        Log("Fake output accepted IAudioClient::Initialize. audio=%p shareMode=%u flags=0x%08lX bufferHns=%lld periodicityHns=%lld fakeBufferFrames=%u fakePeriodFrames=%u",
-            self,
-            static_cast<unsigned>(shareMode),
-            streamFlags,
-            static_cast<long long>(bufferDuration),
-            static_cast<long long>(periodicity),
-            state.fakeBufferFrames,
-            state.fakePeriodFrames);
+        LogFrequent(FrequentLogEvent::FakeInitializeAccepted,
+                    "Fake output accepted IAudioClient::Initialize. audio=%p shareMode=%u flags=0x%08lX bufferHns=%lld periodicityHns=%lld fakeBufferFrames=%u fakePeriodFrames=%u",
+                    self,
+                    static_cast<unsigned>(shareMode),
+                    streamFlags,
+                    static_cast<long long>(bufferDuration),
+                    static_cast<long long>(periodicity),
+                    state.fakeBufferFrames,
+                    state.fakePeriodFrames);
         return S_OK;
     }
 
@@ -2235,6 +2383,10 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                                 periodInFrames);
         AudioClientState state = SnapshotAudioClient(audioClient);
         if (state.fakeFaulted) {
+            LogDeviceInvalidated(
+                "Fake output IAudioClient3::InitializeSharedAudioStream",
+                audioClient,
+                state);
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
         if (!LogWaveFormat("Fake IAudioClient3::InitializeSharedAudioStream",
@@ -2253,12 +2405,13 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                 static_cast<unsigned long long>(state.streamId));
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
-        Log("Fake output accepted IAudioClient3::InitializeSharedAudioStream. audio=%p flags=0x%08lX requestedPeriodFrames=%u fakeBufferFrames=%u fakePeriodFrames=%u",
-            audioClient,
-            streamFlags,
-            periodInFrames,
-            state.fakeBufferFrames,
-            state.fakePeriodFrames);
+        LogFrequent(FrequentLogEvent::FakeInitializeAccepted,
+                    "Fake output accepted IAudioClient3::InitializeSharedAudioStream. audio=%p flags=0x%08lX requestedPeriodFrames=%u fakeBufferFrames=%u fakePeriodFrames=%u",
+                    audioClient,
+                    streamFlags,
+                    periodInFrames,
+                    state.fakeBufferFrames,
+                    state.fakePeriodFrames);
         return S_OK;
     }
 
@@ -2315,11 +2468,12 @@ HRESULT STDMETHODCALLTYPE HookGetService(IAudioClient* self, REFIID iid, void** 
             auto* renderClient = reinterpret_cast<IAudioRenderClient*>(fake);
             if (RegisterRenderClient(renderClient, self)) {
                 const auto count = ++g_renderClientCount;
-                Log("Fake IAudioRenderClient acquired. active renderClients=%u active audioClients=%u render=%p audio=%p",
-                    count,
-                    g_audioClientCount.load(),
-                    renderClient,
-                    self);
+                LogFrequent(FrequentLogEvent::FakeRenderAcquired,
+                            "Fake IAudioRenderClient acquired. active renderClients=%u active audioClients=%u render=%p audio=%p",
+                            count,
+                            g_audioClientCount.load(),
+                            renderClient,
+                            self);
             }
             *service = renderClient;
             return S_OK;
@@ -2423,7 +2577,10 @@ HRESULT STDMETHODCALLTYPE HookGetBufferSize(IAudioClient* self, UINT32* bufferFr
             return AUDCLNT_E_NOT_INITIALIZED;
         }
         *bufferFrames = state.fakeBufferFrames;
-        Log("Fake output GetBufferSize. audio=%p frames=%u", self, *bufferFrames);
+        LogFrequent(FrequentLogEvent::FakeGetBufferSize,
+                    "Fake output GetBufferSize. audio=%p frames=%u",
+                    self,
+                    *bufferFrames);
         return S_OK;
     }
     return g_originalGetBufferSize(self, bufferFrames);
@@ -2454,6 +2611,7 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentPadding(IAudioClient* self, UINT32* padd
         }
         bool initialized = false;
         bool faulted = false;
+        AudioClientState diagnosticState{};
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             const auto audioIt = g_audioClients.find(self);
@@ -2461,6 +2619,7 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentPadding(IAudioClient* self, UINT32* padd
                 auto& state = audioIt->second;
                 AdvanceFakePlaybackLocked(state, QpcNow());
                 faulted = state.fakeFaulted;
+                diagnosticState = state;
                 if (!faulted) {
                     // Managed streams are paced by Core's DAC sample position.
                     // Probe streams retain the legacy QPC-backed queue.
@@ -2474,6 +2633,8 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentPadding(IAudioClient* self, UINT32* padd
             return AUDCLNT_E_NOT_INITIALIZED;
         }
         if (faulted) {
+            LogDeviceInvalidated(
+                "Fake output GetCurrentPadding", self, diagnosticState);
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
         return S_OK;
@@ -2514,12 +2675,13 @@ HRESULT STDMETHODCALLTYPE HookGetMixFormat(IAudioClient* self, WAVEFORMATEX** de
         if (*deviceFormat == nullptr) {
             return E_OUTOFMEMORY;
         }
-        Log("Fake output GetMixFormat. audio=%p rate=%u channels=%u bits=%u tag=0x%04X",
-            self,
-            format.Format.nSamplesPerSec,
-            format.Format.nChannels,
-            format.Format.wBitsPerSample,
-            format.Format.wFormatTag);
+        LogFrequent(FrequentLogEvent::FakeGetMixFormat,
+                    "Fake output GetMixFormat. audio=%p rate=%u channels=%u bits=%u tag=0x%04X",
+                    self,
+                    format.Format.nSamplesPerSec,
+                    format.Format.nChannels,
+                    format.Format.wBitsPerSample,
+                    format.Format.wFormatTag);
         return S_OK;
     }
     return g_originalGetMixFormat(self, deviceFormat);
@@ -2536,10 +2698,11 @@ HRESULT STDMETHODCALLTYPE HookGetDevicePeriod(IAudioClient* self,
         if (minimumPeriod != nullptr) {
             *minimumPeriod = state.fakeMinPeriod;
         }
-        Log("Fake output GetDevicePeriod. audio=%p defaultHns=%lld minHns=%lld",
-            self,
-            static_cast<long long>(state.fakeDefaultPeriod),
-            static_cast<long long>(state.fakeMinPeriod));
+        LogFrequent(FrequentLogEvent::FakeGetDevicePeriod,
+                    "Fake output GetDevicePeriod. audio=%p defaultHns=%lld minHns=%lld",
+                    self,
+                    static_cast<long long>(state.fakeDefaultPeriod),
+                    static_cast<long long>(state.fakeMinPeriod));
         return S_OK;
     }
     return g_originalGetDevicePeriod(self, defaultPeriod, minimumPeriod);
@@ -2547,6 +2710,8 @@ HRESULT STDMETHODCALLTYPE HookGetDevicePeriod(IAudioClient* self,
 
 HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
     if (!g_isBootstrapping && FakeOutputEnabled()) {
+        bool invalidated = false;
+        AudioClientState diagnosticState{};
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
@@ -2556,9 +2721,9 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
             }
             AdvanceFakePlaybackLocked(state, QpcNow());
             if (state.fakeFaulted) {
-                return AUDCLNT_E_DEVICE_INVALIDATED;
-            }
-            if (!state.fakeStarted) {
+                invalidated = true;
+                diagnosticState = state;
+            } else if (!state.fakeStarted) {
                 const LONGLONG nowQpc = QpcNow();
                 state.fakeStarted = true;
                 state.fakeLastUpdateQpc = nowQpc;
@@ -2568,6 +2733,10 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
                     SetEvent(state.fakeEvent);
                 }
             }
+        }
+        if (invalidated) {
+            LogDeviceInvalidated("Fake output Start", self, diagnosticState);
+            return AUDCLNT_E_DEVICE_INVALIDATED;
         }
         Log("Fake output Start. audio=%p", self);
         return S_OK;
@@ -2755,7 +2924,10 @@ ULONG STDMETHODCALLTYPE HookAudioClientRelease(IAudioClient* self) {
         }
         if (removed) {
             const auto count = g_audioClientCount.fetch_sub(1) - 1;
-            Log("IAudioClient released. active clients=%u ptr=%p", count, self);
+            LogFrequent(FrequentLogEvent::AudioClientReleased,
+                        "IAudioClient released. active clients=%u ptr=%p",
+                        count,
+                        self);
         }
     }
     return refs;
@@ -2850,9 +3022,10 @@ HRESULT WINAPI HookCoCreateInstance(REFCLSID clsid,
         if (iid == __uuidof(IMMDeviceEnumerator) || iid == __uuidof(IUnknown)) {
             auto* enumerator = static_cast<IMMDeviceEnumerator*>(*out);
             PatchEnumerator(enumerator);
-            Log("MMDeviceEnumerator created and patched. iid=%s ptr=%p",
-                GuidToString(iid).c_str(),
-                enumerator);
+            LogFrequent(FrequentLogEvent::EnumeratorCreated,
+                        "MMDeviceEnumerator created and patched. iid=%s ptr=%p",
+                        GuidToString(iid).c_str(),
+                        enumerator);
         }
     }
     return hr;

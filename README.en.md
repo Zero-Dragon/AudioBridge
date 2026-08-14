@@ -42,6 +42,7 @@ It is designed for applications without native ASIO output. Fake Output is enabl
 - Do not use the same device for the Windows default audio output and ASIO output.
 - Under Browse, select the main `.exe` that produces audio, not a launcher or updater.
 - AudioBridge captures audio PIDs at application startup. Fully exit the target application, then open it through AudioBridge.
+- Runtime logs are named by launch time and normally saved in the `logs` folder beside the application, with a local-app-data fallback when that folder is not writable. Each file is limited to about 4 MiB and retains the latest content.
 - If there is no sound: when no Audio PID appears, exit every process belonging to the target application and reopen it through AudioBridge. When a PID is present, check the ASIO driver, sample rate, and any error or underrun shown in the app.
 
 ## Limitations

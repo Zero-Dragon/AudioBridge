@@ -59,6 +59,8 @@ constexpr int32_t kMinimumMaxBufferAdvanceMs = 50;
 constexpr int32_t kDefaultAsioBufferFrames = 0;
 constexpr std::size_t kMaxTrackedAudioStreamsPerPid = 32;
 constexpr std::uint64_t kActiveStreamHandoffGraceMs = 250;
+constexpr std::size_t kMaxPendingLogChars = 1024U * 1024U;
+constexpr std::size_t kRetainedPendingLogChars = 768U * 1024U;
 #if defined(_WIN64)
 constexpr REGSAM kAsioRegistryView = KEY_WOW64_64KEY;
 #else
@@ -1048,7 +1050,11 @@ public:
 
 private:
     void SetLastErrorLocked(const std::wstring& error);
+    void AppendLogTextLocked(const std::wstring& text);
     void Log(const wchar_t* format, ...);
+    void LogDetectedStream(std::uint32_t pid,
+                           std::uint64_t streamId,
+                           const WAVEFORMATEX& format);
     void InitializeControlState();
     void WriteControlState(std::uint32_t audioPid, bool finish);
     void PublishRendererRoute(std::uint64_t streamId,
@@ -1136,6 +1142,8 @@ private:
     std::mutex rendererRoutingMutex_;
     std::mutex controlStateMutex_;
     std::atomic<bool> pipelineFaulted_{false};
+    std::atomic<std::uint64_t> detectedStreamLogMs_{0};
+    std::atomic<std::uint32_t> suppressedDetectedStreamLogs_{0};
     std::uint64_t publishedStreamId_ = 0;
     std::uint64_t publishedConsumedBaseline_ = 0;
     std::uint64_t publishedConsumedOffset_ = 0;
@@ -1242,6 +1250,8 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         targetExited_.store(false);
         lockedAudioPid_ = 0;
         pipelineFaulted_.store(false, std::memory_order_release);
+        detectedStreamLogMs_.store(0, std::memory_order_release);
+        suppressedDetectedStreamLogs_.store(0, std::memory_order_release);
         publishedStreamId_ = 0;
         publishedConsumedBaseline_ = 0;
         publishedConsumedOffset_ = 0;
@@ -1778,9 +1788,12 @@ int32_t AudioBridgeCore::DrainLog(wchar_t* buffer, int32_t bufferChars) {
         return kInvalidArgument;
     }
     std::lock_guard<std::mutex> lock(stateMutex_);
-    const int32_t copied = CopyWideString(logBuffer_, buffer, bufferChars);
-    logBuffer_.clear();
-    return copied;
+    const auto copied = (std::min)(
+            static_cast<std::size_t>(bufferChars - 1), logBuffer_.size());
+    std::wmemcpy(buffer, logBuffer_.data(), copied);
+    buffer[copied] = L'\0';
+    logBuffer_.erase(0, copied);
+    return static_cast<int32_t>(copied);
 }
 
 int32_t AudioBridgeCore::GetLastError(wchar_t* buffer, int32_t bufferChars) const {
@@ -1790,6 +1803,20 @@ int32_t AudioBridgeCore::GetLastError(wchar_t* buffer, int32_t bufferChars) cons
 
 void AudioBridgeCore::SetLastErrorLocked(const std::wstring& error) {
     lastError_ = error.empty() ? L"OK" : error;
+}
+
+void AudioBridgeCore::AppendLogTextLocked(const std::wstring& text) {
+    logBuffer_ += text;
+    if (logBuffer_.size() <= kMaxPendingLogChars) {
+        return;
+    }
+
+    const auto minimumErase = logBuffer_.size() - kRetainedPendingLogChars;
+    const auto lineEnd = logBuffer_.find(L'\n', minimumErase);
+    logBuffer_.erase(0, lineEnd == std::wstring::npos ? minimumErase : lineEnd + 1U);
+    logBuffer_.insert(
+            0,
+            L"[log] Native log backlog was trimmed; latest events retained.\r\n");
 }
 
 void AudioBridgeCore::Log(const wchar_t* format, ...) {
@@ -1812,11 +1839,38 @@ void AudioBridgeCore::Log(const wchar_t* format, ...) {
                   message);
 
     std::lock_guard<std::mutex> lock(stateMutex_);
-    logBuffer_ += line;
-    constexpr std::size_t kMaxLogChars = 256U * 1024U;
-    if (logBuffer_.size() > kMaxLogChars) {
-        logBuffer_.erase(0, logBuffer_.size() - kMaxLogChars);
+    AppendLogTextLocked(line);
+}
+
+void AudioBridgeCore::LogDetectedStream(std::uint32_t pid,
+                                        std::uint64_t streamId,
+                                        const WAVEFORMATEX& format) {
+    constexpr std::uint64_t kMinimumIntervalMs = 1000;
+    const auto nowMs = NowMs();
+    auto lastMs = detectedStreamLogMs_.load(std::memory_order_acquire);
+    for (;;) {
+        if (lastMs != 0 && nowMs - lastMs < kMinimumIntervalMs) {
+            suppressedDetectedStreamLogs_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (detectedStreamLogMs_.compare_exchange_weak(
+                    lastMs, nowMs, std::memory_order_acq_rel)) {
+            break;
+        }
     }
+
+    const auto suppressed =
+            suppressedDetectedStreamLogs_.exchange(0, std::memory_order_acq_rel);
+    if (suppressed > 0) {
+        Log(L"[log] Suppressed %u high-frequency detected-stream message(s) during the previous interval.",
+            suppressed);
+    }
+    Log(L"Detected audio stream pid=%u stream=%llu rate=%u channels=%u bits=%u",
+        pid,
+        static_cast<unsigned long long>(streamId),
+        format.nSamplesPerSec,
+        format.nChannels,
+        format.wBitsPerSample);
 }
 
 void AudioBridgeCore::InitializeControlState() {
@@ -1958,7 +2012,7 @@ void AudioBridgeCore::LatchPipelineFaultLocked(const std::wstring& error) {
         std::lock_guard<std::mutex> lock(stateMutex_);
         rendererHasFormat_ = false;
         SetLastErrorLocked(message);
-        logBuffer_ += L"[fault] " + message + L"\r\n";
+        AppendLogTextLocked(L"[fault] " + message + L"\r\n");
     }
 }
 
@@ -2069,7 +2123,7 @@ void AudioBridgeCore::HandlePipeMessage(DWORD type,
     if (type == hook_protocol::kPipeText) {
         const auto text = Utf8ToWide(reinterpret_cast<const char*>(payload.data()), payload.size());
         std::lock_guard<std::mutex> lock(stateMutex_);
-        logBuffer_ += text;
+        AppendLogTextLocked(text);
         return;
     }
     if (type == hook_protocol::kPipeFormat) {
@@ -2157,12 +2211,7 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
             pid,
             static_cast<unsigned long long>(message->streamId));
     } else {
-        Log(L"Detected audio stream pid=%u stream=%llu rate=%u channels=%u bits=%u",
-            pid,
-            static_cast<unsigned long long>(message->streamId),
-            format.nSamplesPerSec,
-            format.nChannels,
-            format.wBitsPerSample);
+        LogDetectedStream(pid, message->streamId, format);
     }
 
     if (shouldStartRenderer) {
@@ -2440,7 +2489,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         if (!WaitForCapturedDrainLocked(&drainError)) {
             std::lock_guard<std::mutex> lock(stateMutex_);
             SetLastErrorLocked(drainError);
-            logBuffer_ += L"[renderer] " + drainError + L"\r\n";
+            AppendLogTextLocked(L"[renderer] " + drainError + L"\r\n");
             return false;
         }
     }
@@ -2474,7 +2523,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         rendererDeviceId_.clear();
         rendererFormat_ = {};
         SetLastErrorLocked(error);
-        logBuffer_ += L"[renderer] " + error + L"\r\n";
+        AppendLogTextLocked(L"[renderer] " + error + L"\r\n");
         return false;
     }
     if (!error.empty()) {

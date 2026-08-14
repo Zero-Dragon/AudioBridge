@@ -1,6 +1,5 @@
 using Microsoft.UI.Xaml;
-using System;
-using System.IO;
+using AudioBridge.Services;
 
 namespace AudioBridge;
 
@@ -33,13 +32,6 @@ public partial class App : Application
 
     private static void WriteStartupCrashLog(Exception ex)
     {
-        try
-        {
-            var path = Path.Combine(AppContext.BaseDirectory, "AudioBridge.startup.log");
-            File.AppendAllText(path, $"[{DateTime.Now:O}]\r\n{ex}\r\n\r\n");
-        }
-        catch
-        {
-        }
+        SessionLogWriter.WriteCrashLog(ex);
     }
 }

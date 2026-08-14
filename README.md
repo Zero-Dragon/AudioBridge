@@ -42,6 +42,7 @@ AudioBridge 是一个 Windows 音频辅助工具。它可以从工具内启动�
 - Windows 默认音频输出与 ASIO output 不要使用同一台设备；
 - Browse 请选择实际播放音频的主程序 `.exe`，不要选择 launcher 或 updater；
 - AudioBridge 需要在应用启动时捕获音频 PID，请先完全退出目标应用，再通过 AudioBridge 打开；
+- 运行日志按启动时间保存在程序目录的 `logs` 文件夹中（目录不可写时回退到本地应用数据目录）；单个文件最大约 4 MiB，超出后保留最新内容；
 - 如果没有声音：没有 Audio PID 时，请退出目标应用的所有进程并重新打开；已经有 PID 时，请检查 ASIO 驱动、采样率和界面中的错误或 underrun 信息。
 
 ## 使用限制
