@@ -28,13 +28,60 @@
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
-            <TextBox x:Name="ExePathBox"
-                     Grid.Row="0"
-                     Grid.Column="0"
-                     Header="Target exe"
-                     MinWidth="420"
-                     PlaceholderText="Select target exe"
-                     VerticalAlignment="Center" />
+            <ComboBox x:Name="ExePathBox"
+                      Grid.Row="0"
+                      Grid.Column="0"
+                      Header="Target exe"
+                      MinWidth="420"
+                      PlaceholderText="Select target exe"
+                      IsEditable="True"
+                      IsTextSearchEnabled="False"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Center"
+                      DropDownOpened="ExePathBox_DropDownOpened"
+                      SelectionChanged="ExePathBox_SelectionChanged">
+                <ComboBox.Resources>
+                    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedUnfocused" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPressed" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemRevealBackgroundSelected" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemRevealBackgroundSelectedUnfocused" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemRevealBackgroundSelectedPressed" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemRevealBackgroundSelectedPointerOver" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemSelectedBackgroundThemeBrush" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemSelectedPointerOverBackgroundThemeBrush" Color="Transparent" />
+                    <SolidColorBrush x:Key="ComboBoxItemPillFillBrush" Color="Transparent" />
+                </ComboBox.Resources>
+                <ComboBox.ItemContainerStyle>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </Style>
+                </ComboBox.ItemContainerStyle>
+                <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="local:RecentTargetView">
+                        <Grid MinWidth="520" ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{x:Bind Path}"
+                                       VerticalAlignment="Center"
+                                       TextTrimming="CharacterEllipsis" />
+                            <Button Grid.Column="1"
+                                    Padding="8,4"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    Tag="{x:Bind Path}"
+                                    Click="RemoveRecentTargetButton_Click"
+                                    ToolTipService.ToolTip="Remove from recent targets"
+                                    AutomationProperties.Name="Remove recent target">
+                                <FontIcon Glyph="&#xE711;" FontSize="12" />
+                            </Button>
+                        </Grid>
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
             <Button x:Name="BrowseButton"
                     Grid.Row="0"
                     Grid.Column="1"
@@ -107,7 +154,8 @@
                        SmallChange="64"
                        LargeChange="512"
                        Value="0"
-                       SpinButtonPlacementMode="Inline" />
+                       SpinButtonPlacementMode="Inline"
+                       ValueChanged="AsioBufferBox_ValueChanged" />
 
             <CheckBox x:Name="FakeOutputCheckBox"
                       Grid.Row="1"

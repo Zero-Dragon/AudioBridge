@@ -5,6 +5,7 @@ using AudioBridge.Services;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 using Windows.Storage.Pickers;
 using WinRT.Interop;
 
@@ -13,10 +14,14 @@ namespace AudioBridge;
 public sealed partial class MainWindow : Window
 {
     private readonly ObservableCollection<AudioDeviceView> devices = new();
+    private readonly ObservableCollection<RecentTargetView> recentTargets = new();
     private readonly ObservableCollection<AudioPidView> pids = new();
     private readonly DispatcherQueueTimer pollTimer;
     private readonly StringBuilder logBuffer = new();
+    private AppSettingsState settings = new();
     private bool suppressDeviceSelection;
+    private bool suppressSettingsPersistence = true;
+    private bool suppressTargetSelection;
     private bool suppressPidSelection;
     private bool nativeReady;
     private bool bridgeActive;
@@ -27,14 +32,14 @@ public sealed partial class MainWindow : Window
         SetWindowIcon();
 
         DeviceComboBox.ItemsSource = devices;
+        ExePathBox.ItemsSource = recentTargets;
+        ExePathBox.RegisterPropertyChangedCallback(
+            ComboBox.TextProperty,
+            ExePathBox_TextPropertyChanged);
         PidListView.ItemsSource = pids;
         ExtendsContentIntoTitleBar = false;
 
-        var lastStartedExePath = AppSettingsService.LoadLastStartedExePath();
-        if (!string.IsNullOrWhiteSpace(lastStartedExePath))
-        {
-            ExePathBox.Text = lastStartedExePath;
-        }
+        LoadSettingsIntoControls();
 
         pollTimer = DispatcherQueue.CreateTimer();
         pollTimer.Interval = TimeSpan.FromMilliseconds(200);
@@ -120,9 +125,35 @@ public sealed partial class MainWindow : Window
             });
         }
 
+        var savedDeviceIndex = -1;
+        if (!string.IsNullOrWhiteSpace(settings.SelectedAsioDeviceId))
+        {
+            for (var i = 0; i < devices.Count; i++)
+            {
+                if (string.Equals(devices[i].Id, settings.SelectedAsioDeviceId,
+                                  StringComparison.OrdinalIgnoreCase))
+                {
+                    savedDeviceIndex = i;
+                    break;
+                }
+            }
+        }
+
+        var fallbackIndex = defaultIndex >= 0 && defaultIndex < devices.Count
+            ? defaultIndex
+            : devices.Count > 0 ? 0 : -1;
+        var selectedIndex = savedDeviceIndex >= 0 ? savedDeviceIndex : fallbackIndex;
+
         suppressDeviceSelection = true;
-        DeviceComboBox.SelectedIndex = defaultIndex >= 0 && defaultIndex < devices.Count ? defaultIndex : 0;
+        suppressSettingsPersistence = true;
+        DeviceComboBox.SelectedIndex = selectedIndex;
+        AsioBufferBox.Value = savedDeviceIndex >= 0 ? settings.AsioBufferFrames : 0;
+        suppressSettingsPersistence = false;
         suppressDeviceSelection = false;
+
+        settings.SelectedAsioDeviceId = selectedIndex >= 0 ? devices[selectedIndex].Id : null;
+        settings.AsioBufferFrames = ReadAsioBufferFrames();
+        PersistSettings("Could not remember the selected ASIO output");
     }
 
     private async void BrowseButton_Click(object sender, RoutedEventArgs e)
@@ -139,8 +170,111 @@ public sealed partial class MainWindow : Window
         var file = await picker.PickSingleFileAsync();
         if (file != null)
         {
+            suppressTargetSelection = true;
+            ExePathBox.SelectedItem = null;
             ExePathBox.Text = file.Path;
+            suppressTargetSelection = false;
         }
+    }
+
+    private void ExePathBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (suppressTargetSelection)
+        {
+            return;
+        }
+
+        if (ExePathBox.SelectedItem is RecentTargetView target)
+        {
+            suppressTargetSelection = true;
+            ExePathBox.Text = target.Path;
+            suppressTargetSelection = false;
+            ClearTargetHistoryTextSelection();
+        }
+    }
+
+    private void ExePathBox_DropDownOpened(object sender, object e)
+    {
+        var currentText = ExePathBox.Text;
+        suppressTargetSelection = true;
+        ExePathBox.SelectedItem = null;
+        ExePathBox.Text = currentText;
+        suppressTargetSelection = false;
+        ClearTargetHistoryTextSelection();
+    }
+
+    private void ClearTargetHistoryTextSelection()
+    {
+        DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+        {
+            var editableTextBox = FindDescendant<TextBox>(ExePathBox);
+            editableTextBox?.Select(editableTextBox.Text.Length, 0);
+        });
+    }
+
+    private void ExePathBox_TextPropertyChanged(DependencyObject sender, DependencyProperty property)
+    {
+        if (suppressTargetSelection ||
+            sender is not ComboBox comboBox ||
+            comboBox.SelectedItem is not RecentTargetView selectedTarget)
+        {
+            return;
+        }
+
+        var editedText = comboBox.Text;
+        if (PathsEqual(editedText, selectedTarget.Path))
+        {
+            return;
+        }
+
+        suppressTargetSelection = true;
+        comboBox.SelectedItem = null;
+        comboBox.Text = editedText;
+        suppressTargetSelection = false;
+    }
+
+    private void RemoveRecentTargetButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string path })
+        {
+            return;
+        }
+
+        var target = recentTargets.FirstOrDefault(item => PathsEqual(item.Path, path));
+        if (target is null)
+        {
+            return;
+        }
+
+        var currentText = ExePathBox.Text.Trim();
+        var removedCurrentTarget = PathsEqual(currentText, target.Path);
+        RecentTargetView? replacementTarget = null;
+        suppressTargetSelection = true;
+        if (ReferenceEquals(ExePathBox.SelectedItem, target))
+        {
+            ExePathBox.SelectedItem = null;
+        }
+        recentTargets.Remove(target);
+
+        if (removedCurrentTarget)
+        {
+            replacementTarget = recentTargets.FirstOrDefault();
+            ExePathBox.SelectedItem = replacementTarget;
+            ExePathBox.Text = replacementTarget?.Path ?? string.Empty;
+        }
+        else
+        {
+            ExePathBox.Text = currentText;
+        }
+        suppressTargetSelection = false;
+
+        if (replacementTarget is not null)
+        {
+            ClearTargetHistoryTextSelection();
+        }
+
+        SyncRecentTargetsToSettings();
+        PersistSettings("Could not remove the recent target");
     }
 
     private void OpenButton_Click(object sender, RoutedEventArgs e)
@@ -181,14 +315,11 @@ public sealed partial class MainWindow : Window
         StopButton.IsEnabled = true;
         bridgeActive = true;
         LastErrorText.Text = string.Empty;
-        try
-        {
-            AppSettingsService.SaveLastStartedExePath(exePath);
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"Could not remember the target path: {ex.Message}");
-        }
+        RememberSuccessfulTarget(exePath);
+        settings.SelectedAsioDeviceId = (DeviceComboBox.SelectedItem as AudioDeviceView)?.Id;
+        settings.PrebufferMs = prebufferMs;
+        settings.AsioBufferFrames = asioBufferFrames;
+        PersistSettings("Could not remember the current settings");
         AppendLog($"Opened target: {exePath} (Fake Output {(fakeOutput ? "on" : "off")})");
     }
 
@@ -205,6 +336,13 @@ public sealed partial class MainWindow : Window
         }
 
         var deviceId = (DeviceComboBox.SelectedItem as AudioDeviceView)?.Id;
+        suppressSettingsPersistence = true;
+        AsioBufferBox.Value = 0;
+        suppressSettingsPersistence = false;
+        settings.SelectedAsioDeviceId = deviceId;
+        settings.AsioBufferFrames = 0;
+        PersistSettings("Could not remember the selected ASIO output");
+
         var result = AudioBridgeNative.ABC_SetOutputDevice(deviceId);
         if (result != 0)
         {
@@ -224,6 +362,24 @@ public sealed partial class MainWindow : Window
         {
             AppendLog($"Prebuffer update failed: {AudioBridgeNative.LastError()}");
         }
+
+        if (!suppressSettingsPersistence)
+        {
+            settings.PrebufferMs = ReadPrebufferMs();
+            PersistSettings("Could not remember the prebuffer setting");
+        }
+    }
+
+    private void AsioBufferBox_ValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (suppressSettingsPersistence || double.IsNaN(args.NewValue))
+        {
+            return;
+        }
+
+        settings.SelectedAsioDeviceId = (DeviceComboBox.SelectedItem as AudioDeviceView)?.Id;
+        settings.AsioBufferFrames = ReadAsioBufferFrames();
+        PersistSettings("Could not remember the ASIO buffer setting");
     }
 
     private void PidListView_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -432,6 +588,131 @@ public sealed partial class MainWindow : Window
         }
 
         return (int)Math.Clamp(Math.Round(AsioBufferBox.Value), 0, 8192);
+    }
+
+    private void LoadSettingsIntoControls()
+    {
+        settings = AppSettingsService.Load();
+        if (!string.IsNullOrWhiteSpace(AppSettingsService.LastLoadError))
+        {
+            AppendLog($"Could not load settings: {AppSettingsService.LastLoadError}");
+        }
+        suppressSettingsPersistence = true;
+        PrebufferBox.Value = settings.PrebufferMs;
+        AsioBufferBox.Value = settings.AsioBufferFrames;
+
+        recentTargets.Clear();
+        foreach (var target in settings.RecentTargets
+                     .OrderByDescending(target => target.LastOpenedUtc)
+                     .Take(AppSettingsService.MaxRecentTargets))
+        {
+            recentTargets.Add(new RecentTargetView
+            {
+                Path = target.Path,
+                LastOpenedUtc = target.LastOpenedUtc,
+            });
+        }
+
+        var mostRecentTarget = recentTargets.FirstOrDefault();
+        suppressTargetSelection = true;
+        ExePathBox.SelectedItem = mostRecentTarget;
+        ExePathBox.Text = mostRecentTarget?.Path ?? string.Empty;
+        suppressTargetSelection = false;
+        suppressSettingsPersistence = false;
+
+        if (mostRecentTarget is not null)
+        {
+            ClearTargetHistoryTextSelection();
+        }
+    }
+
+    private void RememberSuccessfulTarget(string exePath)
+    {
+        var fullPath = Path.GetFullPath(exePath);
+        var existing = recentTargets.FirstOrDefault(target => PathsEqual(target.Path, fullPath));
+        if (existing is not null)
+        {
+            recentTargets.Remove(existing);
+        }
+
+        var latest = new RecentTargetView
+        {
+            Path = fullPath,
+            LastOpenedUtc = DateTimeOffset.UtcNow,
+        };
+        recentTargets.Insert(0, latest);
+        while (recentTargets.Count > AppSettingsService.MaxRecentTargets)
+        {
+            recentTargets.RemoveAt(recentTargets.Count - 1);
+        }
+
+        suppressTargetSelection = true;
+        ExePathBox.SelectedItem = latest;
+        ExePathBox.Text = latest.Path;
+        suppressTargetSelection = false;
+        ClearTargetHistoryTextSelection();
+        SyncRecentTargetsToSettings();
+    }
+
+    private void SyncRecentTargetsToSettings()
+    {
+        settings.RecentTargets = recentTargets.Select(target => new RecentTargetSetting
+        {
+            Path = target.Path,
+            LastOpenedUtc = target.LastOpenedUtc,
+        }).ToList();
+    }
+
+    private void PersistSettings(string errorContext)
+    {
+        if (suppressSettingsPersistence)
+        {
+            return;
+        }
+
+        try
+        {
+            AppSettingsService.Save(settings);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"{errorContext}: {ex.Message}");
+        }
+    }
+
+    private static bool PathsEqual(string left, string right)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right),
+                                 StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return string.Equals(left.Trim(), right.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private static T? FindDescendant<T>(DependencyObject parent)
+        where T : DependencyObject
+    {
+        var childCount = VisualTreeHelper.GetChildrenCount(parent);
+        for (var i = 0; i < childCount; i++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, i);
+            if (child is T match)
+            {
+                return match;
+            }
+
+            var descendant = FindDescendant<T>(child);
+            if (descendant is not null)
+            {
+                return descendant;
+            }
+        }
+
+        return null;
     }
 
     private static string SampleFormatName(byte sampleFormat)

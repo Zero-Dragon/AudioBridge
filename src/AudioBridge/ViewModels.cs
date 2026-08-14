@@ -10,6 +10,17 @@ internal sealed class AudioDeviceView
     public required string Name { get; init; }
 }
 
+internal sealed class RecentTargetView
+{
+    public required string Path { get; init; }
+    public required DateTimeOffset LastOpenedUtc { get; init; }
+
+    public override string ToString()
+    {
+        return Path;
+    }
+}
+
 internal sealed class AudioPidView : INotifyPropertyChanged
 {
     private string format = string.Empty;
