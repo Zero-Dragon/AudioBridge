@@ -920,7 +920,8 @@ void AsioRenderer::Stop() {
     callbackIdleCv_.notify_all();
     callbackActive_.clear(std::memory_order_release);
     streamActive_.store(false, std::memory_order_release);
-    prebuffering_.store(false, std::memory_order_release);
+    SetPrebuffering(
+            false, PrebufferTransitionReason::Stop, ringBuffer_.AvailableReadFrames());
     ringBuffer_.Clear();
     callbackBuffer_.clear();
     bufferFrames_ = 0;
@@ -983,6 +984,9 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
                 ? ringBuffer_.PushCapturedSilence(frameCount)
                 : ringBuffer_.Push(data, frameCount);
         totalFramesQueued_.fetch_add(written, std::memory_order_relaxed);
+        if (silence) {
+            totalPlayerSilentFrames_.fetch_add(written, std::memory_order_relaxed);
+        }
         if (written < frameCount) {
             totalFramesDropped_.fetch_add(frameCount - written, std::memory_order_relaxed);
         }
@@ -1048,7 +1052,10 @@ RendererStats AsioRenderer::GetStats() const {
 
     stats.streamActive = streamActive_.load(std::memory_order_relaxed);
     stats.prebuffering = prebuffering_.load(std::memory_order_relaxed);
+    stats.sourceSampleRate = sampleRate;
     stats.totalFramesQueued = totalFramesQueued_.load(std::memory_order_relaxed);
+    stats.totalPlayerSilentFrames =
+            totalPlayerSilentFrames_.load(std::memory_order_relaxed);
     stats.totalFramesPlayed = totalFramesPlayed_.load(std::memory_order_relaxed);
     stats.totalFramesDropped = totalFramesDropped_.load(std::memory_order_relaxed);
     stats.totalOutputFrames = totalOutputFrames_.load(std::memory_order_relaxed);
@@ -1063,6 +1070,14 @@ RendererStats AsioRenderer::GetStats() const {
     stats.recentOutputFrames = recent.outputFrames;
     stats.recentSilentFrames = recent.silentFrames;
     stats.recentSilentPercent = recent.silentPercent;
+    stats.prebufferEnterCount =
+            prebufferEnterCount_.load(std::memory_order_acquire);
+    stats.prebufferExitCount =
+            prebufferExitCount_.load(std::memory_order_acquire);
+    stats.lastPrebufferTransition =
+            lastPrebufferTransition_.load(std::memory_order_relaxed);
+    stats.lastPrebufferTransitionFrames =
+            lastPrebufferTransitionFrames_.load(std::memory_order_relaxed);
     stats.asioRequestedBufferFrames = static_cast<std::int32_t>(requestedBufferFrames);
     stats.asioActualBufferFrames = static_cast<std::int32_t>(actualBufferFrames);
     stats.asioMinBufferFrames = static_cast<std::int32_t>(minBufferFrames);
@@ -1100,13 +1115,17 @@ std::int64_t AsioRenderer::PendingCapturedFrames() const {
 
 void AsioRenderer::BeginCapturedDrain() {
     capturedDrainActive_.store(true, std::memory_order_release);
-    prebuffering_.store(false, std::memory_order_release);
+    SetPrebuffering(false,
+                    PrebufferTransitionReason::DrainBegin,
+                    ringBuffer_.AvailableReadFrames());
 }
 
 void AsioRenderer::EndCapturedDrain() {
     if (running_.load(std::memory_order_acquire) &&
         streamActive_.load(std::memory_order_acquire) && prebufferFrames_ > 0) {
-        prebuffering_.store(true, std::memory_order_release);
+        SetPrebuffering(true,
+                        PrebufferTransitionReason::DrainEnd,
+                        ringBuffer_.AvailableReadFrames());
     }
     capturedDrainActive_.store(false, std::memory_order_release);
 }
@@ -1154,7 +1173,9 @@ void AsioRenderer::OnAsioBufferSwitch(long doubleBufferIndex,
     if (callbackActive_.test_and_set(std::memory_order_acquire)) {
         if (callbackThreadId_.load(std::memory_order_acquire) == GetCurrentThreadId()) {
             running_.store(false, std::memory_order_release);
-            prebuffering_.store(false, std::memory_order_release);
+            SetPrebuffering(false,
+                            PrebufferTransitionReason::Fault,
+                            ringBuffer_.AvailableReadFrames());
             faultRequested_.store(true, std::memory_order_release);
             deferredReentryFault_.store(true, std::memory_order_release);
         } else {
@@ -1353,7 +1374,8 @@ void AsioRenderer::ControlLoop(std::wstring deviceId,
         }
     }
     running_.store(false, std::memory_order_release);
-    prebuffering_.store(false, std::memory_order_release);
+    SetPrebuffering(
+            false, PrebufferTransitionReason::Stop, ringBuffer_.AvailableReadFrames());
     if (driverQuiesced) {
         RollbackOutputPages();
         CloseDriverOnControlThread();
@@ -1682,7 +1704,9 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
     running_.store(true, std::memory_order_release);
     streamActive_.store(false, std::memory_order_release);
     capturedDrainActive_.store(false, std::memory_order_release);
-    prebuffering_.store(prebufferFrames_ > 0, std::memory_order_release);
+    SetPrebuffering(prebufferFrames_ > 0,
+                    PrebufferTransitionReason::InitialFill,
+                    ringBuffer_.AvailableReadFrames());
     return true;
 }
 
@@ -1877,6 +1901,25 @@ void AsioRenderer::ResetDacClock() {
     dacClockSequence_.fetch_add(1, std::memory_order_release);
 }
 
+void AsioRenderer::SetPrebuffering(bool enabled,
+                                   PrebufferTransitionReason reason,
+                                   std::uint32_t availableFrames) {
+    const bool previous = prebuffering_.exchange(enabled, std::memory_order_acq_rel);
+    if (previous == enabled) {
+        return;
+    }
+
+    lastPrebufferTransition_.store(
+            static_cast<std::int32_t>(reason), std::memory_order_relaxed);
+    lastPrebufferTransitionFrames_.store(
+            availableFrames, std::memory_order_relaxed);
+    if (enabled) {
+        prebufferEnterCount_.fetch_add(1, std::memory_order_release);
+    } else {
+        prebufferExitCount_.fetch_add(1, std::memory_order_release);
+    }
+}
+
 bool AsioRenderer::LatchFault(const std::wstring& message, bool fromOutputCallback) {
     if (faulted_.load(std::memory_order_acquire)) {
         return false;
@@ -1889,7 +1932,9 @@ bool AsioRenderer::LatchFault(const std::wstring& message, bool fromOutputCallba
     // past the gate is allowed to finish so the published counters include its
     // last definitely consumed page.
     running_.store(false, std::memory_order_release);
-    prebuffering_.store(false, std::memory_order_release);
+    SetPrebuffering(false,
+                    PrebufferTransitionReason::Fault,
+                    ringBuffer_.AvailableReadFrames());
 
     if (!fromOutputCallback) {
         std::unique_lock<std::mutex> callbackLock(callbackWaitMutex_);
@@ -1931,7 +1976,8 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
             const std::uint32_t triggerFrames =
                     prebufferFrames_ - maxBufferAdvanceFrames_;
             if (availableFrames < triggerFrames) {
-                prebuffering_.store(true, std::memory_order_release);
+                SetPrebuffering(
+                        true, PrebufferTransitionReason::LowWater, availableFrames);
                 prebuffering = true;
             }
         }
@@ -1942,7 +1988,8 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
             if (availableFrames < startThreshold) {
                 holdForPrebuffer = true;
             } else {
-                prebuffering_.store(false, std::memory_order_release);
+                SetPrebuffering(
+                        false, PrebufferTransitionReason::Refilled, availableFrames);
             }
         }
     }
@@ -2109,11 +2156,18 @@ void AsioRenderer::ResetStats() {
     faultRequested_.store(false, std::memory_order_release);
     faultStopRequested_.store(false, std::memory_order_release);
     totalFramesQueued_.store(0, std::memory_order_relaxed);
+    totalPlayerSilentFrames_.store(0, std::memory_order_relaxed);
     totalFramesPlayed_.store(0, std::memory_order_relaxed);
     totalFramesDropped_.store(0, std::memory_order_relaxed);
     totalOutputFrames_.store(0, std::memory_order_relaxed);
     totalSilentFrames_.store(0, std::memory_order_relaxed);
     underrunCount_.store(0, std::memory_order_relaxed);
+    prebufferEnterCount_.store(0, std::memory_order_relaxed);
+    prebufferExitCount_.store(0, std::memory_order_relaxed);
+    lastPrebufferTransition_.store(
+            static_cast<std::int32_t>(PrebufferTransitionReason::None),
+            std::memory_order_relaxed);
+    lastPrebufferTransitionFrames_.store(0, std::memory_order_relaxed);
     asioResetRequests_.store(0, std::memory_order_relaxed);
     asioBufferSizeChanges_.store(0, std::memory_order_relaxed);
     asioLatencyChanges_.store(0, std::memory_order_relaxed);

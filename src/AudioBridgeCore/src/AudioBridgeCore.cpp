@@ -73,6 +73,35 @@ using hook_protocol::PipeMessageHeader;
 using hook_protocol::PipePcmMessage;
 using hook_protocol::RendererState;
 
+const wchar_t* PrebufferTransitionName(std::int32_t value) {
+    switch (static_cast<PrebufferTransitionReason>(value)) {
+    case PrebufferTransitionReason::InitialFill:
+        return L"initial-fill";
+    case PrebufferTransitionReason::LowWater:
+        return L"low-water";
+    case PrebufferTransitionReason::Refilled:
+        return L"refilled";
+    case PrebufferTransitionReason::DrainBegin:
+        return L"drain-begin";
+    case PrebufferTransitionReason::DrainEnd:
+        return L"drain-end";
+    case PrebufferTransitionReason::Stop:
+        return L"stop";
+    case PrebufferTransitionReason::Fault:
+        return L"fault";
+    default:
+        return L"none";
+    }
+}
+
+std::int64_t FramesToMilliseconds(std::int64_t frames, std::uint32_t sampleRate) {
+    if (frames <= 0 || sampleRate == 0) {
+        return 0;
+    }
+    return (frames / sampleRate) * 1000 +
+            ((frames % sampleRate) * 1000) / sampleRate;
+}
+
 struct DeviceInfo {
     std::wstring id;
     std::wstring name;
@@ -1064,6 +1093,7 @@ private:
                               RendererState state);
     void PublishRendererCounters();
     void FeedbackThread();
+    void LogRendererDiagnostics(std::uint64_t nowMs);
     void LatchPipelineFaultLocked(const std::wstring& error);
     bool WaitForCapturedDrainLocked(std::wstring* outError);
     bool StartPipeServer(std::wstring* outError);
@@ -1149,6 +1179,10 @@ private:
     std::uint64_t publishedConsumedOffset_ = 0;
     LONG publishedStreamGeneration_ = 0;
     bool rendererFaultResetAuthorized_ = false;
+    std::uint64_t rendererDiagnosticLastMs_ = 0;
+    bool rendererDiagnosticBaselineValid_ = false;
+    RendererStats rendererDiagnosticStats_{};
+    DacClockSnapshot rendererDiagnosticDac_{};
     AsioRenderer renderer_;
 };
 
@@ -1252,6 +1286,10 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         pipelineFaulted_.store(false, std::memory_order_release);
         detectedStreamLogMs_.store(0, std::memory_order_release);
         suppressedDetectedStreamLogs_.store(0, std::memory_order_release);
+        rendererDiagnosticLastMs_ = 0;
+        rendererDiagnosticBaselineValid_ = false;
+        rendererDiagnosticStats_ = {};
+        rendererDiagnosticDac_ = {};
         publishedStreamId_ = 0;
         publishedConsumedBaseline_ = 0;
         publishedConsumedOffset_ = 0;
@@ -1977,9 +2015,138 @@ void AudioBridgeCore::PublishRendererCounters() {
     InterlockedIncrement(&control_->counterSequence);
 }
 
+void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
+    const RendererStats stats = renderer_.GetStats();
+    const DacClockSnapshot dac = renderer_.GetDacClockSnapshot();
+    if (!renderer_.IsRunning()) {
+        rendererDiagnosticBaselineValid_ = false;
+        rendererDiagnosticLastMs_ = nowMs;
+        return;
+    }
+
+    std::uint32_t pid = 0;
+    std::uint64_t streamId = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        pid = rendererPid_;
+        const auto pidIt = audioPids_.find(pid);
+        if (pidIt != audioPids_.end()) {
+            streamId = pidIt->second.activeStreamId;
+        }
+    }
+
+    const bool countersRestarted = rendererDiagnosticBaselineValid_ &&
+            (stats.totalFramesQueued < rendererDiagnosticStats_.totalFramesQueued ||
+             stats.totalPlayerSilentFrames <
+                     rendererDiagnosticStats_.totalPlayerSilentFrames ||
+             stats.totalFramesPlayed < rendererDiagnosticStats_.totalFramesPlayed ||
+             stats.totalOutputFrames < rendererDiagnosticStats_.totalOutputFrames ||
+             stats.totalSilentFrames < rendererDiagnosticStats_.totalSilentFrames ||
+             stats.prebufferEnterCount <
+                     rendererDiagnosticStats_.prebufferEnterCount ||
+             stats.prebufferExitCount <
+                     rendererDiagnosticStats_.prebufferExitCount);
+    if (!rendererDiagnosticBaselineValid_ || countersRestarted) {
+        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u active=%s prebuffer=%s fill=%d/%d ms capacity=%d ms queued=%lld playerSilent=%lld confirmed=%lld output=%lld localSilent=%lld dac=%llu prebufferEnters=%llu exits=%llu lastTransition=%s lastTransitionFill=%lld ms underruns=%lld dropped=%lld",
+            pid,
+            static_cast<unsigned long long>(streamId),
+            stats.sourceSampleRate,
+            stats.streamActive ? L"yes" : L"no",
+            stats.prebuffering ? L"yes" : L"no",
+            stats.bufferedMs,
+            stats.prebufferTargetMs,
+            stats.bufferCapacityMs,
+            static_cast<long long>(stats.totalFramesQueued),
+            static_cast<long long>(stats.totalPlayerSilentFrames),
+            static_cast<long long>(stats.totalFramesPlayed),
+            static_cast<long long>(stats.totalOutputFrames),
+            static_cast<long long>(stats.totalSilentFrames),
+            static_cast<unsigned long long>(dac.positionFrames),
+            static_cast<unsigned long long>(stats.prebufferEnterCount),
+            static_cast<unsigned long long>(stats.prebufferExitCount),
+            PrebufferTransitionName(stats.lastPrebufferTransition),
+            static_cast<long long>(FramesToMilliseconds(
+                    stats.lastPrebufferTransitionFrames,
+                    stats.sourceSampleRate)),
+            static_cast<long long>(stats.underrunCount),
+            static_cast<long long>(stats.totalFramesDropped));
+    } else {
+        const auto delta = [](std::int64_t current, std::int64_t previous) {
+            return (std::max<std::int64_t>)(current - previous, 0);
+        };
+        const std::int64_t inputFrames =
+                delta(stats.totalFramesQueued,
+                      rendererDiagnosticStats_.totalFramesQueued);
+        const std::int64_t playerSilentFrames =
+                delta(stats.totalPlayerSilentFrames,
+                      rendererDiagnosticStats_.totalPlayerSilentFrames);
+        const std::int64_t confirmedFrames =
+                delta(stats.totalFramesPlayed,
+                      rendererDiagnosticStats_.totalFramesPlayed);
+        const std::int64_t outputFrames =
+                delta(stats.totalOutputFrames,
+                      rendererDiagnosticStats_.totalOutputFrames);
+        const std::int64_t localSilentFrames =
+                delta(stats.totalSilentFrames,
+                      rendererDiagnosticStats_.totalSilentFrames);
+        const std::int64_t underruns =
+                delta(stats.underrunCount,
+                      rendererDiagnosticStats_.underrunCount);
+        const std::int64_t dropped =
+                delta(stats.totalFramesDropped,
+                      rendererDiagnosticStats_.totalFramesDropped);
+        const std::uint64_t dacFrames = dac.valid && rendererDiagnosticDac_.valid &&
+                        dac.positionFrames >= rendererDiagnosticDac_.positionFrames
+                ? dac.positionFrames - rendererDiagnosticDac_.positionFrames
+                : 0;
+        const std::uint64_t prebufferEnters =
+                stats.prebufferEnterCount -
+                rendererDiagnosticStats_.prebufferEnterCount;
+        const std::uint64_t prebufferExits =
+                stats.prebufferExitCount -
+                rendererDiagnosticStats_.prebufferExitCount;
+        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld confirmed=%lld output=%lld localSilent=%lld dac=%llu queueDelta=%lld inputMinusOutput=%lld fill=%d/%d ms prebuffer=%s transitions=+%llu/-%llu lastTransition=%s lastTransitionFill=%lld ms underruns=+%lld dropped=+%lld",
+            static_cast<unsigned long long>(nowMs - rendererDiagnosticLastMs_),
+            pid,
+            static_cast<unsigned long long>(streamId),
+            stats.sourceSampleRate,
+            static_cast<long long>(inputFrames),
+            static_cast<long long>((std::max<std::int64_t>)(
+                    inputFrames - playerSilentFrames, 0)),
+            static_cast<long long>(playerSilentFrames),
+            static_cast<long long>(confirmedFrames),
+            static_cast<long long>(outputFrames),
+            static_cast<long long>(localSilentFrames),
+            static_cast<unsigned long long>(dacFrames),
+            static_cast<long long>(inputFrames - confirmedFrames),
+            static_cast<long long>(inputFrames - outputFrames),
+            stats.bufferedMs,
+            stats.prebufferTargetMs,
+            stats.prebuffering ? L"yes" : L"no",
+            static_cast<unsigned long long>(prebufferEnters),
+            static_cast<unsigned long long>(prebufferExits),
+            PrebufferTransitionName(stats.lastPrebufferTransition),
+            static_cast<long long>(FramesToMilliseconds(
+                    stats.lastPrebufferTransitionFrames,
+                    stats.sourceSampleRate)),
+            static_cast<long long>(underruns),
+            static_cast<long long>(dropped));
+    }
+
+    rendererDiagnosticStats_ = stats;
+    rendererDiagnosticDac_ = dac;
+    rendererDiagnosticLastMs_ = nowMs;
+    rendererDiagnosticBaselineValid_ = true;
+}
+
 void AudioBridgeCore::FeedbackThread() {
     while (running_.load(std::memory_order_acquire)) {
         PublishRendererCounters();
+        const auto nowMs = NowMs();
+        if (rendererDiagnosticLastMs_ == 0 ||
+            nowMs - rendererDiagnosticLastMs_ >= 1000) {
+            LogRendererDiagnostics(nowMs);
+        }
         if (renderer_.HasFault() &&
             !pipelineFaulted_.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
@@ -2431,6 +2598,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     std::int32_t clockSourceIndex = -1;
     std::uint64_t streamId = 0;
     std::uint64_t submittedFrames = 0;
+    std::uint32_t previousSampleRate = 0;
     bool configurationMatches = false;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -2439,6 +2607,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         maxBufferAdvanceMs = maxBufferAdvanceMs_;
         asioBufferFrames = asioBufferFrames_;
         clockSourceIndex = clockSourceIndex_;
+        previousSampleRate = rendererFormat_.Format.nSamplesPerSec;
         auto pidIt = audioPids_.find(pid);
         if (pidIt != audioPids_.end()) {
             streamId = PreferredAudioStreamId(pidIt->second);
@@ -2468,13 +2637,32 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         return true;
     }
 
+    const auto handoffStartedMs = NowMs();
+    const bool rendererWasRunning = renderer_.IsRunning();
+    const std::uint64_t previousStreamId = publishedStreamId_;
+    const RendererStats handoffStartStats = renderer_.GetStats();
+    const std::int64_t pendingAtHandoff = renderer_.PendingCapturedFrames();
+    Log(L"Renderer handoff begin. oldStream=%llu newStream=%llu oldRate=%u newRate=%u running=%s sameConfiguration=%s pending=%lld frames (%lld ms) fill=%d/%d ms prebuffer=%s submittedOffset=%llu",
+        static_cast<unsigned long long>(previousStreamId),
+        static_cast<unsigned long long>(streamId),
+        previousSampleRate,
+        format.Format.nSamplesPerSec,
+        rendererWasRunning ? L"yes" : L"no",
+        configurationMatches ? L"yes" : L"no",
+        static_cast<long long>(pendingAtHandoff),
+        static_cast<long long>(FramesToMilliseconds(
+                pendingAtHandoff, handoffStartStats.sourceSampleRate)),
+        handoffStartStats.bufferedMs,
+        handoffStartStats.prebufferTargetMs,
+        handoffStartStats.prebuffering ? L"yes" : L"no",
+        static_cast<unsigned long long>(submittedFrames));
+
     // Publish the selected stream before draining the previous renderer. A new
     // WASAPI client has not established a managed-clock baseline yet; if the
     // old route remains Running while its retained PCM drains, that client
     // falls back to synthetic QPC progress and can fill the synchronous pipe.
     // Reconfiguring freezes both the previous managed stream and the selected
     // stream until the old PCM is retired and a new DAC generation is ready.
-    const bool rendererWasRunning = renderer_.IsRunning();
     publishedStreamId_ = streamId;
     publishedConsumedBaseline_ = renderer_.ConfirmedCapturedFrames();
     publishedConsumedOffset_ = submittedFrames;
@@ -2485,13 +2673,42 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                          RendererState::Reconfiguring);
 
     if (rendererWasRunning) {
+        const auto drainStartedMs = NowMs();
         std::wstring drainError;
         if (!WaitForCapturedDrainLocked(&drainError)) {
+            const auto drainFailedStats = renderer_.GetStats();
+            Log(L"Renderer drain failed. oldStream=%llu newStream=%llu elapsed=%llu ms pendingStart=%lld pendingEnd=%lld fill=%d ms error=%s",
+                static_cast<unsigned long long>(previousStreamId),
+                static_cast<unsigned long long>(streamId),
+                static_cast<unsigned long long>(NowMs() - drainStartedMs),
+                static_cast<long long>(pendingAtHandoff),
+                static_cast<long long>(renderer_.PendingCapturedFrames()),
+                drainFailedStats.bufferedMs,
+                drainError.c_str());
             std::lock_guard<std::mutex> lock(stateMutex_);
             SetLastErrorLocked(drainError);
             AppendLogTextLocked(L"[renderer] " + drainError + L"\r\n");
             return false;
         }
+        const RendererStats drainEndStats = renderer_.GetStats();
+        Log(L"Renderer drain complete. oldStream=%llu newStream=%llu elapsed=%llu ms pendingStart=%lld pendingEnd=%lld confirmedDelta=%lld outputDelta=%lld localSilentDelta=%lld prebufferTransitions=+%llu/-%llu",
+            static_cast<unsigned long long>(previousStreamId),
+            static_cast<unsigned long long>(streamId),
+            static_cast<unsigned long long>(NowMs() - drainStartedMs),
+            static_cast<long long>(pendingAtHandoff),
+            static_cast<long long>(renderer_.PendingCapturedFrames()),
+            static_cast<long long>(drainEndStats.totalFramesPlayed -
+                                   handoffStartStats.totalFramesPlayed),
+            static_cast<long long>(drainEndStats.totalOutputFrames -
+                                   handoffStartStats.totalOutputFrames),
+            static_cast<long long>(drainEndStats.totalSilentFrames -
+                                   handoffStartStats.totalSilentFrames),
+            static_cast<unsigned long long>(
+                    drainEndStats.prebufferEnterCount -
+                    handoffStartStats.prebufferEnterCount),
+            static_cast<unsigned long long>(
+                    drainEndStats.prebufferExitCount -
+                    handoffStartStats.prebufferExitCount));
     }
 
     const auto confirmedBeforeReconfigure = renderer_.ConfirmedCapturedFrames();
@@ -2499,11 +2716,20 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     publishedConsumedOffset_ = submittedFrames;
 
     if (configurationMatches) {
+        // The route baseline is derived from the renderer's current confirmed
+        // position. Publish that counter before exposing the matching Running
+        // route; otherwise the hook can observe a new baseline paired with the
+        // previous feedback tick and incorrectly invalidate the endpoint.
+        PublishRendererCounters();
         PublishRendererRoute(streamId,
                              format.Format.nSamplesPerSec,
                              publishedConsumedBaseline_,
                              publishedConsumedOffset_,
                              RendererState::Running);
+        Log(L"Renderer route handoff complete without ASIO restart. stream=%llu rate=%u elapsed=%llu ms",
+            static_cast<unsigned long long>(streamId),
+            format.Format.nSamplesPerSec,
+            static_cast<unsigned long long>(NowMs() - handoffStartedMs));
         return true;
     }
 
@@ -2516,6 +2742,11 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                 static_cast<std::uint32_t>(asioBufferFrames),
                 clockSourceIndex,
                 &error)) {
+        Log(L"Renderer ASIO restart failed. stream=%llu rate=%u elapsed=%llu ms error=%s",
+            static_cast<unsigned long long>(streamId),
+            format.Format.nSamplesPerSec,
+            static_cast<unsigned long long>(NowMs() - handoffStartedMs),
+            error.c_str());
         rendererFaultResetAuthorized_ = false;
         std::lock_guard<std::mutex> lock(stateMutex_);
         rendererHasFormat_ = false;
@@ -2565,6 +2796,12 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     Log(L"Renderer ASIO clock source request=%d (-1=keep driver current)",
         clockSourceIndex);
     Log(L"Source sample rate is passed to ASIO without sample-rate conversion.");
+    Log(L"Renderer handoff complete. stream=%llu rate=%u elapsed=%llu ms prebuffer=%d ms maxAdvance=%d ms",
+        static_cast<unsigned long long>(streamId),
+        format.Format.nSamplesPerSec,
+        static_cast<unsigned long long>(NowMs() - handoffStartedMs),
+        prebufferMs,
+        maxBufferAdvanceMs);
     return true;
 }
 

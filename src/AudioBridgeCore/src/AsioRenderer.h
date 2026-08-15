@@ -26,10 +26,23 @@
 
 namespace audiobridge {
 
+enum class PrebufferTransitionReason : std::int32_t {
+    None = 0,
+    InitialFill = 1,
+    LowWater = 2,
+    Refilled = 3,
+    DrainBegin = 4,
+    DrainEnd = 5,
+    Stop = 6,
+    Fault = 7,
+};
+
 struct RendererStats {
     bool streamActive = false;
     bool prebuffering = false;
+    std::uint32_t sourceSampleRate = 0;
     std::int64_t totalFramesQueued = 0;
+    std::int64_t totalPlayerSilentFrames = 0;
     std::int64_t totalFramesPlayed = 0;
     std::int64_t totalFramesDropped = 0;
     std::int64_t totalOutputFrames = 0;
@@ -44,6 +57,10 @@ struct RendererStats {
     std::int64_t recentOutputFrames = 0;
     std::int64_t recentSilentFrames = 0;
     double recentSilentPercent = 0.0;
+    std::uint64_t prebufferEnterCount = 0;
+    std::uint64_t prebufferExitCount = 0;
+    std::int32_t lastPrebufferTransition = 0;
+    std::int64_t lastPrebufferTransitionFrames = 0;
     std::int32_t asioRequestedBufferFrames = 0;
     std::int32_t asioActualBufferFrames = 0;
     std::int32_t asioMinBufferFrames = 0;
@@ -219,6 +236,9 @@ private:
     void FillOutputBufferWithSilence(long doubleBufferIndex);
     bool PublishDacClock(const ASIOTime* timeInfo, std::int64_t callbackQpc);
     void ResetDacClock();
+    void SetPrebuffering(bool enabled,
+                         PrebufferTransitionReason reason,
+                         std::uint32_t availableFrames);
     void WriteConvertedOutput(const std::uint8_t* interleaved,
                               std::uint32_t frameCount,
                               long doubleBufferIndex);
@@ -298,11 +318,16 @@ private:
     std::uint64_t normalizedDacPosition_ = 0;
 
     std::atomic<std::int64_t> totalFramesQueued_{0};
+    std::atomic<std::int64_t> totalPlayerSilentFrames_{0};
     std::atomic<std::int64_t> totalFramesPlayed_{0};
     std::atomic<std::int64_t> totalFramesDropped_{0};
     std::atomic<std::int64_t> totalOutputFrames_{0};
     std::atomic<std::int64_t> totalSilentFrames_{0};
     std::atomic<std::int64_t> underrunCount_{0};
+    std::atomic<std::uint64_t> prebufferEnterCount_{0};
+    std::atomic<std::uint64_t> prebufferExitCount_{0};
+    std::atomic<std::int32_t> lastPrebufferTransition_{0};
+    std::atomic<std::int64_t> lastPrebufferTransitionFrames_{0};
     std::atomic<bool> capturedDrainActive_{false};
     std::atomic<std::uint32_t> dacClockSequence_{0};
     std::atomic<std::uint64_t> dacPositionFrames_{0};
