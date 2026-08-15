@@ -204,7 +204,7 @@
                        Maximum="10000"
                        SmallChange="10"
                        LargeChange="100"
-                       Value="100"
+                       Value="200"
                        SpinButtonPlacementMode="Inline"
                        ValueChanged="MaxBufferAdvanceBox_ValueChanged"
                        ToolTipService.ToolTip="When the protected timeline falls below Extra prebuffer minus this value, Tick By Tick keeps ASIO running with bridge-owned silence. The application's WASAPI buffer is added separately to the total retention budget." />

@@ -346,7 +346,7 @@ private:
     std::uint32_t applicationBufferFrames_ = 0;
     std::uint32_t effectiveTimelineFrames_ = 0;
     std::uint32_t maxBufferAdvanceFrames_ = 0;
-    std::int32_t maxBufferAdvanceMs_ = 100;
+    std::int32_t maxBufferAdvanceMs_ = 200;
     std::uint32_t minimumTimelineFrames_ = 0;
     std::uint64_t admittedTimelineEndFrame_ = 0;
     RawFrameRingBuffer ringBuffer_;

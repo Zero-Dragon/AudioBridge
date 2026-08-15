@@ -7,7 +7,7 @@ internal sealed class AppSettingsState
 {
     public string? SelectedAsioDeviceId { get; set; }
     public int PrebufferMs { get; set; } = 300;
-    public int MaxBufferAdvanceMs { get; set; } = 100;
+    public int MaxBufferAdvanceMs { get; set; } = 200;
     public int AsioBufferFrames { get; set; }
     public List<RecentTargetSetting> RecentTargets { get; set; } = [];
 }
@@ -45,7 +45,7 @@ internal static class AppSettingsService
 
         public string? SelectedAsioDeviceId { get; set; }
         public int PrebufferMs { get; set; } = 300;
-        public int MaxBufferAdvanceMs { get; set; } = 100;
+        public int MaxBufferAdvanceMs { get; set; } = 200;
         public int AsioBufferFrames { get; set; }
         public List<RecentTargetSetting>? RecentTargets { get; set; }
 
@@ -85,7 +85,7 @@ internal static class AppSettingsService
                 SelectedAsioDeviceId = selectedDeviceId,
                 PrebufferMs = Math.Clamp(ReadInt32(root, "prebufferMs", 300), 0, 10000),
                 MaxBufferAdvanceMs = Math.Clamp(
-                    ReadInt32(root, "maxBufferAdvanceMs", ReadInt32(root, "maxBufferOffsetMs", 100)),
+                    ReadInt32(root, "maxBufferAdvanceMs", ReadInt32(root, "maxBufferOffsetMs", 200)),
                     50,
                     10000),
                 AsioBufferFrames = selectedDeviceId is null
