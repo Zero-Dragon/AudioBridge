@@ -15,8 +15,8 @@
 
 namespace audiobridge::hook_protocol {
 
-constexpr LONG kControlProtocolVersion = 3;
-constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControlV3";
+constexpr LONG kControlProtocolVersion = 6;
+constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControlV6";
 
 constexpr DWORD kPipeMagic = 0x48504241;  // ABPH
 constexpr DWORD kPipeText = 1;
@@ -73,20 +73,19 @@ struct HookControlBlock {
     volatile LONG streamIdHigh = 0;
     volatile LONG sampleRate = 0;
     volatile LONG counterSequence = 0;
-    volatile LONG consumedCapturedLow = 0;
-    volatile LONG consumedCapturedHigh = 0;
-    volatile LONG consumedOutputLow = 0;
-    volatile LONG consumedOutputHigh = 0;
-    volatile LONG consumedCapturedBaselineLow = 0;
-    volatile LONG consumedCapturedBaselineHigh = 0;
-    volatile LONG consumedCapturedOffsetLow = 0;
-    volatile LONG consumedCapturedOffsetHigh = 0;
-    volatile LONG dacPositionLow = 0;
-    volatile LONG dacPositionHigh = 0;
-    volatile LONG dacAnchorQpcLow = 0;
-    volatile LONG dacAnchorQpcHigh = 0;
-    volatile LONG dacBufferFrames = 0;
-    volatile LONG dacClockValid = 0;
+    // Logical player progress advances when player-owned frames enter Core's
+    // protected playout horizon. Bridge-owned silence never advances it.
+    volatile LONG consumedLogicalLow = 0;
+    volatile LONG consumedLogicalHigh = 0;
+    volatile LONG consumedLogicalBaselineLow = 0;
+    volatile LONG consumedLogicalBaselineHigh = 0;
+    volatile LONG consumedLogicalOffsetLow = 0;
+    volatile LONG consumedLogicalOffsetHigh = 0;
+    volatile LONG prebufferMs = 0;
+    // A pending replacement stream can be blocked while the currently
+    // published stream continues to drain and report logical progress.
+    volatile LONG blockedStreamIdLow = 0;
+    volatile LONG blockedStreamIdHigh = 0;
 };
 
 static_assert(sizeof(PipeMessageHeader) == 24);
@@ -99,13 +98,13 @@ static_assert(offsetof(PipePcmMessage, sequence) == 8);
 static_assert(offsetof(PipePcmMessage, submittedFrames) == 16);
 static_assert(offsetof(PipePcmMessage, frameCount) == 24);
 static_assert(offsetof(PipePcmMessage, flags) == 28);
-static_assert(sizeof(HookControlBlock) == 100);
+static_assert(sizeof(HookControlBlock) == 80);
 static_assert(alignof(HookControlBlock) == alignof(LONG));
 static_assert(offsetof(HookControlBlock, configSequence) == 16);
 static_assert(offsetof(HookControlBlock, counterSequence) == 40);
-static_assert(offsetof(HookControlBlock, consumedCapturedOffsetHigh) == 72);
-static_assert(offsetof(HookControlBlock, dacPositionLow) == 76);
-static_assert(offsetof(HookControlBlock, dacClockValid) == 96);
+static_assert(offsetof(HookControlBlock, consumedLogicalOffsetHigh) == 64);
+static_assert(offsetof(HookControlBlock, prebufferMs) == 68);
+static_assert(offsetof(HookControlBlock, blockedStreamIdLow) == 72);
 
 inline std::uint64_t ReadStreamId(const HookControlBlock& control) noexcept {
     const auto low = static_cast<std::uint32_t>(control.streamIdLow);

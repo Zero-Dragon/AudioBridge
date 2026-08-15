@@ -94,6 +94,30 @@ const wchar_t* PrebufferTransitionName(std::int32_t value) {
     }
 }
 
+const wchar_t* CallbackRealtimeModeName(std::int32_t value) {
+    switch (value) {
+        case 1:
+            return L"mmcss-pro-audio-critical";
+        case 2:
+            return L"high-priority-fallback";
+        case -1:
+            return L"failed";
+        default:
+            return L"pending";
+    }
+}
+
+const wchar_t* AsioOutputReadyStateName(std::int32_t value) {
+    switch (value) {
+        case 1:
+            return L"supported";
+        case -1:
+            return L"unsupported";
+        default:
+            return L"pending";
+    }
+}
+
 std::int64_t FramesToMilliseconds(std::int64_t frames, std::uint32_t sampleRate) {
     if (frames <= 0 || sampleRate == 0) {
         return 0;
@@ -1090,7 +1114,8 @@ private:
                               std::uint32_t sampleRate,
                               std::uint64_t consumedBaseline,
                               std::uint64_t consumedOffset,
-                              RendererState state);
+                              RendererState state,
+                              std::uint64_t blockedStreamId = 0);
     void PublishRendererCounters();
     void FeedbackThread();
     void LogRendererDiagnostics(std::uint64_t nowMs);
@@ -1182,7 +1207,6 @@ private:
     std::uint64_t rendererDiagnosticLastMs_ = 0;
     bool rendererDiagnosticBaselineValid_ = false;
     RendererStats rendererDiagnosticStats_{};
-    DacClockSnapshot rendererDiagnosticDac_{};
     AsioRenderer renderer_;
 };
 
@@ -1289,7 +1313,6 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         rendererDiagnosticLastMs_ = 0;
         rendererDiagnosticBaselineValid_ = false;
         rendererDiagnosticStats_ = {};
-        rendererDiagnosticDac_ = {};
         publishedStreamId_ = 0;
         publishedConsumedBaseline_ = 0;
         publishedConsumedOffset_ = 0;
@@ -1494,6 +1517,7 @@ int32_t AudioBridgeCore::SetPrebufferMs(std::int32_t prebufferMs) {
         SetLastErrorLocked(L"OK");
     }
 
+    WriteControlState(pid, false);
     if (pid != 0 && format.Format.nSamplesPerSec != 0) {
         StartRendererForFormat(pid, format);
     }
@@ -1925,6 +1949,11 @@ void AudioBridgeCore::WriteControlState(std::uint32_t audioPid, bool finish) {
     if (control_ == nullptr) {
         return;
     }
+    std::int32_t prebufferMs = kDefaultPrebufferMs;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        prebufferMs = prebufferMs_;
+    }
     std::lock_guard<std::mutex> controlLock(controlStateMutex_);
     InterlockedIncrement(&control_->configSequence);
     MemoryBarrier();
@@ -1932,6 +1961,7 @@ void AudioBridgeCore::WriteControlState(std::uint32_t audioPid, bool finish) {
     InterlockedExchange(&control_->lockedPid, static_cast<LONG>(audioPid));
     InterlockedExchange(&control_->finish, finish ? 1 : 0);
     InterlockedExchange(&control_->fakeOutput, fakeOutput_.load() ? 1 : 0);
+    InterlockedExchange(&control_->prebufferMs, prebufferMs);
     if (finish || previousPid != static_cast<LONG>(audioPid)) {
         InterlockedExchange(&control_->rendererState,
                             static_cast<LONG>(finish
@@ -1940,10 +1970,12 @@ void AudioBridgeCore::WriteControlState(std::uint32_t audioPid, bool finish) {
         InterlockedExchange(&control_->streamIdLow, 0);
         InterlockedExchange(&control_->streamIdHigh, 0);
         InterlockedExchange(&control_->sampleRate, 0);
-        InterlockedExchange(&control_->consumedCapturedBaselineLow, 0);
-        InterlockedExchange(&control_->consumedCapturedBaselineHigh, 0);
-        InterlockedExchange(&control_->consumedCapturedOffsetLow, 0);
-        InterlockedExchange(&control_->consumedCapturedOffsetHigh, 0);
+        InterlockedExchange(&control_->consumedLogicalBaselineLow, 0);
+        InterlockedExchange(&control_->consumedLogicalBaselineHigh, 0);
+        InterlockedExchange(&control_->consumedLogicalOffsetLow, 0);
+        InterlockedExchange(&control_->consumedLogicalOffsetHigh, 0);
+        InterlockedExchange(&control_->blockedStreamIdLow, 0);
+        InterlockedExchange(&control_->blockedStreamIdHigh, 0);
     }
     MemoryBarrier();
     InterlockedIncrement(&control_->configSequence);
@@ -1954,7 +1986,8 @@ void AudioBridgeCore::PublishRendererRoute(
         std::uint32_t sampleRate,
         std::uint64_t consumedBaseline,
         std::uint64_t consumedOffset,
-        RendererState state) {
+        RendererState state,
+        std::uint64_t blockedStreamId) {
     if (control_ == nullptr) {
         return;
     }
@@ -1967,14 +2000,18 @@ void AudioBridgeCore::PublishRendererRoute(
     InterlockedExchange(&control_->streamIdLow, hook_protocol::StreamIdLow(streamId));
     InterlockedExchange(&control_->streamIdHigh, hook_protocol::StreamIdHigh(streamId));
     InterlockedExchange(&control_->sampleRate, static_cast<LONG>(sampleRate));
-    InterlockedExchange(&control_->consumedCapturedBaselineLow,
+    InterlockedExchange(&control_->consumedLogicalBaselineLow,
                         hook_protocol::CounterLow(consumedBaseline));
-    InterlockedExchange(&control_->consumedCapturedBaselineHigh,
+    InterlockedExchange(&control_->consumedLogicalBaselineHigh,
                         hook_protocol::CounterHigh(consumedBaseline));
-    InterlockedExchange(&control_->consumedCapturedOffsetLow,
+    InterlockedExchange(&control_->consumedLogicalOffsetLow,
                         hook_protocol::CounterLow(consumedOffset));
-    InterlockedExchange(&control_->consumedCapturedOffsetHigh,
+    InterlockedExchange(&control_->consumedLogicalOffsetHigh,
                         hook_protocol::CounterHigh(consumedOffset));
+    InterlockedExchange(&control_->blockedStreamIdLow,
+                        hook_protocol::StreamIdLow(blockedStreamId));
+    InterlockedExchange(&control_->blockedStreamIdHigh,
+                        hook_protocol::StreamIdHigh(blockedStreamId));
     InterlockedExchange(&control_->rendererState, static_cast<LONG>(state));
     MemoryBarrier();
     InterlockedIncrement(&control_->configSequence);
@@ -1985,39 +2022,19 @@ void AudioBridgeCore::PublishRendererCounters() {
         return;
     }
     std::lock_guard<std::mutex> controlLock(controlStateMutex_);
-    const auto captured = renderer_.ConfirmedCapturedFrames();
-    const auto output = renderer_.ConfirmedOutputFrames();
-    const auto dacClock = renderer_.GetDacClockSnapshot();
+    const auto logical = renderer_.LogicalConsumedFrames();
     InterlockedIncrement(&control_->counterSequence);
     MemoryBarrier();
-    InterlockedExchange(&control_->consumedCapturedLow,
-                        hook_protocol::CounterLow(captured));
-    InterlockedExchange(&control_->consumedCapturedHigh,
-                        hook_protocol::CounterHigh(captured));
-    InterlockedExchange(&control_->consumedOutputLow,
-                        hook_protocol::CounterLow(output));
-    InterlockedExchange(&control_->consumedOutputHigh,
-                        hook_protocol::CounterHigh(output));
-    InterlockedExchange(&control_->dacPositionLow,
-                        hook_protocol::CounterLow(dacClock.positionFrames));
-    InterlockedExchange(&control_->dacPositionHigh,
-                        hook_protocol::CounterHigh(dacClock.positionFrames));
-    InterlockedExchange(&control_->dacAnchorQpcLow,
-                        hook_protocol::CounterLow(
-                                static_cast<std::uint64_t>(dacClock.anchorQpc)));
-    InterlockedExchange(&control_->dacAnchorQpcHigh,
-                        hook_protocol::CounterHigh(
-                                static_cast<std::uint64_t>(dacClock.anchorQpc)));
-    InterlockedExchange(&control_->dacBufferFrames,
-                        static_cast<LONG>(dacClock.bufferFrames));
-    InterlockedExchange(&control_->dacClockValid, dacClock.valid ? 1 : 0);
+    InterlockedExchange(&control_->consumedLogicalLow,
+                        hook_protocol::CounterLow(logical));
+    InterlockedExchange(&control_->consumedLogicalHigh,
+                        hook_protocol::CounterHigh(logical));
     MemoryBarrier();
     InterlockedIncrement(&control_->counterSequence);
 }
 
 void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
     const RendererStats stats = renderer_.GetStats();
-    const DacClockSnapshot dac = renderer_.GetDacClockSnapshot();
     if (!renderer_.IsRunning()) {
         rendererDiagnosticBaselineValid_ = false;
         rendererDiagnosticLastMs_ = nowMs;
@@ -2040,6 +2057,11 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
              stats.totalPlayerSilentFrames <
                      rendererDiagnosticStats_.totalPlayerSilentFrames ||
              stats.totalFramesPlayed < rendererDiagnosticStats_.totalFramesPlayed ||
+             stats.totalLogicalFrames < rendererDiagnosticStats_.totalLogicalFrames ||
+             stats.totalBridgeSilentFramesQueued <
+                     rendererDiagnosticStats_.totalBridgeSilentFramesQueued ||
+             stats.totalBridgeSilentFramesPlayed <
+                     rendererDiagnosticStats_.totalBridgeSilentFramesPlayed ||
              stats.totalOutputFrames < rendererDiagnosticStats_.totalOutputFrames ||
              stats.totalSilentFrames < rendererDiagnosticStats_.totalSilentFrames ||
              stats.prebufferEnterCount <
@@ -2047,27 +2069,25 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
              stats.prebufferExitCount <
                      rendererDiagnosticStats_.prebufferExitCount);
     if (!rendererDiagnosticBaselineValid_ || countersRestarted) {
-        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u active=%s prebuffer=%s fill=%d/%d ms capacity=%d ms queued=%lld playerSilent=%lld confirmed=%lld output=%lld localSilent=%lld dac=%llu prebufferEnters=%llu exits=%llu lastTransition=%s lastTransitionFill=%lld ms underruns=%lld dropped=%lld",
+        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u active=%s fill=%d/%d ms capacity=%d ms packet=%u frames playerQueued=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld realtime=%s outputReady=%s underruns=%lld dropped=%lld",
             pid,
             static_cast<unsigned long long>(streamId),
             stats.sourceSampleRate,
             stats.streamActive ? L"yes" : L"no",
-            stats.prebuffering ? L"yes" : L"no",
             stats.bufferedMs,
             stats.prebufferTargetMs,
             stats.bufferCapacityMs,
+            stats.maximumRealPacketFrames,
             static_cast<long long>(stats.totalFramesQueued),
             static_cast<long long>(stats.totalPlayerSilentFrames),
+            static_cast<long long>(stats.totalLogicalFrames),
             static_cast<long long>(stats.totalFramesPlayed),
+            static_cast<long long>(stats.totalBridgeSilentFramesQueued),
+            static_cast<long long>(stats.totalBridgeSilentFramesPlayed),
             static_cast<long long>(stats.totalOutputFrames),
             static_cast<long long>(stats.totalSilentFrames),
-            static_cast<unsigned long long>(dac.positionFrames),
-            static_cast<unsigned long long>(stats.prebufferEnterCount),
-            static_cast<unsigned long long>(stats.prebufferExitCount),
-            PrebufferTransitionName(stats.lastPrebufferTransition),
-            static_cast<long long>(FramesToMilliseconds(
-                    stats.lastPrebufferTransitionFrames,
-                    stats.sourceSampleRate)),
+            CallbackRealtimeModeName(stats.callbackRealtimeMode),
+            AsioOutputReadyStateName(stats.asioOutputReadyState),
             static_cast<long long>(stats.underrunCount),
             static_cast<long long>(stats.totalFramesDropped));
     } else {
@@ -2083,6 +2103,15 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
         const std::int64_t confirmedFrames =
                 delta(stats.totalFramesPlayed,
                       rendererDiagnosticStats_.totalFramesPlayed);
+        const std::int64_t logicalFrames =
+                delta(stats.totalLogicalFrames,
+                      rendererDiagnosticStats_.totalLogicalFrames);
+        const std::int64_t bridgeQueuedFrames =
+                delta(stats.totalBridgeSilentFramesQueued,
+                      rendererDiagnosticStats_.totalBridgeSilentFramesQueued);
+        const std::int64_t bridgePlayedFrames =
+                delta(stats.totalBridgeSilentFramesPlayed,
+                      rendererDiagnosticStats_.totalBridgeSilentFramesPlayed);
         const std::int64_t outputFrames =
                 delta(stats.totalOutputFrames,
                       rendererDiagnosticStats_.totalOutputFrames);
@@ -2095,17 +2124,7 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
         const std::int64_t dropped =
                 delta(stats.totalFramesDropped,
                       rendererDiagnosticStats_.totalFramesDropped);
-        const std::uint64_t dacFrames = dac.valid && rendererDiagnosticDac_.valid &&
-                        dac.positionFrames >= rendererDiagnosticDac_.positionFrames
-                ? dac.positionFrames - rendererDiagnosticDac_.positionFrames
-                : 0;
-        const std::uint64_t prebufferEnters =
-                stats.prebufferEnterCount -
-                rendererDiagnosticStats_.prebufferEnterCount;
-        const std::uint64_t prebufferExits =
-                stats.prebufferExitCount -
-                rendererDiagnosticStats_.prebufferExitCount;
-        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld confirmed=%lld output=%lld localSilent=%lld dac=%llu queueDelta=%lld inputMinusOutput=%lld fill=%d/%d ms prebuffer=%s transitions=+%llu/-%llu lastTransition=%s lastTransitionFill=%lld ms underruns=+%lld dropped=+%lld",
+        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld playerPending=%lld fill=%d/%d ms packet=%u frames underruns=+%lld dropped=+%lld",
             static_cast<unsigned long long>(nowMs - rendererDiagnosticLastMs_),
             pid,
             static_cast<unsigned long long>(streamId),
@@ -2114,33 +2133,28 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
             static_cast<long long>((std::max<std::int64_t>)(
                     inputFrames - playerSilentFrames, 0)),
             static_cast<long long>(playerSilentFrames),
+            static_cast<long long>(logicalFrames),
             static_cast<long long>(confirmedFrames),
+            static_cast<long long>(bridgeQueuedFrames),
+            static_cast<long long>(bridgePlayedFrames),
             static_cast<long long>(outputFrames),
             static_cast<long long>(localSilentFrames),
-            static_cast<unsigned long long>(dacFrames),
             static_cast<long long>(inputFrames - confirmedFrames),
-            static_cast<long long>(inputFrames - outputFrames),
             stats.bufferedMs,
             stats.prebufferTargetMs,
-            stats.prebuffering ? L"yes" : L"no",
-            static_cast<unsigned long long>(prebufferEnters),
-            static_cast<unsigned long long>(prebufferExits),
-            PrebufferTransitionName(stats.lastPrebufferTransition),
-            static_cast<long long>(FramesToMilliseconds(
-                    stats.lastPrebufferTransitionFrames,
-                    stats.sourceSampleRate)),
+            stats.maximumRealPacketFrames,
             static_cast<long long>(underruns),
             static_cast<long long>(dropped));
     }
 
     rendererDiagnosticStats_ = stats;
-    rendererDiagnosticDac_ = dac;
     rendererDiagnosticLastMs_ = nowMs;
     rendererDiagnosticBaselineValid_ = true;
 }
 
 void AudioBridgeCore::FeedbackThread() {
     while (running_.load(std::memory_order_acquire)) {
+        renderer_.MaintainTimeline();
         PublishRendererCounters();
         const auto nowMs = NowMs();
         if (rendererDiagnosticLastMs_ == 0 ||
@@ -2193,7 +2207,7 @@ bool AudioBridgeCore::WaitForCapturedDrainLocked(std::wstring* outError) {
             static_cast<std::int64_t>((std::max)(drainPrebufferMs, 0)) + 5000);
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     renderer_.BeginCapturedDrain();
-    while (renderer_.PendingCapturedFrames() > 0) {
+    while (renderer_.PendingTimelineFrames() > 0) {
         if (pipelineFaulted_.load(std::memory_order_acquire) ||
             renderer_.HasFault()) {
             if (outError != nullptr) {
@@ -2323,8 +2337,6 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
     }
 
     bool shouldSelect = false;
-    bool shouldStartRenderer = false;
-    WAVEFORMATEXTENSIBLE rendererFormat{};
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto& state = audioPids_[pid];
@@ -2360,14 +2372,10 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
         std::uint32_t expected = 0;
         shouldSelect = lockedAudioPid_.compare_exchange_strong(expected, pid);
         if (lockedAudioPid_.load() == pid) {
-            // Prime ASIO from the first usable format, but do not let later probe
-            // clients displace it until they actually produce PCM.
+            // Remember the first usable stream, but do not initialize or
+            // reconfigure ASIO until that stream actually produces PCM.
             if (state.activeStreamId == 0) {
                 state.activeStreamId = message->streamId;
-            }
-            if (state.activeStreamId == message->streamId) {
-                rendererFormat = message->format;
-                shouldStartRenderer = true;
             }
         }
     }
@@ -2381,9 +2389,6 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
         LogDetectedStream(pid, message->streamId, format);
     }
 
-    if (shouldStartRenderer) {
-        StartRendererForFormat(pid, rendererFormat);
-    }
 }
 
 void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::size_t bytes) {
@@ -2556,7 +2561,9 @@ void AudioBridgeCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std:
     }
     if (!validationError.empty()) {
         LatchPipelineFaultLocked(validationError);
+        return;
     }
+    PublishRendererCounters();
 }
 
 void AudioBridgeCore::StartRendererForFormat(std::uint32_t pid,
@@ -2641,7 +2648,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     const bool rendererWasRunning = renderer_.IsRunning();
     const std::uint64_t previousStreamId = publishedStreamId_;
     const RendererStats handoffStartStats = renderer_.GetStats();
-    const std::int64_t pendingAtHandoff = renderer_.PendingCapturedFrames();
+    const std::int64_t pendingAtHandoff = renderer_.PendingTimelineFrames();
     Log(L"Renderer handoff begin. oldStream=%llu newStream=%llu oldRate=%u newRate=%u running=%s sameConfiguration=%s pending=%lld frames (%lld ms) fill=%d/%d ms prebuffer=%s submittedOffset=%llu",
         static_cast<unsigned long long>(previousStreamId),
         static_cast<unsigned long long>(streamId),
@@ -2657,22 +2664,18 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         handoffStartStats.prebuffering ? L"yes" : L"no",
         static_cast<unsigned long long>(submittedFrames));
 
-    // Publish the selected stream before draining the previous renderer. A new
-    // WASAPI client has not established a managed-clock baseline yet; if the
-    // old route remains Running while its retained PCM drains, that client
-    // falls back to synthetic QPC progress and can fill the synchronous pipe.
-    // Reconfiguring freezes both the previous managed stream and the selected
-    // stream until the old PCM is retired and a new DAC generation is ready.
-    publishedStreamId_ = streamId;
-    publishedConsumedBaseline_ = renderer_.ConfirmedCapturedFrames();
-    publishedConsumedOffset_ = submittedFrames;
-    PublishRendererRoute(streamId,
-                         format.Format.nSamplesPerSec,
-                         publishedConsumedBaseline_,
-                         publishedConsumedOffset_,
-                         RendererState::Reconfiguring);
-
-    if (rendererWasRunning) {
+    if (rendererWasRunning && handoffStartStats.streamActive) {
+        // Keep the old stream's route and logical clock live while preventing
+        // only the replacement endpoint from staging more than its current
+        // ReleaseBuffer. This separates the format-boundary gate from the old
+        // timeline that still has valid audio to play.
+        PublishRendererCounters();
+        PublishRendererRoute(previousStreamId,
+                             previousSampleRate,
+                             publishedConsumedBaseline_,
+                             publishedConsumedOffset_,
+                             RendererState::Running,
+                             streamId);
         const auto drainStartedMs = NowMs();
         std::wstring drainError;
         if (!WaitForCapturedDrainLocked(&drainError)) {
@@ -2682,7 +2685,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                 static_cast<unsigned long long>(streamId),
                 static_cast<unsigned long long>(NowMs() - drainStartedMs),
                 static_cast<long long>(pendingAtHandoff),
-                static_cast<long long>(renderer_.PendingCapturedFrames()),
+                static_cast<long long>(renderer_.PendingTimelineFrames()),
                 drainFailedStats.bufferedMs,
                 drainError.c_str());
             std::lock_guard<std::mutex> lock(stateMutex_);
@@ -2696,7 +2699,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
             static_cast<unsigned long long>(streamId),
             static_cast<unsigned long long>(NowMs() - drainStartedMs),
             static_cast<long long>(pendingAtHandoff),
-            static_cast<long long>(renderer_.PendingCapturedFrames()),
+            static_cast<long long>(renderer_.PendingTimelineFrames()),
             static_cast<long long>(drainEndStats.totalFramesPlayed -
                                    handoffStartStats.totalFramesPlayed),
             static_cast<long long>(drainEndStats.totalOutputFrames -
@@ -2711,15 +2714,25 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                     handoffStartStats.prebufferExitCount));
     }
 
-    const auto confirmedBeforeReconfigure = renderer_.ConfirmedCapturedFrames();
-    publishedConsumedBaseline_ = confirmedBeforeReconfigure;
+    // The old timeline is now fully retired. Move the route itself to the new
+    // stream and keep its ingress window full until its new ASIO generation is
+    // initialized.
+    publishedStreamId_ = streamId;
+    publishedConsumedBaseline_ = renderer_.LogicalConsumedFrames();
     publishedConsumedOffset_ = submittedFrames;
+    PublishRendererCounters();
+    PublishRendererRoute(streamId,
+                         format.Format.nSamplesPerSec,
+                         publishedConsumedBaseline_,
+                         publishedConsumedOffset_,
+                         RendererState::Reconfiguring,
+                         streamId);
 
     if (configurationMatches) {
-        // The route baseline is derived from the renderer's current confirmed
-        // position. Publish that counter before exposing the matching Running
-        // route; otherwise the hook can observe a new baseline paired with the
-        // previous feedback tick and incorrectly invalidate the endpoint.
+        // Preserve the fixed-delay boundary even when the ASIO hardware format
+        // does not change. Bridge silence is appended before the first packet
+        // of the new logical stream and is never replaced later.
+        renderer_.PrimeTimeline();
         PublishRendererCounters();
         PublishRendererRoute(streamId,
                              format.Format.nSamplesPerSec,
@@ -2762,7 +2775,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     }
 
     rendererFaultResetAuthorized_ = false;
-    publishedConsumedBaseline_ = renderer_.ConfirmedCapturedFrames();
+    publishedConsumedBaseline_ = renderer_.LogicalConsumedFrames();
     publishedConsumedOffset_ = submittedFrames;
     PublishRendererCounters();
     PublishRendererRoute(streamId,
@@ -2796,6 +2809,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     Log(L"Renderer ASIO clock source request=%d (-1=keep driver current)",
         clockSourceIndex);
     Log(L"Source sample rate is passed to ASIO without sample-rate conversion.");
+    Log(L"Strict realtime mode requires an exact source/ASIO sample-format match; only stereo deinterleaving remains in the callback.");
     Log(L"Renderer handoff complete. stream=%llu rate=%u elapsed=%llu ms prebuffer=%d ms maxAdvance=%d ms",
         static_cast<unsigned long long>(streamId),
         format.Format.nSamplesPerSec,

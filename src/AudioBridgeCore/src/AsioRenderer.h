@@ -47,12 +47,16 @@ struct RendererStats {
     std::int64_t totalFramesDropped = 0;
     std::int64_t totalOutputFrames = 0;
     std::int64_t totalSilentFrames = 0;
+    std::int64_t totalLogicalFrames = 0;
+    std::int64_t totalBridgeSilentFramesQueued = 0;
+    std::int64_t totalBridgeSilentFramesPlayed = 0;
     std::int64_t bufferedFrames = 0;
     std::int32_t bufferedMs = 0;
     std::int64_t bufferCapacityFrames = 0;
     std::int32_t bufferCapacityMs = 0;
     std::int64_t prebufferTargetFrames = 0;
     std::int32_t prebufferTargetMs = 0;
+    std::uint32_t maximumRealPacketFrames = 0;
     std::int64_t underrunCount = 0;
     std::int64_t recentOutputFrames = 0;
     std::int64_t recentSilentFrames = 0;
@@ -75,6 +79,8 @@ struct RendererStats {
     std::int64_t asioRebuildCount = 0;
     std::int32_t asioLastMessage = 0;
     std::int32_t asioClockSourceIndex = -1;
+    std::int32_t callbackRealtimeMode = 0;
+    std::int32_t asioOutputReadyState = 0;
 };
 
 struct AsioClockSourceInfo {
@@ -85,21 +91,21 @@ struct AsioClockSourceInfo {
     std::wstring name;
 };
 
-struct DacClockSnapshot {
-    bool valid = false;
-    std::uint64_t positionFrames = 0;
-    std::int64_t anchorQpc = 0;
-    std::uint32_t bufferFrames = 0;
-};
-
 bool QueryAsioClockSources(const std::wstring& deviceId,
                            std::vector<AsioClockSourceInfo>* sources,
                            std::wstring* outError);
 
 class RawFrameRingBuffer {
 public:
+    enum class FrameOwner : std::uint8_t {
+        Bridge = 0,
+        Player = 1,
+    };
+
     struct DispatchResult {
         std::uint32_t frames = 0;
+        std::uint32_t playerFrames = 0;
+        std::uint32_t bridgeFrames = 0;
         std::uint64_t endIndex = 0;
     };
 
@@ -107,10 +113,15 @@ public:
     void Clear();
     std::uint32_t Push(const std::uint8_t* data, std::uint32_t frameCount);
     std::uint32_t PushCapturedSilence(std::uint32_t frameCount);
+    std::uint32_t PushBridgeSilence(std::uint32_t frameCount);
     DispatchResult Dispatch(std::uint8_t* data, std::uint32_t frameCount);
     bool ConfirmDispatch(std::uint64_t endIndex);
     void RollbackDispatch();
     std::uint64_t DispatchPosition() const;
+    std::uint64_t ConfirmedPositionFrames() const;
+    std::uint64_t WritePositionFrames() const;
+    std::uint64_t CountPlayerFrames(std::uint64_t beginFrame,
+                                    std::uint64_t endFrame) const;
     std::uint32_t AvailableReadFrames() const;
     std::uint32_t PendingFrames() const;
     std::uint32_t CapacityFrames() const;
@@ -128,8 +139,13 @@ private:
                   std::size_t bytes);
     void ZeroInto(std::uint64_t writeIndex, std::size_t bytes);
     void CopyOut(std::uint64_t readIndex, std::uint8_t* data, std::size_t bytes) const;
+    std::uint32_t PushSilence(std::uint32_t frameCount, FrameOwner owner);
+    void MarkFrames(std::uint64_t beginByteIndex,
+                    std::uint32_t frameCount,
+                    FrameOwner owner);
 
     std::vector<std::uint8_t> bytes_;
+    std::vector<std::uint8_t> frameOwners_;
     std::size_t byteMask_ = 0;
     std::atomic<std::uint64_t> confirmedReadIndex_{0};
     std::atomic<std::uint64_t> dispatchReadIndex_{0};
@@ -145,14 +161,6 @@ public:
         Pcm16,
         Pcm24,
         Pcm32,
-    };
-
-    enum class OutputSampleKind {
-        Unknown,
-        Float32,
-        Int16,
-        Int24,
-        Int32,
     };
 
     AsioRenderer() = default;
@@ -177,11 +185,14 @@ public:
     RendererStats GetStats() const;
     bool IsRunning() const;
     std::int64_t ConfirmedCapturedFrames() const;
+    std::int64_t LogicalConsumedFrames() const;
     std::int64_t ConfirmedOutputFrames() const;
     std::int64_t PendingCapturedFrames() const;
+    std::int64_t PendingTimelineFrames() const;
+    void PrimeTimeline();
+    void MaintainTimeline();
     void BeginCapturedDrain();
     void EndCapturedDrain();
-    DacClockSnapshot GetDacClockSnapshot() const;
     bool HasFault() const;
     std::wstring FaultMessage() const;
 
@@ -196,6 +207,7 @@ private:
         std::uint64_t dispatchEndIndex = 0;
         std::uint32_t outputFrames = 0;
         std::uint32_t capturedFrames = 0;
+        std::uint32_t bridgeSilentFrames = 0;
         std::uint32_t managedSilentFrames = 0;
         std::uint32_t underrunSilentFrames = 0;
     };
@@ -229,28 +241,25 @@ private:
                                      std::uint32_t frameCount,
                                      bool silence,
                                      std::wstring* outError);
+    void MaintainTimelineLocked();
+    void UpdateLogicalAdmissionLocked();
     bool ConfirmOutputPage(long doubleBufferIndex);
     void RollbackOutputPages();
     bool LatchFault(const std::wstring& message, bool fromOutputCallback = false);
     void FillOutputBuffer(long doubleBufferIndex);
     void FillOutputBufferWithSilence(long doubleBufferIndex);
-    bool PublishDacClock(const ASIOTime* timeInfo, std::int64_t callbackQpc);
-    void ResetDacClock();
+    void NotifyOutputReady();
     void SetPrebuffering(bool enabled,
                          PrebufferTransitionReason reason,
                          std::uint32_t availableFrames);
-    void WriteConvertedOutput(const std::uint8_t* interleaved,
-                              std::uint32_t frameCount,
-                              long doubleBufferIndex);
-    float ReadSourceFloat(const std::uint8_t* interleaved,
-                          std::uint32_t frameIndex,
-                          std::uint32_t channelIndex) const;
-    std::int32_t ReadSourceInt32(const std::uint8_t* interleaved,
-                                 std::uint32_t frameIndex,
-                                 std::uint32_t channelIndex) const;
+    void WriteDirectOutput(const std::uint8_t* interleaved,
+                           std::uint32_t frameCount,
+                           long doubleBufferIndex);
     void ResetStats();
     void RecordOutputFrames(std::uint32_t outputFrames, std::uint32_t silentFrames);
-    SilenceWindowStats GetRecentSilenceStats() const;
+    SilenceWindowStats GetRecentSilenceStats(
+            std::int64_t totalOutputFrames,
+            std::int64_t totalSilentFrames) const;
 
     mutable std::mutex mutex_;
     std::thread controlThread_;
@@ -259,8 +268,7 @@ private:
     std::condition_variable controlCv_;
     std::condition_variable startCv_;
     std::mutex producerMutex_;
-    std::mutex callbackWaitMutex_;
-    std::condition_variable callbackIdleCv_;
+    std::atomic<std::uint32_t> callbackWaiterCount_{0};
     bool initComplete_ = false;
     bool initSucceeded_ = false;
     bool shutdownRequested_ = false;
@@ -282,15 +290,16 @@ private:
     std::atomic<bool> streamActive_{false};
     std::atomic<bool> prebuffering_{false};
     std::atomic_flag callbackActive_ = ATOMIC_FLAG_INIT;
-    std::atomic<bool> callbackExecuting_{false};
+    volatile LONG callbackExecuting_ = FALSE;
     std::atomic<DWORD> callbackThreadId_{0};
     std::atomic<bool> deferredReentryFault_{false};
+    std::atomic<std::int32_t> callbackRealtimeMode_{0};
 
     WAVEFORMATEXTENSIBLE format_{};
     SourceSampleKind sourceKind_ = SourceSampleKind::Unknown;
-    OutputSampleKind outputKind_ = OutputSampleKind::Unknown;
     ASIOSampleType outputAsioSampleType_ = ASIOSTLastEntry;
-    std::uint32_t outputRightShift_ = 0;
+    std::uint32_t outputBytesPerSample_ = 0;
+    std::atomic<std::int32_t> outputReadyState_{0};
     std::uint32_t sourceChannels_ = 0;
     std::uint32_t sourceBytesPerSample_ = 0;
     std::uint32_t bytesPerFrame_ = 0;
@@ -307,33 +316,30 @@ private:
     std::int32_t prebufferMs_ = 300;
     std::uint32_t maxBufferAdvanceFrames_ = 0;
     std::int32_t maxBufferAdvanceMs_ = 100;
+    std::uint32_t minimumTimelineFrames_ = 0;
+    std::uint64_t admittedTimelineEndFrame_ = 0;
     RawFrameRingBuffer ringBuffer_;
     std::vector<std::uint8_t> callbackBuffer_;
     std::array<OutputPageLedger, 2> outputPageLedgers_{};
     std::uint64_t nextDispatchSequence_ = 1;
     std::uint64_t nextConfirmSequence_ = 1;
     bool awaitingFirstBufferSwitch_ = true;
-    bool hasDriverSamplePosition_ = false;
-    std::uint64_t lastDriverSamplePosition_ = 0;
-    std::uint64_t normalizedDacPosition_ = 0;
-
     std::atomic<std::int64_t> totalFramesQueued_{0};
     std::atomic<std::int64_t> totalPlayerSilentFrames_{0};
     std::atomic<std::int64_t> totalFramesPlayed_{0};
     std::atomic<std::int64_t> totalFramesDropped_{0};
     std::atomic<std::int64_t> totalOutputFrames_{0};
     std::atomic<std::int64_t> totalSilentFrames_{0};
+    std::atomic<std::int64_t> totalLogicalFrames_{0};
+    std::atomic<std::int64_t> totalBridgeSilentFramesQueued_{0};
+    std::atomic<std::int64_t> totalBridgeSilentFramesPlayed_{0};
+    std::atomic<std::uint32_t> maximumRealPacketFrames_{0};
     std::atomic<std::int64_t> underrunCount_{0};
     std::atomic<std::uint64_t> prebufferEnterCount_{0};
     std::atomic<std::uint64_t> prebufferExitCount_{0};
     std::atomic<std::int32_t> lastPrebufferTransition_{0};
     std::atomic<std::int64_t> lastPrebufferTransitionFrames_{0};
     std::atomic<bool> capturedDrainActive_{false};
-    std::atomic<std::uint32_t> dacClockSequence_{0};
-    std::atomic<std::uint64_t> dacPositionFrames_{0};
-    std::atomic<std::int64_t> dacAnchorQpc_{0};
-    std::atomic<std::uint32_t> dacClockBufferFrames_{0};
-    std::atomic<bool> dacClockValid_{false};
     std::atomic<std::int64_t> asioResetRequests_{0};
     std::atomic<std::int64_t> asioBufferSizeChanges_{0};
     std::atomic<std::int64_t> asioLatencyChanges_{0};
@@ -344,7 +350,9 @@ private:
     mutable std::mutex faultMutex_;
     std::wstring faultMessage_;
     mutable std::mutex silenceStatsMutex_;
-    std::array<SilenceBucket, 60> silenceBuckets_{};
+    mutable std::array<SilenceBucket, 60> silenceBuckets_{};
+    mutable std::int64_t sampledOutputFrames_ = 0;
+    mutable std::int64_t sampledSilentFrames_ = 0;
 };
 
 }  // namespace audiobridge
