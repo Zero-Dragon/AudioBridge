@@ -16,7 +16,7 @@ Tick By Tick is a Windows audio utility. It launches a selected music player or 
 
 It is designed for applications without native ASIO output.
 
-The application includes targeted designs for improving audio clock stability and welcomes users pursuing high-quality audio playback.
+The application includes targeted designs to improve audio clock stability, and audiophiles pursuing high-quality playback are welcome to give it a try~
 
 If Tick By Tick has helped you, [you are welcome to buy me a coffee ☕](#support-the-project).
 
