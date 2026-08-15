@@ -10,9 +10,12 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 4
 
-[*.{json,xml,xaml,csproj,vcxproj}]
+[*.{json,xml,xaml,csproj,vcxproj,props,targets,filters}]
 indent_style = space
 indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
 
 [*.{bat,cmd,sln}]
 end_of_line = crlf

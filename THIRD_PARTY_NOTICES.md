@@ -10,6 +10,8 @@ This repository includes the following Steinberg ASIO SDK files:
 
 Their licensing terms are preserved in `third_party/asiosdk/LICENSE.txt`. This repository uses the GPL version 3 licensing option described by that file.
 
+Only the ABI headers listed above are vendored. ASIO SDK sample applications and prebuilt binaries are not included. Integration details are documented in `third_party/asiosdk/README.md`.
+
 ## Microsoft and .NET packages
 
 The WinUI controller restores Microsoft Windows App SDK, Windows SDK Build Tools, and their transitive dependencies from NuGet. These packages are not vendored in the source repository.

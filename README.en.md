@@ -16,6 +16,10 @@ Tick By Tick is a Windows audio utility. It launches a selected music player or 
 
 It is designed for applications without native ASIO output.
 
+The application includes targeted designs for improving audio clock stability and welcomes users pursuing high-quality audio playback.
+
+If Tick By Tick has helped you, [you are welcome to buy me a coffee ☕](#support-the-project).
+
 ## Audio path
 
 - **Automatic sample-rate matching**: Matches the DAC sample rate when the input PCM format changes;
@@ -50,13 +54,20 @@ It is designed for applications without native ASIO output.
 - Do not use the same device for the Windows default audio output and ASIO output.
 - Select the main `.exe` that produces audio, not a launcher or updater.
 - Audio PIDs must be captured when the application starts. Fully exit the target application, then open it through Tick By Tick.
-- Fake Output is enabled by default and silences the target application's normal WASAPI output, preventing duplicate playback through both the standard Windows output and the ASIO device.
 - If there is no sound: when no Audio PID appears, exit every process belonging to the target application and reopen it through Tick By Tick. When a PID is present, check the ASIO driver, sample rate, and any error or underrun shown in the app.
+
+### Configuration
+
+| Setting | Description |
+| --- | --- |
+| **Extra prebuffer ms** | Additional audio retained beyond the application's own WASAPI buffer. A larger value improves tolerance for brief delivery gaps and scheduling jitter but also increases playback latency. |
+| **Max buffer advance ms** | Controls the low-water silence threshold. When the protected audio timeline falls below `Extra prebuffer ms - Max buffer advance ms`, Tick By Tick adds bridge-owned silence to keep ASIO running continuously. |
+| **ASIO buffer frames** | Specifies the number of frames in each ASIO driver buffer page. `0` uses the driver's preferred size. |
+| **Fake Output** | Captures the target through a virtual WASAPI output and prevents simultaneous playback through the Windows default device. |
 
 ## Limitations
 
 - Stereo audio only; no sample-rate conversion. The ASIO driver must natively accept the source sample rate;
-- automatic adaptation is supported between standard ASIO `Float32LSB`, `Int16LSB`, `Int24LSB`, and `Int32LSB` sample formats; packed valid-bit and other specialized ASIO formats are unsupported;
 - applications using specialized audio interfaces or separate system services may not be captured;
 - DLL injection may trigger security software warnings. Launch only applications you trust.
 

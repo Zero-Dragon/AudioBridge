@@ -16,6 +16,10 @@ Tick By Tick 是一个 Windows 音频辅助工具。它可以从工具内启动�
 
 它适合本身不支持 ASIO、但希望绕过普通 Windows 共享输出的应用。
 
+软件内部做了针对性的提高音频时钟稳定性的设计，欢迎追求高音质的用户体验
+
+如果 Tick By Tick 对你有所帮助，[欢迎请我喝杯咖啡 ☕](#支持项目)
+
 ## 音频链路
 
 - **采样率自动跟随**：输入PCM格式变化时自动匹配 DAC 采样率
@@ -45,18 +49,26 @@ Tick By Tick 是一个 Windows 音频辅助工具。它可以从工具内启动�
 4. 点击 Open，再在目标应用中开始播放音频。
 5. 确认 Audio PIDs 中出现 PID，状态变为 `Output Active`。
 
+
+
 ### 注意
 
 - Windows 默认音频输出与 ASIO output 不要使用同一台设备；
 - 请选择实际播放音频的主程序 `.exe`，不要选择 launcher 或 updater；
 - 需要在应用启动时捕获音频 PID，请先完全退出目标应用，再通过 Tick By Tick 打开；
-- 默认开启的 Fake Output 会将原来的 WASAPI 输出静音，避免声音同时从普通扬声器和 ASIO 设备播放。
 - 如果没有声音：没有 Audio PID 时，请退出目标应用的所有进程并重新打开；已经有 PID 时，请检查 ASIO 驱动、采样率和界面中的错误或 underrun 信息。
+### 配置说明
+
+| 参数 | 说明 |
+| --- | --- |
+| **Extra prebuffer ms** | 在应用自身的 WASAPI 缓冲之外，额外保留的音频时长。增大可提高对短时送数中断和线程抖动的容忍度，但也会增加播放延迟。 |
+| **Max buffer advance ms** | 控制低水位补静音的触发位置。当受保护的音频余量低于 `Extra prebuffer ms - Max buffer advance ms` 时，Tick By Tick 会补充桥接静音以保持 ASIO 连续运行。 |
+| **ASIO buffer frames** | 指定 ASIO 驱动每页缓冲区的帧数。`0` 表示使用驱动的首选值。 |
+| **Fake Output** | 使用虚拟 WASAPI 输出捕获目标应用，并阻止声音同时输出到 Windows 默认设备。
 
 ## 使用限制
 
 - 当前只支持立体声音频，不进行采样率转换；ASIO 驱动必须原生支持音源采样率；
-- 支持标准 `Float32LSB`、`Int16LSB`、`Int24LSB` 和 `Int32LSB` ASIO 样本格式之间的自动适配；不支持 packed valid-bit 等特殊 ASIO 格式；
 - 少数使用特殊音频接口或独立系统服务的应用可能无法捕获；
 - DLL 注入可能触发安全软件警告，请只打开你信任的应用。
 

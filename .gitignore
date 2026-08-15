@@ -13,8 +13,11 @@
 *.pdb
 *.ilk
 *.exp
+*.tlog
+*.lastbuildstate
 
 # Runtime diagnostics
+*.log
 *.startup.log
 *.native.log
 /settings.json*
