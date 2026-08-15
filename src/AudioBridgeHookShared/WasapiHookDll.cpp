@@ -737,12 +737,19 @@ UINT32 SelectFakeBufferFrames(std::uint64_t requestedFrames,
         *prebufferFrames = targetFrames;
     }
 
-    // Fake WASAPI is only the bounded ingress window. Core owns the actual
-    // prebuffer timeline, so the endpoint always needs two application
-    // periods, not another copy of the requested or configured playback delay.
-    const std::uint64_t selectedFrames = minimumFrames;
+    // Preserve the application's requested shared-mode ingress capacity while
+    // bounding pathological requests to one second. Some renderers use the
+    // requested capacity as part of their startup scheduling even after
+    // GetBufferSize reports the negotiated result, so shrinking every client
+    // to two periods can stall it after its first packet.
+    const std::uint64_t maximumFrames = (std::max<std::uint64_t>)(
+            minimumFrames,
+            effectiveRate);
+    const std::uint64_t selectedFrames = (std::min)(
+            (std::max<std::uint64_t>)(requestedFrames, minimumFrames),
+            maximumFrames);
     if (capped != nullptr) {
-        *capped = requestedFrames > selectedFrames;
+        *capped = requestedFrames > maximumFrames;
     }
     return static_cast<UINT32>(selectedFrames);
 }
@@ -1068,6 +1075,7 @@ bool LogWaveFormat(const char* source,
                    AUDCLNT_SHAREMODE shareMode,
                    DWORD streamFlags,
                    UINT32 periodInFrames,
+                   UINT32 applicationBufferFrames,
                    std::uint64_t streamId) {
     const bool frequentFakeInitialization =
             source != nullptr && std::strncmp(source, "Fake ", 5) == 0;
@@ -1149,6 +1157,7 @@ bool LogWaveFormat(const char* source,
     message.streamFlags = streamFlags;
     message.shareMode = static_cast<DWORD>(shareMode);
     message.periodFrames = periodInFrames;
+    message.applicationBufferFrames = applicationBufferFrames;
     message.streamId = streamId;
     return SendPipeMessage(kPipeFormat, &message, sizeof(message));
 }
@@ -1507,6 +1516,9 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                            audioState.shareMode,
                            audioState.streamFlags,
                            0,
+                           audioState.fakeOutput
+                                   ? audioState.fakeBufferFrames
+                                   : 0,
                            renderState.streamId)) {
             Log("Late-attached format message could not be delivered. render=%p stream=%llu",
                 self,
@@ -2457,6 +2469,7 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
                            shareMode,
                            streamFlags,
                            state.fakePeriodFrames,
+                           state.fakeBufferFrames,
                            state.streamId)) {
             {
                 std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -2506,6 +2519,7 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
                            shareMode,
                            streamFlags,
                            0,
+                           0,
                            state.streamId)) {
             Log("IAudioClient format message could not be delivered. audio=%p stream=%llu",
                 self,
@@ -2547,6 +2561,7 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                            AUDCLNT_SHAREMODE_SHARED,
                            streamFlags,
                            periodInFrames,
+                           state.fakeBufferFrames,
                            state.streamId)) {
             {
                 std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -2597,6 +2612,7 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                            AUDCLNT_SHAREMODE_SHARED,
                            streamFlags,
                            periodInFrames,
+                           0,
                            state.streamId)) {
             Log("IAudioClient3 format message could not be delivered. audio=%p stream=%llu",
                 audioClient,

@@ -56,6 +56,10 @@ struct RendererStats {
     std::int32_t bufferCapacityMs = 0;
     std::int64_t prebufferTargetFrames = 0;
     std::int32_t prebufferTargetMs = 0;
+    std::int64_t applicationBufferFrames = 0;
+    std::int32_t applicationBufferMs = 0;
+    std::int64_t effectiveTimelineFrames = 0;
+    std::int32_t effectiveTimelineMs = 0;
     std::uint32_t maximumRealPacketFrames = 0;
     std::int64_t underrunCount = 0;
     std::int64_t recentOutputFrames = 0;
@@ -72,6 +76,7 @@ struct RendererStats {
     std::int32_t asioPreferredBufferFrames = 0;
     std::int32_t asioBufferGranularity = 0;
     std::int32_t asioOutputSampleType = 0;
+    std::int32_t sampleConversionMode = 0;
     std::uint32_t asioSampleRate = 0;
     std::int64_t asioResetRequests = 0;
     std::int64_t asioBufferSizeChanges = 0;
@@ -173,6 +178,7 @@ public:
                const WAVEFORMATEXTENSIBLE& format,
                std::int32_t prebufferMs,
                std::int32_t maxBufferAdvanceMs,
+               std::uint32_t applicationBufferFrames,
                std::uint32_t requestedBufferFrames,
                std::int32_t requestedClockSourceIndex,
                std::wstring* outError);
@@ -201,6 +207,26 @@ public:
     long OnAsioMessage(long selector, long value, void* message, double* opt);
 
 private:
+    enum class SampleConversionMode : std::int32_t {
+        Direct = 0,
+        Float32ToInt32 = 1,
+        Int32ToFloat32 = 2,
+    };
+
+    enum class AsioFaultCode : std::uint32_t {
+        None = 0,
+        SampleRateChanged = 1,
+        ResetRequested = 2,
+        BufferSizeChanged = 3,
+        ResyncRequested = 4,
+        Overload = 5,
+        ReenteredCallback = 6,
+        InvalidBufferIndex = 7,
+        OutputPageOrder = 8,
+        OutputConfirmation = 9,
+        InvalidRendererBuffers = 10,
+    };
+
     struct OutputPageLedger {
         bool valid = false;
         std::uint64_t sequence = 0;
@@ -241,11 +267,15 @@ private:
                                      std::uint32_t frameCount,
                                      bool silence,
                                      std::wstring* outError);
+    const std::uint8_t* ConvertCapturedFramesLocked(const std::uint8_t* data,
+                                                    std::uint32_t frameCount);
     void MaintainTimelineLocked();
     void UpdateLogicalAdmissionLocked();
     bool ConfirmOutputPage(long doubleBufferIndex);
     void RollbackOutputPages();
-    bool LatchFault(const std::wstring& message, bool fromOutputCallback = false);
+    void RequestAsioFault(AsioFaultCode code, std::uint32_t detail = 0) noexcept;
+    void FinalizePendingAsioFault();
+    bool LatchFault(const std::wstring& message);
     void FillOutputBuffer(long doubleBufferIndex);
     void FillOutputBufferWithSilence(long doubleBufferIndex);
     void NotifyOutputReady();
@@ -291,12 +321,11 @@ private:
     std::atomic<bool> prebuffering_{false};
     std::atomic_flag callbackActive_ = ATOMIC_FLAG_INIT;
     volatile LONG callbackExecuting_ = FALSE;
-    std::atomic<DWORD> callbackThreadId_{0};
-    std::atomic<bool> deferredReentryFault_{false};
     std::atomic<std::int32_t> callbackRealtimeMode_{0};
 
     WAVEFORMATEXTENSIBLE format_{};
     SourceSampleKind sourceKind_ = SourceSampleKind::Unknown;
+    SampleConversionMode sampleConversionMode_ = SampleConversionMode::Direct;
     ASIOSampleType outputAsioSampleType_ = ASIOSTLastEntry;
     std::uint32_t outputBytesPerSample_ = 0;
     std::atomic<std::int32_t> outputReadyState_{0};
@@ -314,12 +343,15 @@ private:
     std::int32_t asioClockSourceIndex_ = -1;
     std::uint32_t prebufferFrames_ = 0;
     std::int32_t prebufferMs_ = 300;
+    std::uint32_t applicationBufferFrames_ = 0;
+    std::uint32_t effectiveTimelineFrames_ = 0;
     std::uint32_t maxBufferAdvanceFrames_ = 0;
     std::int32_t maxBufferAdvanceMs_ = 100;
     std::uint32_t minimumTimelineFrames_ = 0;
     std::uint64_t admittedTimelineEndFrame_ = 0;
     RawFrameRingBuffer ringBuffer_;
     std::vector<std::uint8_t> callbackBuffer_;
+    std::vector<std::uint32_t> conversionSamples_;
     std::array<OutputPageLedger, 2> outputPageLedgers_{};
     std::uint64_t nextDispatchSequence_ = 1;
     std::uint64_t nextConfirmSequence_ = 1;
@@ -345,6 +377,7 @@ private:
     std::atomic<std::int64_t> asioLatencyChanges_{0};
     std::atomic<std::int64_t> asioRebuildCount_{0};
     std::atomic<std::int32_t> asioLastMessage_{0};
+    std::atomic<std::uint64_t> pendingAsioFault_{0};
     std::atomic<bool> faultRequested_{false};
     std::atomic<bool> faulted_{false};
     mutable std::mutex faultMutex_;

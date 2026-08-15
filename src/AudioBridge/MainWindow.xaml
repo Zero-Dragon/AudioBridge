@@ -55,7 +55,6 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
@@ -173,7 +172,7 @@
             <NumberBox x:Name="PrebufferBox"
                        Grid.Row="1"
                        Grid.Column="1"
-                       Header="Prebuffer ms"
+                       Header="Extra prebuffer ms"
                        Width="180"
                        Minimum="0"
                        Maximum="10000"
@@ -208,7 +207,7 @@
                        Value="100"
                        SpinButtonPlacementMode="Inline"
                        ValueChanged="MaxBufferAdvanceBox_ValueChanged"
-                       ToolTipService.ToolTip="When real buffered audio falls below Prebuffer minus this value, AudioBridge keeps ASIO running with callback-local silence until the real queue returns to Prebuffer. Generated silence is never added to Buffer Fill." />
+                       ToolTipService.ToolTip="When the protected timeline falls below Extra prebuffer minus this value, AudioBridge keeps ASIO running with bridge-owned silence. The application's WASAPI buffer is added separately to the total retention budget." />
 
             <CheckBox x:Name="FakeOutputCheckBox"
                       Grid.Row="1"
@@ -219,17 +218,6 @@
                       VerticalAlignment="Bottom"
                       ToolTipService.ToolTip="Route the target into the bridge without opening the app's real shared output." />
 
-            <ComboBox x:Name="ClockSourceComboBox"
-                      Grid.Row="2"
-                      Grid.Column="0"
-                      Header="ASIO clock source"
-                      HorizontalAlignment="Stretch"
-                      MinWidth="420"
-                      DisplayMemberPath="Name"
-                      IsEnabled="False"
-                      PlaceholderText="Driver clock sources unavailable"
-                      SelectionChanged="ClockSourceComboBox_SelectionChanged"
-                      ToolTipService.ToolTip="Select a driver-reported clock source before opening the target. AudioBridge verifies the source during ASIO initialization." />
         </Grid>
 
         <Grid Grid.Row="1" ColumnSpacing="16">
@@ -288,45 +276,57 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="130" />
-                        <ColumnDefinition Width="150" />
+                        <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="130" />
-                        <ColumnDefinition Width="150" />
-                        <ColumnDefinition Width="150" />
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
 
-                    <TextBlock Text="Target PID" Opacity="0.72" />
-                    <TextBlock x:Name="TargetPidText" Grid.Column="1" Text="-" FontWeight="SemiBold" />
-                    <TextBlock Grid.Column="2" Text="Selected PID" Opacity="0.72" />
-                    <TextBlock x:Name="SelectedPidText" Grid.Column="3" Text="-" FontWeight="SemiBold" />
-                    <TextBlock Grid.Column="4" Text="State" Opacity="0.72" />
-                    <TextBlock x:Name="BridgeStateText" Grid.Column="5" Text="Idle" FontWeight="SemiBold" />
+                    <TextBlock Text="Selected PID" Opacity="0.72" />
+                    <TextBlock x:Name="SelectedPidText" Grid.Column="1" Text="-" FontWeight="SemiBold" />
+                    <TextBlock Grid.Column="2" Text="State" Opacity="0.72" />
+                    <TextBlock x:Name="BridgeStateText" Grid.Column="3" Text="Idle" FontWeight="SemiBold" />
 
                     <TextBlock Grid.Row="1" Text="Buffered" Opacity="0.72" />
                     <TextBlock x:Name="BufferedText" Grid.Row="1" Grid.Column="1" Text="0 ms" FontWeight="SemiBold" />
                     <TextBlock Grid.Row="1" Grid.Column="2" Text="Capacity" Opacity="0.72" />
                     <TextBlock x:Name="CapacityText" Grid.Row="1" Grid.Column="3" Text="0 ms" FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="1" Grid.Column="4" Text="Silent Last Minute" Opacity="0.72" />
-                    <TextBlock x:Name="SilentPercentText" Grid.Row="1" Grid.Column="5" Text="0.00%" FontWeight="SemiBold" />
 
                     <TextBlock Grid.Row="2" Text="Underruns" Opacity="0.72" />
                     <TextBlock x:Name="UnderrunText" Grid.Row="2" Grid.Column="1" Text="0" FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="2" Grid.Column="2" Text="ASIO Clock" Opacity="0.72" />
+                    <TextBlock Grid.Row="2" Grid.Column="2" Text="WASAPI Buffer" Opacity="0.72" />
+                    <TextBlock x:Name="WasapiBufferText" Grid.Row="2" Grid.Column="3" Text="0 ms" FontWeight="SemiBold" />
+
+                    <TextBlock Grid.Row="3" Text="Queued / Played" Opacity="0.72" />
+                    <TextBlock x:Name="FramesText" Grid.Row="3" Grid.Column="1" Text="0 / 0" FontWeight="SemiBold" />
+                    <TextBlock Grid.Row="3" Grid.Column="2" Text="ASIO Buffer" Opacity="0.72" />
+                    <TextBlock x:Name="AsioBufferText" Grid.Row="3" Grid.Column="3" Text="-" FontWeight="SemiBold" />
+
+                    <TextBlock Grid.Row="4" Text="ASIO Preferred" Opacity="0.72" />
+                    <TextBlock x:Name="AsioPreferredText" Grid.Row="4" Grid.Column="1" Text="-" FontWeight="SemiBold" />
+                    <TextBlock Grid.Row="4" Grid.Column="2" Text="ASIO Sample" Opacity="0.72" />
+                    <TextBlock x:Name="AsioSampleText" Grid.Row="4" Grid.Column="3" Text="-" FontWeight="SemiBold" />
+
+                    <TextBlock Grid.Row="5" Text="ASIO Range" Opacity="0.72" />
+                    <TextBlock x:Name="AsioRangeText" Grid.Row="5" Grid.Column="1" Text="-" FontWeight="SemiBold" />
+                    <TextBlock Grid.Row="5" Grid.Column="2" Text="ASIO Clock" Opacity="0.72" />
                     <TextBlock x:Name="AsioClockText"
-                               Grid.Row="2"
+                               Grid.Row="5"
                                Grid.Column="3"
                                Text="-"
                                TextTrimming="CharacterEllipsis"
                                FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="2" Grid.Column="4" Text="Queued / Played" Opacity="0.72" />
-                    <TextBlock x:Name="FramesText" Grid.Row="2" Grid.Column="5" Text="0 / 0" FontWeight="SemiBold" />
 
-                    <TextBlock Grid.Row="3" Text="Buffer Fill" Opacity="0.72" />
+                    <TextBlock Grid.Row="6" Text="ASIO Events" Opacity="0.72" />
+                    <TextBlock x:Name="AsioEventsText" Grid.Row="6" Grid.Column="1" Grid.ColumnSpan="3" Text="-" FontWeight="SemiBold" />
+
+                    <TextBlock Grid.Row="7" Text="Buffer Fill" Opacity="0.72" />
                     <ProgressBar x:Name="BufferProgress"
-                                 Grid.Row="3"
+                                 Grid.Row="7"
                                  Grid.Column="1"
                                  Grid.ColumnSpan="3"
                                  Minimum="0"
@@ -335,27 +335,6 @@
                                  Template="{StaticResource LeftAnchoredProgressBarTemplate}"
                                  Height="8"
                                  VerticalAlignment="Center" />
-                    <TextBlock Grid.Row="3" Grid.Column="4" Text="Silent %" Opacity="0.72" />
-                    <ProgressBar x:Name="SilentProgress"
-                                  Grid.Row="3"
-                                  Grid.Column="5"
-                                  Minimum="0"
-                                  Maximum="100"
-                                  Value="0"
-                                  Height="8"
-                                  VerticalAlignment="Center" />
-
-                    <TextBlock Grid.Row="4" Text="ASIO Buffer" Opacity="0.72" />
-                    <TextBlock x:Name="AsioBufferText" Grid.Row="4" Grid.Column="1" Text="-" FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="4" Grid.Column="2" Text="ASIO Preferred" Opacity="0.72" />
-                    <TextBlock x:Name="AsioPreferredText" Grid.Row="4" Grid.Column="3" Text="-" FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="4" Grid.Column="4" Text="ASIO Sample" Opacity="0.72" />
-                    <TextBlock x:Name="AsioSampleText" Grid.Row="4" Grid.Column="5" Text="-" FontWeight="SemiBold" />
-
-                    <TextBlock Grid.Row="5" Text="ASIO Range" Opacity="0.72" />
-                    <TextBlock x:Name="AsioRangeText" Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="3" Text="-" FontWeight="SemiBold" />
-                    <TextBlock Grid.Row="5" Grid.Column="4" Text="ASIO Events" Opacity="0.72" />
-                    <TextBlock x:Name="AsioEventsText" Grid.Row="5" Grid.Column="5" Text="-" FontWeight="SemiBold" />
                 </Grid>
 
                 <TextBlock x:Name="LastErrorText"

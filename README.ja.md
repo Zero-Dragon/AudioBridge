@@ -33,7 +33,7 @@ ASIO 出力に対応していないアプリでの利用を想定しています
 
 1. 対象アプリを完全に終了します。
 2. AudioBridge を起動し、Browse で対象アプリの `.exe` を選択します。
-3. ASIO output で DAC の ASIO ドライバーを選択します。ドライバーに複数のクロックソースがある場合は、ASIO clock source で選択します。
+3. ASIO output で DAC の ASIO ドライバーを選択します。AudioBridge はドライバーの現在のクロックソースを維持し、使用中のソースを Status に表示します。
 4. Open をクリックし、対象アプリで音声を再生します。
 5. Audio PIDs に PID が表示され、状態が `Output Active` になることを確認します。
 
@@ -42,6 +42,7 @@ ASIO 出力に対応していないアプリでの利用を想定しています
 - Windows の既定の音声出力と ASIO output に同じ機器を使用しないでください。
 - Browse では、音声を出力するメインの `.exe` を選択し、launcher や updater は選択しないでください。
 - AudioBridge はアプリの起動時に音声 PID を取得します。対象アプリを完全に終了してから、AudioBridge 経由で開いてください。
+- `Extra prebuffer ms` はアプリの WASAPI buffer に追加されるバッファーです。Status には実際の `WASAPI Buffer` が表示され、その合計を基準に内部タイムライン容量を計算します。
 - 実行ログは起動時刻ごとの名前で、通常はアプリと同じ場所の `logs` フォルダーに保存されます。書き込めない場合はローカルアプリデータへ保存されます。各ファイルは約 4 MiB に制限され、超過後は最新の内容を保持します。
 - 音が出ない場合は、Audio PID が表示されていなければ対象アプリの全プロセスを終了し、AudioBridge 経由で開き直してください。PID が表示されている場合は、ASIO ドライバー、サンプルレート、および画面上のエラーや underrun を確認してください。
 

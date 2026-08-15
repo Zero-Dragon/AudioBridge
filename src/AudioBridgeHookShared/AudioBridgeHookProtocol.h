@@ -15,8 +15,8 @@
 
 namespace audiobridge::hook_protocol {
 
-constexpr LONG kControlProtocolVersion = 6;
-constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControlV6";
+constexpr LONG kControlProtocolVersion = 7;
+constexpr wchar_t kControlMapName[] = L"Local\\AudioBridgeWasapiHookControlV7";
 
 constexpr DWORD kPipeMagic = 0x48504241;  // ABPH
 constexpr DWORD kPipeText = 1;
@@ -38,6 +38,11 @@ struct PipeFormatMessage {
     DWORD streamFlags = 0;
     DWORD shareMode = 0;
     DWORD periodFrames = 0;
+    // Capacity exposed by the fake WASAPI endpoint. Core combines this with
+    // the user-configured additional prebuffer when sizing the protected
+    // timeline and its hard retention boundary.
+    DWORD applicationBufferFrames = 0;
+    DWORD reserved = 0;
     std::uint64_t streamId = 0;
 };
 
@@ -90,8 +95,9 @@ struct HookControlBlock {
 
 static_assert(sizeof(PipeMessageHeader) == 24);
 static_assert(offsetof(PipeMessageHeader, payloadBytes) == 16);
-static_assert(sizeof(PipeFormatMessage) == 64);
-static_assert(offsetof(PipeFormatMessage, streamId) == 56);
+static_assert(sizeof(PipeFormatMessage) == 72);
+static_assert(offsetof(PipeFormatMessage, applicationBufferFrames) == 56);
+static_assert(offsetof(PipeFormatMessage, streamId) == 64);
 static_assert(sizeof(PipePcmMessage) == 32);
 static_assert(offsetof(PipePcmMessage, streamId) == 0);
 static_assert(offsetof(PipePcmMessage, sequence) == 8);

@@ -33,7 +33,7 @@ It is designed for applications without native ASIO output. Fake Output is enabl
 
 1. Fully exit the target application.
 2. Start AudioBridge and click Browse to select the application's `.exe`.
-3. Select the DAC driver under ASIO output. If the driver exposes multiple clock sources, choose one under ASIO clock source.
+3. Select the DAC driver under ASIO output. AudioBridge keeps the driver's current clock source and shows the active source in Status.
 4. Click Open, then start playback in the target application.
 5. Confirm that a PID appears under Audio PIDs and the status reaches `Output Active`.
 
@@ -42,6 +42,7 @@ It is designed for applications without native ASIO output. Fake Output is enabl
 - Do not use the same device for the Windows default audio output and ASIO output.
 - Under Browse, select the main `.exe` that produces audio, not a launcher or updater.
 - AudioBridge captures audio PIDs at application startup. Fully exit the target application, then open it through AudioBridge.
+- `Extra prebuffer ms` is added on top of the application's WASAPI buffer. Status shows the negotiated `WASAPI Buffer`, and their sum determines the internal timeline capacity.
 - Runtime logs are named by launch time and normally saved in the `logs` folder beside the application, with a local-app-data fallback when that folder is not writable. Each file is limited to about 4 MiB and retains the latest content.
 - If there is no sound: when no Audio PID appears, exit every process belonging to the target application and reopen it through AudioBridge. When a PID is present, check the ASIO driver, sample rate, and any error or underrun shown in the app.
 

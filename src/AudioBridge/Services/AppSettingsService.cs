@@ -9,7 +9,6 @@ internal sealed class AppSettingsState
     public int PrebufferMs { get; set; } = 300;
     public int MaxBufferAdvanceMs { get; set; } = 100;
     public int AsioBufferFrames { get; set; }
-    public int AsioClockSourceIndex { get; set; } = -1;
     public List<RecentTargetSetting> RecentTargets { get; set; } = [];
 }
 
@@ -48,7 +47,6 @@ internal static class AppSettingsService
         public int PrebufferMs { get; set; } = 300;
         public int MaxBufferAdvanceMs { get; set; } = 100;
         public int AsioBufferFrames { get; set; }
-        public int AsioClockSourceIndex { get; set; } = -1;
         public List<RecentTargetSetting>? RecentTargets { get; set; }
 
         // The first settings schema stored only this value. Reading it once
@@ -93,9 +91,6 @@ internal static class AppSettingsService
                 AsioBufferFrames = selectedDeviceId is null
                     ? 0
                     : Math.Clamp(ReadInt32(root, "asioBufferFrames", 0), 0, 8192),
-                AsioClockSourceIndex = selectedDeviceId is null
-                    ? -1
-                    : Math.Max(ReadInt32(root, "asioClockSourceIndex", -1), -1),
                 RecentTargets = recentTargets,
             };
         }
@@ -119,9 +114,6 @@ internal static class AppSettingsService
             AsioBufferFrames = selectedDeviceId is null
                 ? 0
                 : Math.Clamp(settings.AsioBufferFrames, 0, 8192),
-            AsioClockSourceIndex = selectedDeviceId is null
-                ? -1
-                : Math.Max(settings.AsioClockSourceIndex, -1),
             RecentTargets = NormalizeRecentTargets(settings.RecentTargets),
         };
 

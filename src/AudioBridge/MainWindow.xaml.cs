@@ -16,7 +16,7 @@ public sealed partial class MainWindow : Window
     private const int AutomaticClockSourceIndex = -1;
 
     private readonly ObservableCollection<AudioDeviceView> devices = new();
-    private readonly ObservableCollection<AsioClockSourceView> clockSources = new();
+    private readonly Dictionary<int, string> clockSourceNames = new();
     private readonly ObservableCollection<RecentTargetView> recentTargets = new();
     private readonly ObservableCollection<AudioPidView> pids = new();
     private readonly DispatcherQueueTimer pollTimer;
@@ -24,14 +24,12 @@ public sealed partial class MainWindow : Window
     private readonly SemaphoreSlim clockSourceRefreshLock = new(1, 1);
     private AppSettingsState settings = new();
     private bool suppressDeviceSelection;
-    private bool suppressClockSourceSelection;
     private bool suppressSettingsPersistence = true;
     private bool suppressTargetSelection;
     private bool suppressPidSelection;
     private bool nativeReady;
     private bool bridgeActive;
     private int clockSourceRefreshGeneration;
-    private int probedCurrentClockSourceIndex = -1;
     private bool clockSourceRefreshInProgress;
     private string clockSourceAvailabilityText = "-";
     private string lastLoggedPipelineError = "";
@@ -43,7 +41,6 @@ public sealed partial class MainWindow : Window
         SetWindowIcon();
 
         DeviceComboBox.ItemsSource = devices;
-        ClockSourceComboBox.ItemsSource = clockSources;
         ExePathBox.ItemsSource = recentTargets;
         ExePathBox.RegisterPropertyChangedCallback(
             ComboBox.TextProperty,
@@ -170,10 +167,6 @@ public sealed partial class MainWindow : Window
 
         settings.SelectedAsioDeviceId = selectedIndex >= 0 ? devices[selectedIndex].Id : null;
         settings.AsioBufferFrames = ReadAsioBufferFrames();
-        if (savedDeviceIndex < 0)
-        {
-            settings.AsioClockSourceIndex = AutomaticClockSourceIndex;
-        }
         var outputResult = AudioBridgeNative.ABC_SetOutputDevice(settings.SelectedAsioDeviceId);
         if (outputResult != 0)
         {
@@ -187,14 +180,9 @@ public sealed partial class MainWindow : Window
         var generation = ++clockSourceRefreshGeneration;
         var deviceId = (DeviceComboBox.SelectedItem as AudioDeviceView)?.Id;
 
-        suppressClockSourceSelection = true;
-        ClockSourceComboBox.SelectedItem = null;
-        clockSources.Clear();
-        suppressClockSourceSelection = false;
-        probedCurrentClockSourceIndex = -1;
+        clockSourceNames.Clear();
         clockSourceRefreshInProgress = true;
         clockSourceAvailabilityText = "Querying...";
-        ClockSourceComboBox.IsEnabled = false;
         AsioClockText.Text = string.IsNullOrWhiteSpace(deviceId) ? "-" : "Querying...";
         if (string.IsNullOrWhiteSpace(deviceId))
         {
@@ -219,7 +207,7 @@ public sealed partial class MainWindow : Window
             {
                 var result = AudioBridgeNative.ABC_RefreshClockSources(deviceId);
                 var error = result == 0 ? string.Empty : AudioBridgeNative.LastError();
-                var loadedSources = new List<AsioClockSourceView>();
+                var loadedSources = new List<(int Index, string Name, bool IsCurrent)>();
                 if (result == 0)
                 {
                     var count = AudioBridgeNative.ABC_GetClockSourceCount();
@@ -231,16 +219,12 @@ public sealed partial class MainWindow : Window
                         }
                         var name = AudioBridgeNative.ReadString((buffer, chars) =>
                             AudioBridgeNative.ABC_GetClockSourceName(position, buffer, chars));
-                        loadedSources.Add(new AsioClockSourceView
-                        {
-                            Index = info.Index,
-                            Name = string.IsNullOrWhiteSpace(name)
+                        loadedSources.Add((
+                            info.Index,
+                            string.IsNullOrWhiteSpace(name)
                                 ? $"Clock source {info.Index}"
                                 : name,
-                            AssociatedChannel = info.AssociatedChannel,
-                            AssociatedGroup = info.AssociatedGroup,
-                            IsCurrent = info.IsCurrent != 0,
-                        });
+                            info.IsCurrent != 0));
                     }
                 }
                 return (Result: result, Error: error, Sources: loadedSources);
@@ -258,53 +242,22 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            var automaticSource = new AsioClockSourceView
-            {
-                Index = AutomaticClockSourceIndex,
-                Name = "Automatic (driver current)",
-                AssociatedChannel = -1,
-                AssociatedGroup = -1,
-                IsCurrent = false,
-            };
-            clockSources.Add(automaticSource);
             foreach (var source in query.Sources)
             {
-                clockSources.Add(source);
+                clockSourceNames[source.Index] = source.Name;
             }
             var currentSource = query.Sources.FirstOrDefault(source => source.IsCurrent);
-            probedCurrentClockSourceIndex = currentSource?.Index ?? -1;
-            var savedSource = settings.AsioClockSourceIndex >= 0
-                ? query.Sources.FirstOrDefault(
-                    source => source.Index == settings.AsioClockSourceIndex)
-                : null;
-            var selectedSource = savedSource ?? automaticSource;
-
-            suppressClockSourceSelection = true;
-            ClockSourceComboBox.SelectedItem = selectedSource;
-            suppressClockSourceSelection = false;
-            ClockSourceComboBox.IsEnabled = query.Sources.Count > 0 && !bridgeActive;
             clockSourceAvailabilityText = query.Sources.Count == 0
                 ? "Driver managed"
-                : currentSource is null
+                : currentSource == default
                     ? "Current source not reported"
                     : $"{currentSource.Name} (driver current)";
             AsioClockText.Text = clockSourceAvailabilityText;
 
-            var desiredSourceIndex = savedSource?.Index ?? -1;
-            if (savedSource is null && settings.AsioClockSourceIndex >= 0)
-            {
-                settings.AsioClockSourceIndex = -1;
-                PersistSettings("Could not reset the unavailable ASIO clock source");
-            }
-            var selectResult = AudioBridgeNative.ABC_SetClockSource(desiredSourceIndex);
+            var selectResult = AudioBridgeNative.ABC_SetClockSource(AutomaticClockSourceIndex);
             if (selectResult != 0)
             {
-                settings.AsioClockSourceIndex = AutomaticClockSourceIndex;
-                suppressClockSourceSelection = true;
-                ClockSourceComboBox.SelectedItem = automaticSource;
-                suppressClockSourceSelection = false;
-                PersistSettings("Could not reset the rejected ASIO clock source");
-                AppendLog($"ASIO clock source selection failed: {AudioBridgeNative.LastError()}");
+                AppendLog($"Could not keep the ASIO driver current clock source: {AudioBridgeNative.LastError()}");
             }
         }
         catch (Exception ex)
@@ -321,7 +274,6 @@ public sealed partial class MainWindow : Window
             if (generation == clockSourceRefreshGeneration)
             {
                 clockSourceRefreshInProgress = false;
-                ClockSourceComboBox.IsEnabled = clockSources.Count > 1 && !bridgeActive;
             }
             clockSourceRefreshLock.Release();
             if (generation == clockSourceRefreshGeneration && !bridgeActive)
@@ -471,8 +423,6 @@ public sealed partial class MainWindow : Window
         var prebufferMs = ReadPrebufferMs();
         var maxBufferAdvanceMs = ReadMaxBufferAdvanceMs();
         var asioBufferFrames = ReadAsioBufferFrames();
-        var clockSourceIndex =
-            (ClockSourceComboBox.SelectedItem as AsioClockSourceView)?.Index ?? -1;
         var fakeOutput = FakeOutputCheckBox.IsChecked == true;
         var advanceResult = AudioBridgeNative.ABC_SetMaxBufferAdvanceMs(maxBufferAdvanceMs);
         if (advanceResult != 0)
@@ -482,13 +432,11 @@ public sealed partial class MainWindow : Window
             AppendLog($"Max buffer advance update failed: {error}");
             return;
         }
-        var clockResult = AudioBridgeNative.ABC_SetClockSource(clockSourceIndex);
+        var clockResult = AudioBridgeNative.ABC_SetClockSource(AutomaticClockSourceIndex);
         if (clockResult != 0)
         {
             var error = AudioBridgeNative.LastError();
-            clockSourceIndex = AutomaticClockSourceIndex;
-            _ = AudioBridgeNative.ABC_SetClockSource(clockSourceIndex);
-            AppendLog($"ASIO clock source update failed; using the driver current source: {error}");
+            AppendLog($"Could not keep the ASIO driver current clock source: {error}");
         }
         var result = AudioBridgeNative.ABC_StartTargetWithOptions3(
             exePath,
@@ -508,7 +456,6 @@ public sealed partial class MainWindow : Window
         OpenButton.IsEnabled = false;
         StopButton.IsEnabled = true;
         DeviceComboBox.IsEnabled = false;
-        ClockSourceComboBox.IsEnabled = false;
         bridgeActive = true;
         LastErrorText.Text = string.Empty;
         RememberSuccessfulTarget(exePath);
@@ -516,7 +463,6 @@ public sealed partial class MainWindow : Window
         settings.PrebufferMs = prebufferMs;
         settings.MaxBufferAdvanceMs = maxBufferAdvanceMs;
         settings.AsioBufferFrames = asioBufferFrames;
-        settings.AsioClockSourceIndex = clockSourceIndex;
         PersistSettings("Could not remember the current settings");
         AppendLog($"Opened target: {exePath} (Fake Output {(fakeOutput ? "on" : "off")})");
     }
@@ -539,7 +485,6 @@ public sealed partial class MainWindow : Window
         suppressSettingsPersistence = false;
         settings.SelectedAsioDeviceId = deviceId;
         settings.AsioBufferFrames = 0;
-        settings.AsioClockSourceIndex = -1;
         PersistSettings("Could not remember the selected ASIO output");
 
         var result = AudioBridgeNative.ABC_SetOutputDevice(deviceId);
@@ -549,34 +494,6 @@ public sealed partial class MainWindow : Window
             return;
         }
         _ = RefreshClockSourcesAsync();
-    }
-
-    private void ClockSourceComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (suppressClockSourceSelection || !nativeReady || bridgeActive ||
-            ClockSourceComboBox.SelectedItem is not AsioClockSourceView source)
-        {
-            return;
-        }
-
-        var previousIndex = settings.AsioClockSourceIndex;
-        var result = AudioBridgeNative.ABC_SetClockSource(source.Index);
-        if (result != 0)
-        {
-            var error = AudioBridgeNative.LastError();
-            suppressClockSourceSelection = true;
-            ClockSourceComboBox.SelectedItem = clockSources.FirstOrDefault(
-                item => item.Index == previousIndex) ??
-                clockSources.FirstOrDefault(item => item.Index == AutomaticClockSourceIndex);
-            suppressClockSourceSelection = false;
-            LastErrorText.Text = error;
-            AppendLog($"ASIO clock source selection failed: {error}");
-            return;
-        }
-
-        settings.AsioClockSourceIndex = source.Index;
-        PersistSettings("Could not remember the ASIO clock source");
-        AsioClockText.Text = ClockSourceStatusText(AutomaticClockSourceIndex);
     }
 
     private void PrebufferBox_ValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
@@ -677,12 +594,16 @@ public sealed partial class MainWindow : Window
 
     private void UpdateStatus(AudioBridgeNative.Status status)
     {
-        TargetPidText.Text = status.TargetPid == 0 ? "-" : status.TargetPid.ToString();
         SelectedPidText.Text = status.LockedAudioPid == 0 ? "-" : status.LockedAudioPid.ToString();
         BridgeStateText.Text = StateText(status);
         BufferedText.Text = $"{status.BufferedMs} ms";
         CapacityText.Text = $"{status.BufferCapacityMs} ms";
-        SilentPercentText.Text = $"{status.RecentSilentPercent:F2}%";
+        WasapiBufferText.Text = $"{status.WasapiBufferMs} ms";
+        ToolTipService.SetToolTip(
+            WasapiBufferText,
+            status.WasapiBufferFrames > 0
+                ? $"{status.WasapiBufferFrames:N0} frames; effective timeline {status.EffectiveTimelineMs} ms"
+                : "Waiting for a fake WASAPI stream");
         UnderrunText.Text = status.UnderrunCount.ToString("N0");
         FramesText.Text = $"{status.TotalFramesQueued:N0} / {status.TotalFramesPlayed:N0}";
         AsioBufferText.Text = status.AsioActualBufferFrames > 0
@@ -711,7 +632,6 @@ public sealed partial class MainWindow : Window
             ? Math.Clamp(status.BufferedFrames * 100.0 / status.BufferCapacityFrames, 0.0, 100.0)
             : 0.0;
         BufferProgress.Value = bufferPercent;
-        SilentProgress.Value = Math.Clamp(status.RecentSilentPercent, 0.0, 100.0);
 
         if (status.StreamActive < 0)
         {
@@ -734,8 +654,6 @@ public sealed partial class MainWindow : Window
             OpenButton.IsEnabled = !clockSourceRefreshInProgress;
             StopButton.IsEnabled = false;
             DeviceComboBox.IsEnabled = true;
-            ClockSourceComboBox.IsEnabled = clockSources.Count > 1 &&
-                                            !clockSourceRefreshInProgress;
         }
     }
 
@@ -1052,11 +970,9 @@ public sealed partial class MainWindow : Window
     {
         if (activeClockSourceIndex >= 0)
         {
-            var activeSource = clockSources.FirstOrDefault(
-                source => source.Index == activeClockSourceIndex);
-            return activeSource is null
+            return !clockSourceNames.TryGetValue(activeClockSourceIndex, out var activeSource)
                 ? $"Clock source {activeClockSourceIndex} (active)"
-                : $"{activeSource.Name} (active)";
+                : $"{activeSource} (active)";
         }
 
         if (clockSourceRefreshInProgress)
@@ -1064,21 +980,7 @@ public sealed partial class MainWindow : Window
             return "Querying...";
         }
 
-        if (settings.AsioClockSourceIndex >= 0)
-        {
-            var selectedSource = clockSources.FirstOrDefault(
-                source => source.Index == settings.AsioClockSourceIndex);
-            if (selectedSource is not null)
-            {
-                return $"{selectedSource.Name} (selected)";
-            }
-        }
-
-        var currentSource = clockSources.FirstOrDefault(
-            source => source.Index == probedCurrentClockSourceIndex);
-        return currentSource is null
-            ? clockSourceAvailabilityText
-            : $"{currentSource.Name} (driver current)";
+        return clockSourceAvailabilityText;
     }
 
     private void AppendLog(string message)
@@ -1103,8 +1005,6 @@ public sealed partial class MainWindow : Window
         OpenButton.IsEnabled = !clockSourceRefreshInProgress;
         StopButton.IsEnabled = false;
         DeviceComboBox.IsEnabled = true;
-        ClockSourceComboBox.IsEnabled = clockSources.Count > 1 &&
-                                        !clockSourceRefreshInProgress;
         AppendLog("Bridge stopped.");
     }
 

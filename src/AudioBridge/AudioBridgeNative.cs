@@ -44,6 +44,10 @@ internal static partial class AudioBridgeNative
         public long AsioRebuildCount;
         public int AsioLastMessage;
         public int AsioClockSourceIndex;
+        public long WasapiBufferFrames;
+        public int WasapiBufferMs;
+        public long EffectiveTimelineFrames;
+        public int EffectiveTimelineMs;
     }
 
     [StructLayout(LayoutKind.Sequential)]

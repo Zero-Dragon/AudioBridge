@@ -118,6 +118,17 @@ const wchar_t* AsioOutputReadyStateName(std::int32_t value) {
     }
 }
 
+const wchar_t* SampleConversionModeName(std::int32_t value) {
+    switch (value) {
+        case 1:
+            return L"float32-to-int32";
+        case 2:
+            return L"int32-to-float32";
+        default:
+            return L"direct";
+    }
+}
+
 std::int64_t FramesToMilliseconds(std::int64_t frames, std::uint32_t sampleRate) {
     if (frames <= 0 || sampleRate == 0) {
         return 0;
@@ -135,6 +146,7 @@ struct DeviceInfo {
 struct AudioStreamState {
     WAVEFORMATEXTENSIBLE format{};
     std::uint32_t bytesPerFrame = 0;
+    std::uint32_t applicationBufferFrames = 0;
     std::uint64_t lastFormatMs = 0;
     std::uint64_t lastPcmMs = 0;
     std::uint64_t formatSequence = 0;
@@ -1172,6 +1184,7 @@ private:
     std::int32_t rendererMaxBufferAdvanceMs_ = kDefaultMaxBufferAdvanceMs;
     std::int32_t rendererAsioBufferFrames_ = kDefaultAsioBufferFrames;
     std::int32_t rendererClockSourceIndex_ = -1;
+    std::uint32_t rendererApplicationBufferFrames_ = 0;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> targetExited_{false};
@@ -1304,6 +1317,7 @@ int32_t AudioBridgeCore::StartTarget(const wchar_t* exePath,
         rendererMaxBufferAdvanceMs_ = maxBufferAdvanceMs_;
         rendererAsioBufferFrames_ = asioBufferFrames_;
         rendererClockSourceIndex_ = clockSourceIndex_;
+        rendererApplicationBufferFrames_ = 0;
         targetPid_ = 0;
         targetExited_.store(false);
         lockedAudioPid_ = 0;
@@ -1465,6 +1479,7 @@ void AudioBridgeCore::Stop() {
         rendererMaxBufferAdvanceMs_ = maxBufferAdvanceMs_;
         rendererAsioBufferFrames_ = asioBufferFrames_;
         rendererClockSourceIndex_ = clockSourceIndex_;
+        rendererApplicationBufferFrames_ = 0;
     }
 }
 
@@ -1842,6 +1857,10 @@ int32_t AudioBridgeCore::GetStatus(ABC_Status* status) const {
     status->asioRebuildCount = stats.asioRebuildCount;
     status->asioLastMessage = stats.asioLastMessage;
     status->asioClockSourceIndex = stats.asioClockSourceIndex;
+    status->wasapiBufferFrames = stats.applicationBufferFrames;
+    status->wasapiBufferMs = stats.applicationBufferMs;
+    status->effectiveTimelineFrames = stats.effectiveTimelineFrames;
+    status->effectiveTimelineMs = stats.effectiveTimelineMs;
     return kOk;
 }
 
@@ -2069,13 +2088,15 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
              stats.prebufferExitCount <
                      rendererDiagnosticStats_.prebufferExitCount);
     if (!rendererDiagnosticBaselineValid_ || countersRestarted) {
-        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u active=%s fill=%d/%d ms capacity=%d ms packet=%u frames playerQueued=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld realtime=%s outputReady=%s underruns=%lld dropped=%lld",
+        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u active=%s fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms capacity=%d ms packet=%u frames playerQueued=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld realtime=%s outputReady=%s underruns=%lld dropped=%lld",
             pid,
             static_cast<unsigned long long>(streamId),
             stats.sourceSampleRate,
             stats.streamActive ? L"yes" : L"no",
             stats.bufferedMs,
             stats.prebufferTargetMs,
+            stats.applicationBufferMs,
+            stats.effectiveTimelineMs,
             stats.bufferCapacityMs,
             stats.maximumRealPacketFrames,
             static_cast<long long>(stats.totalFramesQueued),
@@ -2124,7 +2145,7 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
         const std::int64_t dropped =
                 delta(stats.totalFramesDropped,
                       rendererDiagnosticStats_.totalFramesDropped);
-        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld playerPending=%lld fill=%d/%d ms packet=%u frames underruns=+%lld dropped=+%lld",
+        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld playerPending=%lld fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms packet=%u frames underruns=+%lld dropped=+%lld",
             static_cast<unsigned long long>(nowMs - rendererDiagnosticLastMs_),
             pid,
             static_cast<unsigned long long>(streamId),
@@ -2142,6 +2163,8 @@ void AudioBridgeCore::LogRendererDiagnostics(std::uint64_t nowMs) {
             static_cast<long long>(inputFrames - confirmedFrames),
             stats.bufferedMs,
             stats.prebufferTargetMs,
+            stats.applicationBufferMs,
+            stats.effectiveTimelineMs,
             stats.maximumRealPacketFrames,
             static_cast<long long>(underruns),
             static_cast<long long>(dropped));
@@ -2192,6 +2215,7 @@ void AudioBridgeCore::LatchPipelineFaultLocked(const std::wstring& error) {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         rendererHasFormat_ = false;
+        rendererApplicationBufferFrames_ = 0;
         SetLastErrorLocked(message);
         AppendLogTextLocked(L"[fault] " + message + L"\r\n");
     }
@@ -2365,6 +2389,8 @@ void AudioBridgeCore::HandleFormatMessage(DWORD pid,
         const auto nowMs = NowMs();
         streamIt->second.format = message->format;
         streamIt->second.bytesPerFrame = bytesPerFrame;
+        streamIt->second.applicationBufferFrames =
+                message->applicationBufferFrames;
         streamIt->second.lastFormatMs = nowMs;
         state.latestStreamId = message->streamId;
         state.lastFormatMs = nowMs;
@@ -2603,6 +2629,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     std::int32_t maxBufferAdvanceMs = kDefaultMaxBufferAdvanceMs;
     std::int32_t asioBufferFrames = kDefaultAsioBufferFrames;
     std::int32_t clockSourceIndex = -1;
+    std::uint32_t applicationBufferFrames = 0;
     std::uint64_t streamId = 0;
     std::uint64_t submittedFrames = 0;
     std::uint32_t previousSampleRate = 0;
@@ -2621,6 +2648,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
             const auto* stream = FindAudioStream(pidIt->second, streamId);
             if (stream != nullptr) {
                 submittedFrames = stream->submittedFrames;
+                applicationBufferFrames = stream->applicationBufferFrames;
             }
         }
         configurationMatches = renderer_.IsRunning() &&
@@ -2631,6 +2659,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                 rendererMaxBufferAdvanceMs_ == maxBufferAdvanceMs &&
                 rendererAsioBufferFrames_ == asioBufferFrames &&
                 rendererClockSourceIndex_ == clockSourceIndex &&
+                rendererApplicationBufferFrames_ == applicationBufferFrames &&
                 WaveFormatsEqual(rendererFormat_, format);
     }
 
@@ -2649,7 +2678,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
     const std::uint64_t previousStreamId = publishedStreamId_;
     const RendererStats handoffStartStats = renderer_.GetStats();
     const std::int64_t pendingAtHandoff = renderer_.PendingTimelineFrames();
-    Log(L"Renderer handoff begin. oldStream=%llu newStream=%llu oldRate=%u newRate=%u running=%s sameConfiguration=%s pending=%lld frames (%lld ms) fill=%d/%d ms prebuffer=%s submittedOffset=%llu",
+    Log(L"Renderer handoff begin. oldStream=%llu newStream=%llu oldRate=%u newRate=%u running=%s sameConfiguration=%s pending=%lld frames (%lld ms) fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms prebuffer=%s submittedOffset=%llu",
         static_cast<unsigned long long>(previousStreamId),
         static_cast<unsigned long long>(streamId),
         previousSampleRate,
@@ -2661,6 +2690,8 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                 pendingAtHandoff, handoffStartStats.sourceSampleRate)),
         handoffStartStats.bufferedMs,
         handoffStartStats.prebufferTargetMs,
+        handoffStartStats.applicationBufferMs,
+        handoffStartStats.effectiveTimelineMs,
         handoffStartStats.prebuffering ? L"yes" : L"no",
         static_cast<unsigned long long>(submittedFrames));
 
@@ -2752,6 +2783,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
                 format,
                 prebufferMs,
                 maxBufferAdvanceMs,
+                applicationBufferFrames,
                 static_cast<std::uint32_t>(asioBufferFrames),
                 clockSourceIndex,
                 &error)) {
@@ -2766,6 +2798,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         rendererPid_ = 0;
         rendererDeviceId_.clear();
         rendererFormat_ = {};
+        rendererApplicationBufferFrames_ = 0;
         SetLastErrorLocked(error);
         AppendLogTextLocked(L"[renderer] " + error + L"\r\n");
         return false;
@@ -2794,6 +2827,7 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         rendererMaxBufferAdvanceMs_ = maxBufferAdvanceMs;
         rendererAsioBufferFrames_ = asioBufferFrames;
         rendererClockSourceIndex_ = clockSourceIndex;
+        rendererApplicationBufferFrames_ = applicationBufferFrames;
         SetLastErrorLocked(L"OK");
     }
 
@@ -2803,13 +2837,21 @@ bool AudioBridgeCore::StartRendererForFormatLocked(
         format.Format.nChannels,
         format.Format.wBitsPerSample,
         BytesPerFrame(format.Format));
-    Log(L"Renderer prebuffer target=%d ms", prebufferMs);
+    Log(L"Renderer additional prebuffer=%d ms applicationBuffer=%u frames (%lld ms) effectiveTimeline=%lld ms",
+        prebufferMs,
+        applicationBufferFrames,
+        static_cast<long long>(FramesToMilliseconds(
+                applicationBufferFrames, format.Format.nSamplesPerSec)),
+        static_cast<long long>(prebufferMs) + FramesToMilliseconds(
+                applicationBufferFrames, format.Format.nSamplesPerSec));
     Log(L"Renderer max buffer advance=%d ms", maxBufferAdvanceMs);
     Log(L"Renderer ASIO buffer request=%d frames (0=driver preferred)", asioBufferFrames);
     Log(L"Renderer ASIO clock source request=%d (-1=keep driver current)",
         clockSourceIndex);
     Log(L"Source sample rate is passed to ASIO without sample-rate conversion.");
-    Log(L"Strict realtime mode requires an exact source/ASIO sample-format match; only stereo deinterleaving remains in the callback.");
+    Log(L"Renderer sample conversion=%s",
+        SampleConversionModeName(renderer_.GetStats().sampleConversionMode));
+    Log(L"Realtime output uses an exact sample-format match or producer-side Float32/full Int32LSB conversion; only stereo deinterleaving remains in the ASIO callback.");
     Log(L"Renderer handoff complete. stream=%llu rate=%u elapsed=%llu ms prebuffer=%d ms maxAdvance=%d ms",
         static_cast<unsigned long long>(streamId),
         format.Format.nSamplesPerSec,

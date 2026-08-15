@@ -53,6 +53,10 @@ typedef struct ABC_Status {
     int64_t asioRebuildCount;
     int32_t asioLastMessage;
     int32_t asioClockSourceIndex;
+    int64_t wasapiBufferFrames;
+    int32_t wasapiBufferMs;
+    int64_t effectiveTimelineFrames;
+    int32_t effectiveTimelineMs;
 } ABC_Status;
 
 typedef struct ABC_ClockSourceInfo {
