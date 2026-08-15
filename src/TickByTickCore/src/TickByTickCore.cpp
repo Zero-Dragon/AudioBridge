@@ -121,11 +121,28 @@ const wchar_t* AsioOutputReadyStateName(std::int32_t value) {
 const wchar_t* SampleConversionModeName(std::int32_t value) {
     switch (value) {
         case 1:
-            return L"float32-to-int32";
+            return L"float-to-integer";
         case 2:
-            return L"int32-to-float32";
+            return L"integer-to-float";
+        case 3:
+            return L"integer-bit-depth";
         default:
             return L"direct";
+    }
+}
+
+const wchar_t* AsioSampleTypeName(std::int32_t value) {
+    switch (static_cast<ASIOSampleType>(value)) {
+        case ASIOSTFloat32LSB:
+            return L"Float32LSB";
+        case ASIOSTInt16LSB:
+            return L"Int16LSB";
+        case ASIOSTInt24LSB:
+            return L"Int24LSB";
+        case ASIOSTInt32LSB:
+            return L"Int32LSB";
+        default:
+            return L"unsupported";
     }
 }
 
@@ -2849,9 +2866,13 @@ bool TickByTickCore::StartRendererForFormatLocked(
     Log(L"Renderer ASIO clock source request=%d (-1=keep driver current)",
         clockSourceIndex);
     Log(L"Source sample rate is passed to ASIO without sample-rate conversion.");
-    Log(L"Renderer sample conversion=%s",
-        SampleConversionModeName(renderer_.GetStats().sampleConversionMode));
-    Log(L"Realtime output uses an exact sample-format match or producer-side Float32/full Int32LSB conversion; only stereo deinterleaving remains in the ASIO callback.");
+    const RendererStats initializedStats = renderer_.GetStats();
+    Log(L"Renderer sample format source=%s%u ASIO=%s conversion=%s",
+        SampleFormatValue(format) == 2 ? L"Float" : L"PCM",
+        format.Format.wBitsPerSample,
+        AsioSampleTypeName(initializedStats.asioOutputSampleType),
+        SampleConversionModeName(initializedStats.sampleConversionMode));
+    Log(L"Realtime output stores ASIO-native Float32/Int16/Int24/Int32 samples in the retained ring; all required sample conversion stays on the producer path and only stereo deinterleaving remains in the ASIO callback.");
     Log(L"Renderer handoff complete. stream=%llu rate=%u elapsed=%llu ms prebuffer=%d ms maxAdvance=%d ms",
         static_cast<unsigned long long>(streamId),
         format.Format.nSamplesPerSec,

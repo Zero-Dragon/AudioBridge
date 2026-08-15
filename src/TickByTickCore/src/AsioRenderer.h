@@ -209,8 +209,9 @@ public:
 private:
     enum class SampleConversionMode : std::int32_t {
         Direct = 0,
-        Float32ToInt32 = 1,
-        Int32ToFloat32 = 2,
+        FloatToInteger = 1,
+        IntegerToFloat = 2,
+        IntegerBitDepth = 3,
     };
 
     enum class AsioFaultCode : std::uint32_t {
@@ -331,7 +332,8 @@ private:
     std::atomic<std::int32_t> outputReadyState_{0};
     std::uint32_t sourceChannels_ = 0;
     std::uint32_t sourceBytesPerSample_ = 0;
-    std::uint32_t bytesPerFrame_ = 0;
+    std::uint32_t sourceBytesPerFrame_ = 0;
+    std::uint32_t outputBytesPerFrame_ = 0;
     std::uint32_t bufferFrames_ = 0;
     std::uint32_t requestedBufferFrames_ = 0;
     std::uint32_t minBufferFrames_ = 0;
@@ -351,7 +353,7 @@ private:
     std::uint64_t admittedTimelineEndFrame_ = 0;
     RawFrameRingBuffer ringBuffer_;
     std::vector<std::uint8_t> callbackBuffer_;
-    std::vector<std::uint32_t> conversionSamples_;
+    std::vector<std::uint8_t> conversionBuffer_;
     std::array<OutputPageLedger, 2> outputPageLedgers_{};
     std::uint64_t nextDispatchSequence_ = 1;
     std::uint64_t nextConfirmSequence_ = 1;

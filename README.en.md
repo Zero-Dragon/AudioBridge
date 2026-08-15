@@ -19,6 +19,7 @@ It is designed for applications without native ASIO output.
 ## Audio path
 
 - **Automatic sample-rate matching**: Matches the DAC sample rate when the input PCM format changes;
+- **Automatic sample-format adaptation**: Converts Float32, PCM16, PCM24, or PCM32 to the standard sample format required by the ASIO driver outside the real-time callback;
 - **DAC-clock-driven flow**: Advances audio data according to actual DAC consumption;
 - **Real-time ASIO output**: Processes audio data through ASIO with low overhead and high priority;
 - **Adjustable prebuffer**: Absorbs clock jitter caused by brief data-delivery gaps and thread scheduling.
@@ -54,7 +55,8 @@ It is designed for applications without native ASIO output.
 
 ## Limitations
 
-- Stereo audio only; no sample-rate conversion;
+- Stereo audio only; no sample-rate conversion. The ASIO driver must natively accept the source sample rate;
+- automatic adaptation is supported between standard ASIO `Float32LSB`, `Int16LSB`, `Int24LSB`, and `Int32LSB` sample formats; packed valid-bit and other specialized ASIO formats are unsupported;
 - applications using specialized audio interfaces or separate system services may not be captured;
 - DLL injection may trigger security software warnings. Launch only applications you trust.
 

@@ -125,6 +125,7 @@
   <ItemGroup>
     <ClInclude Include="include\TickByTickCore.h" />
     <ClInclude Include="src\AsioRenderer.h" />
+    <ClInclude Include="src\PcmSampleConverter.h" />
     <ClInclude Include="..\TickByTickHookShared\TickByTickHookProtocol.h" />
   </ItemGroup>
   <ItemGroup>

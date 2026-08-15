@@ -1,4 +1,5 @@
 #include "AsioRenderer.h"
+#include "PcmSampleConverter.h"
 
 #include <avrt.h>
 
@@ -474,12 +475,35 @@ bool IsDirectSampleFormat(AsioRenderer::SourceSampleKind sourceKind,
     }
 }
 
-bool IsFloatInt32Conversion(AsioRenderer::SourceSampleKind sourceKind,
-                            ASIOSampleType outputType) {
-    return (sourceKind == AsioRenderer::SourceSampleKind::Float32 &&
-            outputType == ASIOSTInt32LSB) ||
-           (sourceKind == AsioRenderer::SourceSampleKind::Pcm32 &&
-            outputType == ASIOSTFloat32LSB);
+pcm::SampleFormat SourcePcmSampleFormat(
+        AsioRenderer::SourceSampleKind sourceKind) {
+    switch (sourceKind) {
+        case AsioRenderer::SourceSampleKind::Float32:
+            return pcm::SampleFormat::Float32;
+        case AsioRenderer::SourceSampleKind::Pcm16:
+            return pcm::SampleFormat::Int16;
+        case AsioRenderer::SourceSampleKind::Pcm24:
+            return pcm::SampleFormat::Int24;
+        case AsioRenderer::SourceSampleKind::Pcm32:
+            return pcm::SampleFormat::Int32;
+        default:
+            return pcm::SampleFormat::Unknown;
+    }
+}
+
+pcm::SampleFormat AsioPcmSampleFormat(ASIOSampleType outputType) {
+    switch (outputType) {
+        case ASIOSTFloat32LSB:
+            return pcm::SampleFormat::Float32;
+        case ASIOSTInt16LSB:
+            return pcm::SampleFormat::Int16;
+        case ASIOSTInt24LSB:
+            return pcm::SampleFormat::Int24;
+        case ASIOSTInt32LSB:
+            return pcm::SampleFormat::Int32;
+        default:
+            return pcm::SampleFormat::Unknown;
+    }
 }
 
 const wchar_t* SourceSampleKindName(AsioRenderer::SourceSampleKind sourceKind) {
@@ -898,12 +922,15 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
         std::lock_guard<std::mutex> lock(mutex_);
         ResetStats();
         format_ = format;
-        bytesPerFrame_ = BytesPerFrame(format_.Format);
+        sourceBytesPerFrame_ = BytesPerFrame(format_.Format);
         sampleRate_ = format_.Format.nSamplesPerSec;
         asioSampleRate_ = sampleRate_;
         sourceChannels_ = format_.Format.nChannels;
         sourceBytesPerSample_ =
-                sourceChannels_ == 0 ? 0 : bytesPerFrame_ / sourceChannels_;
+                sourceChannels_ == 0
+                ? 0
+                : sourceBytesPerFrame_ / sourceChannels_;
+        outputBytesPerFrame_ = 0;
         sourceKind_ = SourceKindFromWave(format_);
         prebufferMs_ = static_cast<std::int32_t>(NormalizePrebufferMs(prebufferMs));
         prebufferFrames_ = FramesFromMs(sampleRate_, static_cast<std::uint32_t>(prebufferMs_));
@@ -941,7 +968,7 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
         bufferGranularity_ = 0;
         asioClockSourceIndex_ = -1;
 
-        if (bytesPerFrame_ == 0 || sampleRate_ == 0 ||
+        if (sourceBytesPerFrame_ == 0 || sampleRate_ == 0 ||
             sourceChannels_ != 2 || sourceBytesPerSample_ == 0 ||
             sourceKind_ == SourceSampleKind::Unknown) {
             if (outError != nullptr) {
@@ -1033,7 +1060,7 @@ void AsioRenderer::Stop() {
             false, PrebufferTransitionReason::Stop, ringBuffer_.AvailableReadFrames());
     ringBuffer_.Clear();
     callbackBuffer_.clear();
-    conversionSamples_.clear();
+    conversionBuffer_.clear();
     bufferFrames_ = 0;
     requestedBufferFrames_ = 0;
     applicationBufferFrames_ = 0;
@@ -1046,6 +1073,7 @@ void AsioRenderer::Stop() {
     asioClockSourceIndex_ = -1;
     outputAsioSampleType_ = ASIOSTLastEntry;
     outputBytesPerSample_ = 0;
+    outputBytesPerFrame_ = 0;
     sampleConversionMode_ = SampleConversionMode::Direct;
     outputReadyState_.store(0, std::memory_order_relaxed);
     capturedDrainActive_.store(false, std::memory_order_release);
@@ -1154,56 +1182,31 @@ const std::uint8_t* AsioRenderer::ConvertCapturedFramesLocked(
     if (sampleConversionMode_ == SampleConversionMode::Direct) {
         return data;
     }
-    if (data == nullptr || sourceChannels_ != 2 || sourceBytesPerSample_ != 4) {
+    if (data == nullptr || sourceChannels_ != 2 ||
+        sourceBytesPerSample_ == 0 || outputBytesPerSample_ == 0) {
         return nullptr;
     }
 
     const std::uint64_t sampleCount64 =
             static_cast<std::uint64_t>(frameCount) * sourceChannels_;
-    if (sampleCount64 > conversionSamples_.size()) {
+    const std::uint64_t requiredBytes64 =
+            sampleCount64 * outputBytesPerSample_;
+    if (sampleCount64 > (std::numeric_limits<std::size_t>::max)() ||
+        requiredBytes64 > conversionBuffer_.size()) {
         return nullptr;
     }
     const std::size_t sampleCount = static_cast<std::size_t>(sampleCount64);
-
-    if (sampleConversionMode_ == SampleConversionMode::Float32ToInt32) {
-        for (std::size_t sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
-            float sample = 0.0f;
-            std::memcpy(&sample,
-                        data + sampleIndex * sizeof(sample),
-                        sizeof(sample));
-
-            std::int32_t converted = 0;
-            if (std::isnan(sample)) {
-                converted = 0;
-            } else if (sample >= 1.0f) {
-                converted = (std::numeric_limits<std::int32_t>::max)();
-            } else if (sample <= -1.0f) {
-                converted = (std::numeric_limits<std::int32_t>::min)();
-            } else {
-                converted = static_cast<std::int32_t>(
-                        static_cast<double>(sample) * 2147483648.0);
-            }
-            std::memcpy(&conversionSamples_[sampleIndex],
-                        &converted,
-                        sizeof(converted));
-        }
-    } else if (sampleConversionMode_ == SampleConversionMode::Int32ToFloat32) {
-        constexpr float kInt32Scale = 1.0f / 2147483648.0f;
-        for (std::size_t sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
-            std::int32_t sample = 0;
-            std::memcpy(&sample,
-                        data + sampleIndex * sizeof(sample),
-                        sizeof(sample));
-            const float converted = static_cast<float>(sample) * kInt32Scale;
-            std::memcpy(&conversionSamples_[sampleIndex],
-                        &converted,
-                        sizeof(converted));
-        }
-    } else {
+    const pcm::SampleFormat sourceFormat = SourcePcmSampleFormat(sourceKind_);
+    const pcm::SampleFormat outputFormat =
+            AsioPcmSampleFormat(outputAsioSampleType_);
+    if (!pcm::ConvertSamples(data,
+                             sourceFormat,
+                             conversionBuffer_.data(),
+                             outputFormat,
+                             sampleCount)) {
         return nullptr;
     }
-
-    return reinterpret_cast<const std::uint8_t*>(conversionSamples_.data());
+    return conversionBuffer_.data();
 }
 
 RendererStats AsioRenderer::GetStats() const {
@@ -1905,22 +1908,41 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
         }
         return false;
     }
+    const pcm::SampleFormat sourceSampleFormat =
+            SourcePcmSampleFormat(sourceKind_);
+    const pcm::SampleFormat outputSampleFormat =
+            AsioPcmSampleFormat(firstChannel.type);
     SampleConversionMode conversionMode = SampleConversionMode::Direct;
-    if (IsDirectSampleFormat(sourceKind_, firstChannel.type) &&
-        outputBytesPerSample == sourceBytesPerSample_) {
-        conversionMode = SampleConversionMode::Direct;
-    } else if (IsFloatInt32Conversion(sourceKind_, firstChannel.type) &&
-               outputBytesPerSample == 4 && sourceBytesPerSample_ == 4) {
-        conversionMode = sourceKind_ == SourceSampleKind::Float32
-                ? SampleConversionMode::Float32ToInt32
-                : SampleConversionMode::Int32ToFloat32;
-    } else {
+    if (sourceSampleFormat == pcm::SampleFormat::Unknown ||
+        outputSampleFormat == pcm::SampleFormat::Unknown) {
         if (outError != nullptr) {
-            std::wstring message = L"ASIO output requires an exact sample-format match or Float32/full Int32LSB conversion. Source=";
+            std::wstring message = L"ASIO output sample conversion is unsupported. Source=";
             message += SourceSampleKindName(sourceKind_);
             message += L", ASIO=";
             message += AsioSampleTypeName(firstChannel.type);
-            message += L". Integer bit-depth changes and packed valid-bit formats are not supported.";
+            message += L". Standard Float32LSB, Int16LSB, Int24LSB, and Int32LSB formats are supported; packed valid-bit ASIO formats are rejected.";
+            *outError = message;
+        }
+        return false;
+    }
+    if (IsDirectSampleFormat(sourceKind_, firstChannel.type) &&
+        outputBytesPerSample == sourceBytesPerSample_) {
+        conversionMode = SampleConversionMode::Direct;
+    } else if (sourceSampleFormat == pcm::SampleFormat::Float32 &&
+               pcm::IsIntegerFormat(outputSampleFormat)) {
+        conversionMode = SampleConversionMode::FloatToInteger;
+    } else if (pcm::IsIntegerFormat(sourceSampleFormat) &&
+               outputSampleFormat == pcm::SampleFormat::Float32) {
+        conversionMode = SampleConversionMode::IntegerToFloat;
+    } else if (pcm::IsIntegerFormat(sourceSampleFormat) &&
+               pcm::IsIntegerFormat(outputSampleFormat)) {
+        conversionMode = SampleConversionMode::IntegerBitDepth;
+    } else {
+        if (outError != nullptr) {
+            std::wstring message = L"ASIO output sample conversion is unsupported. Source=";
+            message += SourceSampleKindName(sourceKind_);
+            message += L", ASIO=";
+            message += AsioSampleTypeName(firstChannel.type);
             *outError = message;
         }
         return false;
@@ -1936,6 +1958,7 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
         bufferGranularity_ = granularity;
         outputAsioSampleType_ = firstChannel.type;
         outputBytesPerSample_ = outputBytesPerSample;
+        outputBytesPerFrame_ = outputBytesPerSample_ * sourceChannels_;
         sampleConversionMode_ = conversionMode;
         outputReadyState_.store(0, std::memory_order_relaxed);
         channelInfos_[0] = firstChannel;
@@ -1958,7 +1981,7 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
             }
             const std::uint32_t ringFrames =
                     static_cast<std::uint32_t>(ringFrames64);
-            if (!ringBuffer_.Reset(bytesPerFrame_, ringFrames)) {
+            if (!ringBuffer_.Reset(outputBytesPerFrame_, ringFrames)) {
                 if (outError != nullptr) {
                     *outError = L"Failed to allocate ASIO PCM ring buffer.";
                 }
@@ -1984,23 +2007,24 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
             }
         }
         if (sampleConversionMode_ == SampleConversionMode::Direct) {
-            conversionSamples_.clear();
+            conversionBuffer_.clear();
         } else {
             const std::uint64_t conversionFrameCapacity =
                     (std::max<std::uint64_t>)(sampleRate_, applicationBufferFrames_);
-            const std::uint64_t conversionSampleCapacity =
-                    conversionFrameCapacity * sourceChannels_;
-            if (conversionSampleCapacity >
+            const std::uint64_t conversionByteCapacity =
+                    conversionFrameCapacity * outputBytesPerFrame_;
+            if (conversionByteCapacity >
                 (std::numeric_limits<std::size_t>::max)()) {
                 if (outError != nullptr) {
-                    *outError = L"The Float32/Int32 conversion buffer is too large.";
+                    *outError = L"The PCM sample conversion buffer is too large.";
                 }
                 return false;
             }
-            conversionSamples_.assign(
-                    static_cast<std::size_t>(conversionSampleCapacity), 0);
+            conversionBuffer_.assign(
+                    static_cast<std::size_t>(conversionByteCapacity), 0);
         }
-        callbackBuffer_.assign(static_cast<std::size_t>(bufferFrames_) * bytesPerFrame_, 0);
+        callbackBuffer_.assign(
+                static_cast<std::size_t>(bufferFrames_) * outputBytesPerFrame_, 0);
     }
 
     bufferInfos_[0] = {};
@@ -2326,7 +2350,7 @@ bool AsioRenderer::LatchFault(const std::wstring& message) {
 
 void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
     if (doubleBufferIndex < 0 || doubleBufferIndex > 1 ||
-        bufferFrames_ == 0 || bytesPerFrame_ == 0 || callbackBuffer_.empty()) {
+        bufferFrames_ == 0 || outputBytesPerFrame_ == 0 || callbackBuffer_.empty()) {
         FillOutputBufferWithSilence(doubleBufferIndex);
         RequestAsioFault(AsioFaultCode::InvalidRendererBuffers);
         NotifyOutputReady();
@@ -2339,9 +2363,11 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
     const std::uint32_t underrunSilentFrames = bufferFrames_ - dispatched.frames;
     if (underrunSilentFrames > 0) {
         std::memset(callbackBuffer_.data() +
-                            static_cast<std::size_t>(dispatched.frames) * bytesPerFrame_,
+                            static_cast<std::size_t>(dispatched.frames) *
+                                    outputBytesPerFrame_,
                     0,
-                    static_cast<std::size_t>(underrunSilentFrames) * bytesPerFrame_);
+                    static_cast<std::size_t>(underrunSilentFrames) *
+                            outputBytesPerFrame_);
     }
 
     WriteDirectOutput(callbackBuffer_.data(), bufferFrames_, doubleBufferIndex);
@@ -2399,7 +2425,7 @@ void AsioRenderer::WriteDirectOutput(const std::uint8_t* interleaved,
         return;
     }
 
-    switch (sourceBytesPerSample_) {
+    switch (outputBytesPerSample_) {
         case 2:
             DeinterleaveStereo<2>(interleaved, left, right, frameCount);
             break;
