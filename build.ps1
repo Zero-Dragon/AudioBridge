@@ -11,8 +11,9 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $sourceRoot = $PSScriptRoot
-$solutionPath = Join-Path $sourceRoot "AudioBridge.sln"
-$appProjectPath = Join-Path $sourceRoot "src\AudioBridge\AudioBridge.csproj"
+$solutionPath = Join-Path $sourceRoot "TickByTick.sln"
+$appProjectPath = Join-Path $sourceRoot "src\TickByTick\TickByTick.csproj"
+$hookProjectPath = Join-Path $sourceRoot "src\TickByTickHook\TickByTickHook.vcxproj"
 
 function Find-MSBuild {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
@@ -75,13 +76,19 @@ function Build-Architecture {
         & dotnet restore $appProjectPath "-p:Platform=$Platform"
     }
 
+    if ($Platform -eq "x64") {
+        Invoke-Checked "build $Configuration Win32 hook prerequisite" {
+            & $script:msbuildPath $hookProjectPath "/m" "/t:Build" "/p:Configuration=$Configuration" "/p:Platform=Win32" "/p:PlatformToolset=$script:platformToolset" "/verbosity:minimal"
+        }
+    }
+
     Invoke-Checked "build $Configuration $Platform" {
         & $script:msbuildPath $solutionPath "/m" "/t:Build" "/p:Configuration=$Configuration" "/p:Platform=$Platform" "/p:RuntimeIdentifier=$RuntimeIdentifier" "/p:PlatformToolset=$script:platformToolset" "/verbosity:minimal"
     }
 }
 
 if (-not (Test-Path -LiteralPath $solutionPath) -or -not (Test-Path -LiteralPath $appProjectPath)) {
-    throw "Run this script from an intact AudioBridge source checkout."
+    throw "Run this script from an intact Tick By Tick source checkout."
 }
 
 $script:msbuildPath = Find-MSBuild
@@ -98,4 +105,4 @@ if ($Architecture -in @("all", "x86")) {
     Build-Architecture "x86" "win-x86"
 }
 
-Write-Host "[done] AudioBridge build completed."
+Write-Host "[done] Tick By Tick build completed."
