@@ -14,7 +14,14 @@
 
 Tick By Tick is a Windows audio utility. It launches a selected music player or other application, captures its audio, and routes it directly to a DAC through an ASIO driver.
 
-It is designed for applications without native ASIO output. Fake Output is enabled by default and silences the target application's normal WASAPI output, preventing duplicate playback through both the standard Windows output and the ASIO device.
+It is designed for applications without native ASIO output.
+
+## Audio path
+
+- **Automatic sample-rate matching**: Matches the DAC sample rate when the input PCM format changes;
+- **DAC-clock-driven flow**: Advances audio data according to actual DAC consumption;
+- **Real-time ASIO output**: Processes audio data through ASIO with low overhead and high priority;
+- **Adjustable prebuffer**: Absorbs clock jitter caused by brief data-delivery gaps and thread scheduling.
 
 ## Preview
 
@@ -33,17 +40,16 @@ It is designed for applications without native ASIO output. Fake Output is enabl
 
 1. Fully exit the target application.
 2. Start Tick By Tick and click Browse to select the application's `.exe`.
-3. Select the DAC driver under ASIO output. Tick By Tick keeps the driver's current clock source and shows the active source in Status.
+3. Select the DAC driver under ASIO output.
 4. Click Open, then start playback in the target application.
 5. Confirm that a PID appears under Audio PIDs and the status reaches `Output Active`.
 
 ### Notes
 
 - Do not use the same device for the Windows default audio output and ASIO output.
-- Under Browse, select the main `.exe` that produces audio, not a launcher or updater.
-- Tick By Tick captures audio PIDs at application startup. Fully exit the target application, then open it through Tick By Tick.
-- `Extra prebuffer ms` is added on top of the application's WASAPI buffer. Status shows the negotiated `WASAPI Buffer`, and their sum determines the internal timeline capacity.
-- Runtime logs are named by launch time and normally saved in the `logs` folder beside the application, with a local-app-data fallback when that folder is not writable. Each file is limited to about 4 MiB and retains the latest content.
+- Select the main `.exe` that produces audio, not a launcher or updater.
+- Audio PIDs must be captured when the application starts. Fully exit the target application, then open it through Tick By Tick.
+- Fake Output is enabled by default and silences the target application's normal WASAPI output, preventing duplicate playback through both the standard Windows output and the ASIO device.
 - If there is no sound: when no Audio PID appears, exit every process belonging to the target application and reopen it through Tick By Tick. When a PID is present, check the ASIO driver, sample rate, and any error or underrun shown in the app.
 
 ## Limitations

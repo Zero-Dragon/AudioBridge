@@ -14,7 +14,14 @@
 
 Tick By Tick 是一个 Windows 音频辅助工具。它可以从工具内启动音乐播放器或其他应用，捕获应用的声音，并通过 ASIO 驱动直接输出到 DAC。
 
-它适合本身不支持 ASIO、但希望绕过普通 Windows 共享输出的应用。默认开启的 Fake Output 会将原来的 WASAPI 输出静音，避免声音同时从普通扬声器和 ASIO 设备播放。
+它适合本身不支持 ASIO、但希望绕过普通 Windows 共享输出的应用。
+
+## 音频链路
+
+- **采样率自动跟随**：输入PCM格式变化时自动匹配 DAC 采样率
+- **DAC 时钟驱动**：以 DAC 的实际消费推动音频数据流动
+- **实时 ASIO 输出**： ASIO 低负载高优先级采集数据
+- **可调预缓冲**：吸收短时数据提交与线程调度产生时钟抖动
 
 ## 运行预览
 
@@ -33,17 +40,16 @@ Tick By Tick 是一个 Windows 音频辅助工具。它可以从工具内启动�
 
 1. 完全退出目标应用。
 2. 启动 Tick By Tick，点击 Browse 选择目标应用的 `.exe`。
-3. 在 ASIO output 中选择 DAC 的 ASIO 驱动；Tick By Tick 保持驱动当前时钟源，并在状态区显示实际使用的时钟。
+3. 在 ASIO output 中选择 DAC 的 ASIO 驱动；
 4. 点击 Open，再在目标应用中开始播放音频。
 5. 确认 Audio PIDs 中出现 PID，状态变为 `Output Active`。
 
 ### 注意
 
 - Windows 默认音频输出与 ASIO output 不要使用同一台设备；
-- Browse 请选择实际播放音频的主程序 `.exe`，不要选择 launcher 或 updater；
-- Tick By Tick 需要在应用启动时捕获音频 PID，请先完全退出目标应用，再通过 Tick By Tick 打开；
-- `Extra prebuffer ms` 是叠加在应用 WASAPI buffer 之外的额外缓冲；状态区会显示应用实际获得的 `WASAPI Buffer`，两者之和用于计算内部时间线容量；
-- 运行日志按启动时间保存在程序目录的 `logs` 文件夹中（目录不可写时回退到本地应用数据目录）；单个文件最大约 4 MiB，超出后保留最新内容；
+- 请选择实际播放音频的主程序 `.exe`，不要选择 launcher 或 updater；
+- 需要在应用启动时捕获音频 PID，请先完全退出目标应用，再通过 Tick By Tick 打开；
+- 默认开启的 Fake Output 会将原来的 WASAPI 输出静音，避免声音同时从普通扬声器和 ASIO 设备播放。
 - 如果没有声音：没有 Audio PID 时，请退出目标应用的所有进程并重新打开；已经有 PID 时，请检查 ASIO 驱动、采样率和界面中的错误或 underrun 信息。
 
 ## 使用限制
