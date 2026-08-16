@@ -12,12 +12,14 @@
 
 #include <windows.h>
 #include <appmodel.h>
+#include <appxpackaging.h>
 #include <audiopolicy.h>
 #include <ks.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
 #include <sddl.h>
 #include <shobjidl_core.h>
+#include <shlwapi.h>
 #include <tlhelp32.h>
 #include <wrl/client.h>
 
@@ -209,6 +211,12 @@ enum class PackageIdentityQueryResult {
     NoPackage,
     Found,
     Failed,
+};
+
+enum class PackagedPathResolutionResult {
+    NotPackaged,
+    Found,
+    Invalid,
 };
 
 std::wstring HResultMessage(const wchar_t* action, HRESULT result);
@@ -761,6 +769,405 @@ std::wstring NormalizePathForComparison(const std::filesystem::path& path) {
         result.erase(0, 4);
     }
     return Lowercase(std::move(result));
+}
+
+bool IsPathWithin(const std::filesystem::path& path,
+                  const std::filesystem::path& parent) {
+    std::wstring normalizedPath = NormalizePathForComparison(path);
+    std::wstring normalizedParent = NormalizePathForComparison(parent);
+    while (normalizedParent.size() > 3 &&
+           (normalizedParent.back() == L'\\' || normalizedParent.back() == L'/')) {
+        normalizedParent.pop_back();
+    }
+    if (normalizedPath == normalizedParent) {
+        return true;
+    }
+    if (normalizedParent.empty()) {
+        return false;
+    }
+    normalizedParent.push_back(L'\\');
+    return normalizedPath.size() > normalizedParent.size() &&
+            normalizedPath.compare(0, normalizedParent.size(), normalizedParent) == 0;
+}
+
+bool IsWindowsAppsPath(const std::filesystem::path& path) {
+    std::wstring programFiles(32768, L'\0');
+    const DWORD chars = GetEnvironmentVariableW(
+            L"ProgramFiles", programFiles.data(), static_cast<DWORD>(programFiles.size()));
+    if (chars == 0 || chars >= programFiles.size()) {
+        return false;
+    }
+    programFiles.resize(chars);
+    return IsPathWithin(path, std::filesystem::path(programFiles) / L"WindowsApps");
+}
+
+std::filesystem::path FindPackageManifestRoot(const std::filesystem::path& executablePath) {
+    std::filesystem::path current;
+    try {
+        current = std::filesystem::absolute(executablePath).lexically_normal().parent_path();
+    } catch (...) {
+        current = executablePath.parent_path();
+    }
+
+    for (int depth = 0; depth < 32 && !current.empty(); ++depth) {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(current / L"AppxManifest.xml", error) && !error) {
+            return current;
+        }
+        const auto parent = current.parent_path();
+        if (parent.empty() || parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return {};
+}
+
+std::wstring NormalizePackageRelativePath(std::filesystem::path path) {
+    path = path.lexically_normal();
+    path.make_preferred();
+    std::wstring result = path.wstring();
+    while (result.size() >= 2 && result[0] == L'.' &&
+           (result[1] == L'\\' || result[1] == L'/')) {
+        result.erase(0, 2);
+    }
+    std::replace(result.begin(), result.end(), L'/', L'\\');
+    return Lowercase(std::move(result));
+}
+
+bool PackageFamilyNameFromFullNameString(const std::wstring& packageFullName,
+                                         std::wstring* packageFamilyName,
+                                         LONG* queryError) {
+    if (packageFamilyName != nullptr) {
+        packageFamilyName->clear();
+    }
+    UINT32 chars = 0;
+    LONG result = PackageFamilyNameFromFullName(packageFullName.c_str(), &chars, nullptr);
+    if (result != ERROR_INSUFFICIENT_BUFFER || chars == 0) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+
+    std::wstring value(chars, L'\0');
+    result = PackageFamilyNameFromFullName(packageFullName.c_str(), &chars, value.data());
+    if (result != ERROR_SUCCESS) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+    if (!value.empty() && value.back() == L'\0') {
+        value.pop_back();
+    }
+    if (value.empty()) {
+        if (queryError != nullptr) {
+            *queryError = ERROR_INVALID_DATA;
+        }
+        return false;
+    }
+    if (packageFamilyName != nullptr) {
+        *packageFamilyName = std::move(value);
+    }
+    if (queryError != nullptr) {
+        *queryError = ERROR_SUCCESS;
+    }
+    return true;
+}
+
+bool IsPackageRegisteredForCurrentUser(const std::wstring& packageFamilyName,
+                                       const std::wstring& expectedPackageFullName,
+                                       LONG* queryError) {
+    UINT32 count = 0;
+    UINT32 bufferChars = 0;
+    LONG result = GetPackagesByPackageFamily(packageFamilyName.c_str(),
+                                             &count,
+                                             nullptr,
+                                             &bufferChars,
+                                             nullptr);
+    if (result != ERROR_INSUFFICIENT_BUFFER && result != ERROR_SUCCESS) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+    if (count == 0 || bufferChars == 0) {
+        if (queryError != nullptr) {
+            *queryError = APPMODEL_ERROR_NO_PACKAGE;
+        }
+        return false;
+    }
+
+    std::vector<PWSTR> names(count, nullptr);
+    std::vector<wchar_t> buffer(bufferChars, L'\0');
+    result = GetPackagesByPackageFamily(packageFamilyName.c_str(),
+                                        &count,
+                                        names.data(),
+                                        &bufferChars,
+                                        buffer.data());
+    if (result != ERROR_SUCCESS) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+
+    for (UINT32 index = 0; index < count; ++index) {
+        if (names[index] != nullptr &&
+            _wcsicmp(names[index], expectedPackageFullName.c_str()) == 0) {
+            if (queryError != nullptr) {
+                *queryError = ERROR_SUCCESS;
+            }
+            return true;
+        }
+    }
+    if (queryError != nullptr) {
+        *queryError = APPMODEL_ERROR_NO_PACKAGE;
+    }
+    return false;
+}
+
+bool QueryRegisteredPackagePath(const std::wstring& packageFullName,
+                                std::filesystem::path* packagePath,
+                                LONG* queryError) {
+    if (packagePath != nullptr) {
+        packagePath->clear();
+    }
+    UINT32 chars = 0;
+    LONG result = GetPackagePathByFullName(packageFullName.c_str(), &chars, nullptr);
+    if (result != ERROR_INSUFFICIENT_BUFFER || chars == 0) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+
+    std::wstring value(chars, L'\0');
+    result = GetPackagePathByFullName(packageFullName.c_str(), &chars, value.data());
+    if (result != ERROR_SUCCESS) {
+        if (queryError != nullptr) {
+            *queryError = result;
+        }
+        return false;
+    }
+    if (!value.empty() && value.back() == L'\0') {
+        value.pop_back();
+    }
+    if (value.empty()) {
+        if (queryError != nullptr) {
+            *queryError = ERROR_INVALID_DATA;
+        }
+        return false;
+    }
+    if (packagePath != nullptr) {
+        *packagePath = std::filesystem::path(std::move(value));
+    }
+    if (queryError != nullptr) {
+        *queryError = ERROR_SUCCESS;
+    }
+    return true;
+}
+
+bool ReadApplicationUserModelIdFromManifest(
+        const std::filesystem::path& packageRoot,
+        const std::filesystem::path& executablePath,
+        std::wstring* applicationUserModelId,
+        std::wstring* outError) {
+    if (applicationUserModelId != nullptr) {
+        applicationUserModelId->clear();
+    }
+
+    std::filesystem::path absoluteRoot;
+    std::filesystem::path absoluteExecutable;
+    try {
+        absoluteRoot = std::filesystem::absolute(packageRoot).lexically_normal();
+        absoluteExecutable = std::filesystem::absolute(executablePath).lexically_normal();
+    } catch (...) {
+        if (outError != nullptr) {
+            *outError = L"The packaged application path could not be normalized.";
+        }
+        return false;
+    }
+    const auto relativeExecutable = absoluteExecutable.lexically_relative(absoluteRoot);
+    if (relativeExecutable.empty() || relativeExecutable.is_absolute() ||
+        (!relativeExecutable.empty() && *relativeExecutable.begin() == L"..")) {
+        if (outError != nullptr) {
+            *outError = L"The selected executable is outside its package manifest directory.";
+        }
+        return false;
+    }
+    const std::wstring expectedExecutable =
+            NormalizePackageRelativePath(relativeExecutable);
+
+    const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize = SUCCEEDED(initializeResult);
+    if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
+        if (outError != nullptr) {
+            *outError = HResultMessage(L"CoInitializeEx(package manifest)", initializeResult);
+        }
+        return false;
+    }
+
+    HRESULT result = S_OK;
+    Microsoft::WRL::ComPtr<IStream> manifestStream;
+    result = SHCreateStreamOnFileEx((absoluteRoot / L"AppxManifest.xml").c_str(),
+                                    STGM_READ | STGM_SHARE_DENY_WRITE,
+                                    FILE_ATTRIBUTE_NORMAL,
+                                    FALSE,
+                                    nullptr,
+                                    &manifestStream);
+    Microsoft::WRL::ComPtr<IAppxFactory> factory;
+    if (SUCCEEDED(result)) {
+        result = CoCreateInstance(CLSID_AppxFactory,
+                                  nullptr,
+                                  CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&factory));
+    }
+    Microsoft::WRL::ComPtr<IAppxManifestReader> manifestReader;
+    if (SUCCEEDED(result)) {
+        result = factory->CreateManifestReader(manifestStream.Get(), &manifestReader);
+    }
+    Microsoft::WRL::ComPtr<IAppxManifestApplicationsEnumerator> applications;
+    if (SUCCEEDED(result)) {
+        result = manifestReader->GetApplications(&applications);
+    }
+
+    bool found = false;
+    BOOL hasCurrent = FALSE;
+    if (SUCCEEDED(result)) {
+        result = applications->GetHasCurrent(&hasCurrent);
+    }
+    while (SUCCEEDED(result) && hasCurrent) {
+        Microsoft::WRL::ComPtr<IAppxManifestApplication> application;
+        result = applications->GetCurrent(&application);
+        LPWSTR declaredExecutable = nullptr;
+        if (SUCCEEDED(result)) {
+            result = application->GetStringValue(L"Executable", &declaredExecutable);
+        }
+        const bool matches = SUCCEEDED(result) && declaredExecutable != nullptr &&
+                NormalizePackageRelativePath(declaredExecutable) == expectedExecutable;
+        CoTaskMemFree(declaredExecutable);
+
+        if (matches) {
+            LPWSTR rawApplicationUserModelId = nullptr;
+            result = application->GetAppUserModelId(&rawApplicationUserModelId);
+            if (SUCCEEDED(result) && rawApplicationUserModelId != nullptr &&
+                rawApplicationUserModelId[0] != L'\0') {
+                if (applicationUserModelId != nullptr) {
+                    *applicationUserModelId = rawApplicationUserModelId;
+                }
+                found = true;
+            } else if (SUCCEEDED(result)) {
+                result = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            }
+            CoTaskMemFree(rawApplicationUserModelId);
+            break;
+        }
+
+        result = applications->MoveNext(&hasCurrent);
+    }
+    applications.Reset();
+    manifestReader.Reset();
+    factory.Reset();
+    manifestStream.Reset();
+    if (uninitialize) {
+        CoUninitialize();
+    }
+
+    if (!found) {
+        if (outError != nullptr) {
+            if (FAILED(result)) {
+                *outError = HResultMessage(L"Read packaged application manifest", result);
+            } else {
+                *outError = L"The package manifest does not declare the selected executable as an application.";
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+PackagedPathResolutionResult ResolvePackagedApplicationFromPath(
+        const std::filesystem::path& executablePath,
+        std::wstring* packageFullName,
+        std::wstring* applicationUserModelId,
+        std::wstring* outError) {
+    if (packageFullName != nullptr) {
+        packageFullName->clear();
+    }
+    if (applicationUserModelId != nullptr) {
+        applicationUserModelId->clear();
+    }
+
+    const auto packageRoot = FindPackageManifestRoot(executablePath);
+    if (packageRoot.empty()) {
+        if (!IsWindowsAppsPath(executablePath)) {
+            return PackagedPathResolutionResult::NotPackaged;
+        }
+        if (outError != nullptr) {
+            *outError = L"The selected WindowsApps executable has no readable AppxManifest.xml.";
+        }
+        return PackagedPathResolutionResult::Invalid;
+    }
+
+    const std::wstring candidatePackageFullName = packageRoot.filename().wstring();
+    std::wstring packageFamilyName;
+    LONG queryError = ERROR_SUCCESS;
+    if (!PackageFamilyNameFromFullNameString(candidatePackageFullName,
+                                             &packageFamilyName,
+                                             &queryError)) {
+        if (outError != nullptr) {
+            *outError = L"The selected executable is in a package layout whose directory name is not a valid Package Full Name (error " +
+                        std::to_wstring(queryError) + L").";
+        }
+        return PackagedPathResolutionResult::Invalid;
+    }
+
+    if (!IsPackageRegisteredForCurrentUser(packageFamilyName,
+                                           candidatePackageFullName,
+                                           &queryError)) {
+        if (outError != nullptr) {
+            *outError = L"The selected package is not registered for the current Windows user (error " +
+                        std::to_wstring(queryError) + L").";
+        }
+        return PackagedPathResolutionResult::Invalid;
+    }
+
+    std::filesystem::path registeredPackagePath;
+    if (!QueryRegisteredPackagePath(candidatePackageFullName,
+                                    &registeredPackagePath,
+                                    &queryError)) {
+        if (outError != nullptr) {
+            *outError = L"Windows could not resolve the registered package installation path (error " +
+                        std::to_wstring(queryError) + L").";
+        }
+        return PackagedPathResolutionResult::Invalid;
+    }
+    if (NormalizePathForComparison(registeredPackagePath) !=
+        NormalizePathForComparison(packageRoot)) {
+        if (outError != nullptr) {
+            *outError = L"The selected executable belongs to a stale or copied package layout. Registered path: " +
+                        registeredPackagePath.wstring();
+        }
+        return PackagedPathResolutionResult::Invalid;
+    }
+
+    std::wstring resolvedApplicationUserModelId;
+    if (!ReadApplicationUserModelIdFromManifest(packageRoot,
+                                                executablePath,
+                                                &resolvedApplicationUserModelId,
+                                                outError)) {
+        return PackagedPathResolutionResult::Invalid;
+    }
+
+    if (packageFullName != nullptr) {
+        *packageFullName = candidatePackageFullName;
+    }
+    if (applicationUserModelId != nullptr) {
+        *applicationUserModelId = std::move(resolvedApplicationUserModelId);
+    }
+    return PackagedPathResolutionResult::Found;
 }
 
 std::wstring QueryProcessImagePath(DWORD pid) {
@@ -2885,7 +3292,8 @@ bool TickByTickCore::StartRendererForFormatLocked(
 bool TickByTickCore::LaunchAndInjectTarget(const std::filesystem::path& exePath,
                                              const std::filesystem::path& hookDllPath,
                                              std::wstring* outError) {
-    const std::wstring targetExe = std::filesystem::absolute(exePath).wstring();
+    const std::filesystem::path targetExePath = std::filesystem::absolute(exePath);
+    const std::wstring targetExe = targetExePath.wstring();
     std::wstring commandLine = QuoteCommandArgument(targetExe);
     std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
     mutableCommandLine.push_back(L'\0');
@@ -2917,23 +3325,60 @@ bool TickByTickCore::LaunchAndInjectTarget(const std::filesystem::path& exePath,
     LONG packageQueryError = ERROR_SUCCESS;
     const auto packageIdentityResult = QueryProcessPackageFullName(
             processInfo.hProcess, &targetPackageFullName, &packageQueryError);
-    const bool isPackagedTarget = packageIdentityResult == PackageIdentityQueryResult::Found;
-
-    if (isPackagedTarget) {
-        std::wstring applicationUserModelId;
-        LONG applicationIdQueryError = ERROR_SUCCESS;
-        if (!QueryProcessApplicationUserModelId(processInfo.hProcess,
-                                                &applicationUserModelId,
-                                                &applicationIdQueryError)) {
+    std::wstring recoveredApplicationUserModelId;
+    PackagedPathResolutionResult packagedPathResult =
+            PackagedPathResolutionResult::NotPackaged;
+    if (packageIdentityResult != PackageIdentityQueryResult::Found) {
+        std::wstring packagedPathError;
+        packagedPathResult = ResolvePackagedApplicationFromPath(
+                targetExePath,
+                &targetPackageFullName,
+                &recoveredApplicationUserModelId,
+                &packagedPathError);
+        if (packagedPathResult == PackagedPathResolutionResult::Invalid) {
+            Log(L"Packaged target identity recovery rejected the launch. processQueryResult=%d processQueryError=%ld detail=\"%s\"",
+                static_cast<int>(packageIdentityResult),
+                packageQueryError,
+                packagedPathError.c_str());
             if (outError != nullptr) {
-                *outError = L"The selected packaged application could not be resolved to an AUMID (error " +
-                            std::to_wstring(applicationIdQueryError) +
-                            L"). Tick By Tick did not launch it as a plain executable.";
+                *outError = L"The selected executable appears to belong to a Windows app package, but Tick By Tick could not verify a matching registration and application identity. " +
+                            packagedPathError +
+                            L" Repair or reinstall the app, then select the executable from its current registered installation. The executable was not launched as a plain desktop app.";
             }
             TerminateProcess(processInfo.hProcess, 1);
             CloseHandle(processInfo.hThread);
             CloseHandle(processInfo.hProcess);
             return false;
+        }
+        if (packagedPathResult == PackagedPathResolutionResult::Found) {
+            Log(L"Recovered packaged target identity from the registered manifest after process identity query result=%d error=%ld. packageFullName=\"%s\" aumid=\"%s\"",
+                static_cast<int>(packageIdentityResult),
+                packageQueryError,
+                targetPackageFullName.c_str(),
+                recoveredApplicationUserModelId.c_str());
+        }
+    }
+    const bool isPackagedTarget =
+            packageIdentityResult == PackageIdentityQueryResult::Found ||
+            packagedPathResult == PackagedPathResolutionResult::Found;
+
+    if (isPackagedTarget) {
+        std::wstring applicationUserModelId = recoveredApplicationUserModelId;
+        if (applicationUserModelId.empty()) {
+            LONG applicationIdQueryError = ERROR_SUCCESS;
+            if (!QueryProcessApplicationUserModelId(processInfo.hProcess,
+                                                    &applicationUserModelId,
+                                                    &applicationIdQueryError)) {
+                if (outError != nullptr) {
+                    *outError = L"The selected packaged application could not be resolved to an AUMID (error " +
+                                std::to_wstring(applicationIdQueryError) +
+                                L"). Tick By Tick did not launch it as a plain executable.";
+                }
+                TerminateProcess(processInfo.hProcess, 1);
+                CloseHandle(processInfo.hThread);
+                CloseHandle(processInfo.hProcess);
+                return false;
+            }
         }
 
         // CreateProcess is only a suspended identity probe. Resuming a packaged
@@ -3027,7 +3472,7 @@ bool TickByTickCore::LaunchAndInjectTarget(const std::filesystem::path& exePath,
     if (isPackagedTarget) {
         {
             std::lock_guard<std::mutex> lock(processMonitorMutex_);
-            targetExePath_ = std::filesystem::absolute(exePath);
+            targetExePath_ = targetExePath;
             injectedPids_.clear();
             injectedPids_.insert(targetPid_);
             injectionAttempts_.clear();
