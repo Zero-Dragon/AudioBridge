@@ -125,6 +125,7 @@
     <ClCompile Include="src\TickByTickHook.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\TickByTickHookShared\FakeWasapiBufferLedger.h" />
     <ClInclude Include="..\TickByTickHookShared\TickByTickHookProtocol.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
