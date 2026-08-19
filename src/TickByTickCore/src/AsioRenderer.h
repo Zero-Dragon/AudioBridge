@@ -38,7 +38,10 @@ enum class PrebufferTransitionReason : std::int32_t {
 };
 
 struct RendererStats {
+    bool startAccepted = false;
     bool streamActive = false;
+    bool silentStartDeferred = false;
+    std::int32_t startupWaitMs = 0;
     bool prebuffering = false;
     std::uint32_t sourceSampleRate = 0;
     std::int64_t totalFramesQueued = 0;
@@ -195,6 +198,12 @@ public:
     std::int64_t ConfirmedOutputFrames() const;
     std::int64_t PendingCapturedFrames() const;
     std::int64_t PendingTimelineFrames() const;
+    bool EnsureStreamStarted(std::wstring* outError = nullptr);
+    bool StartDeferredSilenceIfDue(std::uint32_t delayMs,
+                                   std::wstring* outError = nullptr);
+    bool IsDeferredSilenceStartDue(std::uint32_t delayMs) const;
+    bool WaitForFirstOutputCallback(std::wstring* outError = nullptr);
+    bool HasFirstOutputCallbackTimedOut() const;
     void PrimeTimeline();
     void MaintainTimeline();
     void BeginCapturedDrain();
@@ -226,6 +235,12 @@ private:
         OutputPageOrder = 8,
         OutputConfirmation = 9,
         InvalidRendererBuffers = 10,
+    };
+
+    enum class FirstOutputCallbackState : LONG {
+        Awaiting = 0,
+        Completed = 1,
+        Cancelled = 2,
     };
 
     struct OutputPageLedger {
@@ -264,6 +279,8 @@ private:
     void DisposeBuffersOnControlThread();
     void CloseDriverOnControlThread();
     bool TryStartStreamIfReady(std::wstring* outError);
+    void ResetFirstOutputCallbackGate() noexcept;
+    void CancelFirstOutputCallbackGate() noexcept;
     std::uint32_t PushCapturedFrames(const std::uint8_t* data,
                                      std::uint32_t frameCount,
                                      bool silence,
@@ -318,7 +335,15 @@ private:
     bool coInitialized_ = false;
     std::atomic<bool> driverQuiesceFailed_{false};
     std::atomic<bool> running_{false};
-    std::atomic<bool> streamActive_{false};
+    // IASIO::start() returning success does not prove that the driver has
+    // entered its output callback loop.
+    std::atomic<bool> startAccepted_{false};
+    std::atomic<std::uint64_t> startAcceptedAtMs_{0};
+    std::atomic<std::uint64_t> deferredSilentStartAtMs_{0};
+    // Tri-state WaitOnAddress gate. Cancellation changes the observed value
+    // before waking waiters, so a Stop/Fault wake cannot be lost.
+    volatile LONG firstOutputCallbackState_ =
+            static_cast<LONG>(FirstOutputCallbackState::Awaiting);
     std::atomic<bool> prebuffering_{false};
     std::atomic_flag callbackActive_ = ATOMIC_FLAG_INIT;
     volatile LONG callbackExecuting_ = FALSE;

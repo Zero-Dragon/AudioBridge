@@ -20,6 +20,25 @@ std::atomic<bool> g_asioDriverPoisoned{false};
 std::atomic<std::uint32_t> g_asioCallbackEntrants{0};
 std::mutex g_asioClockProbeMutex;
 
+constexpr DWORD kFirstOutputCallbackTimeoutMs = 2000;
+constexpr auto kControlMessagePumpInterval = std::chrono::milliseconds(2);
+
+void EnsureCurrentThreadMessageQueue() noexcept {
+    MSG message{};
+    PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+}
+
+void PumpCurrentThreadMessages() noexcept {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        if (message.message == WM_QUIT) {
+            continue;
+        }
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+
 enum class CallbackRealtimeMode : std::int32_t {
     Unknown = 0,
     MmcssProAudio = 1,
@@ -1027,6 +1046,7 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
 
 void AsioRenderer::Stop() {
     running_.store(false, std::memory_order_release);
+    CancelFirstOutputCallbackGate();
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
         shutdownRequested_ = true;
@@ -1055,7 +1075,9 @@ void AsioRenderer::Stop() {
         WakeByAddressAll(const_cast<LONG*>(&callbackExecuting_));
     }
     callbackActive_.clear(std::memory_order_release);
-    streamActive_.store(false, std::memory_order_release);
+    startAccepted_.store(false, std::memory_order_release);
+    startAcceptedAtMs_.store(0, std::memory_order_release);
+    deferredSilentStartAtMs_.store(0, std::memory_order_release);
     SetPrebuffering(
             false, PrebufferTransitionReason::Stop, ringBuffer_.AvailableReadFrames());
     ringBuffer_.Clear();
@@ -1170,8 +1192,17 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
         }
         return written;
     }
-    if (written > 0 && !TryStartStreamIfReady(outError)) {
-        return written;
+    if (written > 0) {
+        if (silence && !startAccepted_.load(std::memory_order_acquire)) {
+            std::uint64_t expected = 0;
+            deferredSilentStartAtMs_.compare_exchange_strong(
+                    expected, GetTickCount64(), std::memory_order_acq_rel);
+        } else {
+            deferredSilentStartAtMs_.store(0, std::memory_order_release);
+            if (!TryStartStreamIfReady(outError)) {
+                return written;
+            }
+        }
     }
     return written;
 }
@@ -1249,7 +1280,27 @@ RendererStats AsioRenderer::GetStats() const {
         clockSourceIndex = asioClockSourceIndex_;
     }
 
-    stats.streamActive = streamActive_.load(std::memory_order_relaxed);
+    stats.startAccepted = startAccepted_.load(std::memory_order_relaxed);
+    const LONG callbackState = InterlockedCompareExchange(
+            const_cast<LONG*>(&firstOutputCallbackState_),
+            static_cast<LONG>(FirstOutputCallbackState::Awaiting),
+            static_cast<LONG>(FirstOutputCallbackState::Awaiting));
+    stats.streamActive = running_.load(std::memory_order_relaxed) &&
+            stats.startAccepted &&
+            callbackState ==
+                    static_cast<LONG>(FirstOutputCallbackState::Completed);
+    const std::uint64_t deferredAt =
+            deferredSilentStartAtMs_.load(std::memory_order_relaxed);
+    stats.silentStartDeferred = deferredAt != 0 && !stats.startAccepted;
+    const std::uint64_t startAcceptedAt =
+            startAcceptedAtMs_.load(std::memory_order_relaxed);
+    if (startAcceptedAt != 0 && !stats.streamActive) {
+        const std::uint64_t elapsed = GetTickCount64() - startAcceptedAt;
+        stats.startupWaitMs = static_cast<std::int32_t>((std::min<std::uint64_t>)(
+                elapsed,
+                static_cast<std::uint64_t>(
+                        (std::numeric_limits<std::int32_t>::max)())));
+    }
     stats.prebuffering = prebuffering_.load(std::memory_order_relaxed);
     stats.sourceSampleRate = sampleRate;
     stats.totalFramesQueued = totalFramesQueued_.load(std::memory_order_relaxed);
@@ -1424,6 +1475,14 @@ void AsioRenderer::BeginCapturedDrain() {
 }
 
 void AsioRenderer::EndCapturedDrain() {
+    // PendingTimelineFrames reaching zero proves that the DAC has confirmed
+    // the old ordered timeline, but the feedback thread may not yet have
+    // advanced logical admission through its final player-owned frames. Settle
+    // that ownership while drain mode still prevents bridge replenishment, so
+    // the caller can take the next stream's baseline without inheriting old
+    // player frames.
+    std::lock_guard<std::mutex> producerLock(producerMutex_);
+    UpdateLogicalAdmissionLocked();
     capturedDrainActive_.store(false, std::memory_order_release);
 }
 
@@ -1490,6 +1549,18 @@ void AsioRenderer::OnAsioBufferSwitch(long doubleBufferIndex,
         return;
     }
     FillOutputBuffer(doubleBufferIndex);
+    if (pendingAsioFault_.load(std::memory_order_acquire) == 0 &&
+        !faultRequested_.load(std::memory_order_acquire)) {
+        const LONG awaiting =
+                static_cast<LONG>(FirstOutputCallbackState::Awaiting);
+        const LONG completed =
+                static_cast<LONG>(FirstOutputCallbackState::Completed);
+        if (InterlockedCompareExchange(
+                    &firstOutputCallbackState_, completed, awaiting) == awaiting) {
+            deferredSilentStartAtMs_.store(0, std::memory_order_release);
+            WakeByAddressAll(const_cast<LONG*>(&firstOutputCallbackState_));
+        }
+    }
     finishCallback();
 }
 
@@ -1548,6 +1619,10 @@ long AsioRenderer::OnAsioMessage(long selector, long value, void* /*message*/, d
 void AsioRenderer::ControlLoop(std::wstring deviceId,
                                std::uint32_t requestedBufferFrames,
                                std::int32_t requestedClockSourceIndex) {
+    // Some Windows ASIO drivers post startup work back to the thread that
+    // initialized them. Create that queue before init and keep it pumped while
+    // the control thread is otherwise idle.
+    EnsureCurrentThreadMessageQueue();
     std::wstring error;
     bool ok = OpenDriverOnControlThread(
             deviceId, requestedBufferFrames, requestedClockSourceIndex, &error);
@@ -1573,11 +1648,20 @@ void AsioRenderer::ControlLoop(std::wstring deviceId,
     std::uint64_t handledSerial = 0;
     std::unique_lock<std::mutex> lock(controlMutex_);
     while (!shutdownRequested_) {
-        controlCv_.wait(lock, [this, handledSerial] {
+        const auto controlReady = [this, handledSerial] {
             return shutdownRequested_ ||
                    faultStopRequested_.load(std::memory_order_acquire) ||
                    startRequestSerial_ != handledSerial;
-        });
+        };
+        if (!controlReady()) {
+            controlCv_.wait_for(lock, kControlMessagePumpInterval, controlReady);
+        }
+        lock.unlock();
+        PumpCurrentThreadMessages();
+        lock.lock();
+        if (!controlReady()) {
+            continue;
+        }
         if (shutdownRequested_) {
             break;
         }
@@ -1596,14 +1680,15 @@ void AsioRenderer::ControlLoop(std::wstring deviceId,
         if (faultRequested_.load(std::memory_order_acquire)) {
             started = false;
             startError = L"ASIO renderer entered a faulting state before output could start.";
-        } else if (!streamActive_.load(std::memory_order_acquire)) {
+        } else if (!startAccepted_.load(std::memory_order_acquire)) {
             const ASIOError startResult = asioDriver_->start();
             if (!IsAsioSuccess(startResult)) {
                 started = false;
                 startError = AsioErrorMessage(asioDriver_, startResult, L"IASIO::start");
                 LatchFault(startError);
             } else {
-                streamActive_.store(true, std::memory_order_release);
+                startAcceptedAtMs_.store(GetTickCount64(), std::memory_order_release);
+                startAccepted_.store(true, std::memory_order_release);
                 if (faultRequested_.load(std::memory_order_acquire)) {
                     started = false;
                     startError = L"ASIO renderer entered a faulting state while output was starting.";
@@ -1621,10 +1706,11 @@ void AsioRenderer::ControlLoop(std::wstring deviceId,
     lock.unlock();
 
     bool driverQuiesced = true;
-    if (streamActive_.load(std::memory_order_acquire) && asioDriver_ != nullptr) {
+    if (startAccepted_.load(std::memory_order_acquire) && asioDriver_ != nullptr) {
         const ASIOError stopResult = asioDriver_->stop();
         if (IsAsioSuccess(stopResult)) {
-            streamActive_.store(false, std::memory_order_release);
+            startAccepted_.store(false, std::memory_order_release);
+            startAcceptedAtMs_.store(0, std::memory_order_release);
             if (g_activeRenderer.load(std::memory_order_acquire) == this) {
                 g_activeRenderer.store(nullptr, std::memory_order_release);
             }
@@ -2070,7 +2156,10 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
         return false;
     }
     running_.store(true, std::memory_order_release);
-    streamActive_.store(false, std::memory_order_release);
+    startAccepted_.store(false, std::memory_order_release);
+    startAcceptedAtMs_.store(0, std::memory_order_release);
+    deferredSilentStartAtMs_.store(0, std::memory_order_release);
+    ResetFirstOutputCallbackGate();
     capturedDrainActive_.store(false, std::memory_order_release);
     SetPrebuffering(false,
                     PrebufferTransitionReason::InitialFill,
@@ -2110,7 +2199,7 @@ bool AsioRenderer::TryStartStreamIfReady(std::wstring* outError) {
         }
         return false;
     }
-    if (streamActive_.load(std::memory_order_acquire)) {
+    if (startAccepted_.load(std::memory_order_acquire)) {
         return true;
     }
     if (!running_.load(std::memory_order_acquire)) {
@@ -2127,7 +2216,7 @@ bool AsioRenderer::TryStartStreamIfReady(std::wstring* outError) {
         }
         return false;
     }
-    if (streamActive_.load(std::memory_order_acquire)) {
+    if (startAccepted_.load(std::memory_order_acquire)) {
         return true;
     }
 
@@ -2160,6 +2249,132 @@ bool AsioRenderer::TryStartStreamIfReady(std::wstring* outError) {
         return false;
     }
     return true;
+}
+
+bool AsioRenderer::EnsureStreamStarted(std::wstring* outError) {
+    deferredSilentStartAtMs_.store(0, std::memory_order_release);
+    return TryStartStreamIfReady(outError);
+}
+
+bool AsioRenderer::StartDeferredSilenceIfDue(std::uint32_t delayMs,
+                                             std::wstring* outError) {
+    if (startAccepted_.load(std::memory_order_acquire)) {
+        deferredSilentStartAtMs_.store(0, std::memory_order_release);
+        return true;
+    }
+    const std::uint64_t deferredAt =
+            deferredSilentStartAtMs_.load(std::memory_order_acquire);
+    if (deferredAt == 0 || GetTickCount64() - deferredAt < delayMs) {
+        return true;
+    }
+    return EnsureStreamStarted(outError);
+}
+
+bool AsioRenderer::IsDeferredSilenceStartDue(std::uint32_t delayMs) const {
+    if (!running_.load(std::memory_order_acquire) ||
+        startAccepted_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const std::uint64_t deferredAt =
+            deferredSilentStartAtMs_.load(std::memory_order_acquire);
+    return deferredAt != 0 && GetTickCount64() - deferredAt >= delayMs;
+}
+
+bool AsioRenderer::WaitForFirstOutputCallback(std::wstring* outError) {
+    if (!startAccepted_.load(std::memory_order_acquire)) {
+        if (outError != nullptr) {
+            *outError = L"ASIO stream start has not been accepted by the driver.";
+        }
+        return false;
+    }
+    const std::uint64_t startAcceptedAt =
+            startAcceptedAtMs_.load(std::memory_order_acquire);
+    if (startAcceptedAt == 0) {
+        if (outError != nullptr) {
+            *outError = L"ASIO stream start timestamp is unavailable.";
+        }
+        return false;
+    }
+    const ULONGLONG deadline = startAcceptedAt + kFirstOutputCallbackTimeoutMs;
+    const LONG awaiting = static_cast<LONG>(FirstOutputCallbackState::Awaiting);
+    const LONG completed = static_cast<LONG>(FirstOutputCallbackState::Completed);
+    const LONG cancelled = static_cast<LONG>(FirstOutputCallbackState::Cancelled);
+    for (;;) {
+        if (faultRequested_.load(std::memory_order_acquire)) {
+            if (outError != nullptr) {
+                const std::wstring fault = FaultMessage();
+                *outError = !fault.empty()
+                        ? fault
+                        : L"ASIO renderer faulted before its first output callback completed.";
+            }
+            return false;
+        }
+        if (!running_.load(std::memory_order_acquire)) {
+            if (outError != nullptr) {
+                *outError = L"ASIO renderer stopped before its first output callback completed.";
+            }
+            return false;
+        }
+        const LONG callbackState = InterlockedCompareExchange(
+                &firstOutputCallbackState_, awaiting, awaiting);
+        if (callbackState == completed) {
+            return true;
+        }
+        if (callbackState == cancelled) {
+            if (outError != nullptr) {
+                *outError = L"ASIO output stopped before its first callback completed.";
+            }
+            return false;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            if (outError != nullptr) {
+                *outError = L"IASIO::start succeeded, but the ASIO driver did not complete its first output callback within 2000 ms; retained audio was not reassigned to another stream.";
+            }
+            return false;
+        }
+
+        const ULONGLONG remaining = deadline - now;
+        const DWORD waitMs = static_cast<DWORD>(
+                (std::min<ULONGLONG>)(remaining, MAXDWORD));
+        LONG waiting = awaiting;
+        WaitOnAddress(&firstOutputCallbackState_,
+                      &waiting,
+                      sizeof(waiting),
+                      waitMs);
+    }
+}
+
+bool AsioRenderer::HasFirstOutputCallbackTimedOut() const {
+    if (!running_.load(std::memory_order_acquire) ||
+        !startAccepted_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const LONG awaiting = static_cast<LONG>(FirstOutputCallbackState::Awaiting);
+    if (InterlockedCompareExchange(
+                const_cast<LONG*>(&firstOutputCallbackState_), awaiting, awaiting) !=
+        awaiting) {
+        return false;
+    }
+    const std::uint64_t startAcceptedAt =
+            startAcceptedAtMs_.load(std::memory_order_acquire);
+    return startAcceptedAt != 0 &&
+           GetTickCount64() - startAcceptedAt >= kFirstOutputCallbackTimeoutMs;
+}
+
+void AsioRenderer::ResetFirstOutputCallbackGate() noexcept {
+    InterlockedExchange(
+            &firstOutputCallbackState_,
+            static_cast<LONG>(FirstOutputCallbackState::Awaiting));
+}
+
+void AsioRenderer::CancelFirstOutputCallbackGate() noexcept {
+    const LONG awaiting = static_cast<LONG>(FirstOutputCallbackState::Awaiting);
+    const LONG cancelled = static_cast<LONG>(FirstOutputCallbackState::Cancelled);
+    if (InterlockedExchange(&firstOutputCallbackState_, cancelled) == awaiting) {
+        WakeByAddressAll(const_cast<LONG*>(&firstOutputCallbackState_));
+    }
 }
 
 bool AsioRenderer::ConfirmOutputPage(long doubleBufferIndex) {
@@ -2244,6 +2459,7 @@ void AsioRenderer::RequestAsioFault(AsioFaultCode code,
     // are completed on the control thread after this callback has returned.
     faultRequested_.store(true, std::memory_order_release);
     running_.store(false, std::memory_order_release);
+    CancelFirstOutputCallbackGate();
     faultStopRequested_.store(true, std::memory_order_release);
     controlCv_.notify_all();
     startCv_.notify_all();
@@ -2321,6 +2537,7 @@ bool AsioRenderer::LatchFault(const std::wstring& message) {
     // past the gate is allowed to finish so the published counters include its
     // last definitely consumed page.
     running_.store(false, std::memory_order_release);
+    CancelFirstOutputCallbackGate();
     SetPrebuffering(false,
                     PrebufferTransitionReason::Fault,
                     ringBuffer_.AvailableReadFrames());
@@ -2449,6 +2666,9 @@ void AsioRenderer::ResetStats() {
     pendingAsioFault_.store(0, std::memory_order_release);
     faultRequested_.store(false, std::memory_order_release);
     faultStopRequested_.store(false, std::memory_order_release);
+    startAcceptedAtMs_.store(0, std::memory_order_release);
+    deferredSilentStartAtMs_.store(0, std::memory_order_release);
+    ResetFirstOutputCallbackGate();
     totalFramesQueued_.store(0, std::memory_order_relaxed);
     totalPlayerSilentFrames_.store(0, std::memory_order_relaxed);
     totalFramesPlayed_.store(0, std::memory_order_relaxed);
