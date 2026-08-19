@@ -47,7 +47,12 @@ inline std::uint32_t UncommittedAvailableFrames(
 inline std::uint32_t ClaimableGetBufferFrames(
         const IngressLedger& ledger) noexcept {
     if (ledger.admissionBlocked) {
-        return 0;
+        // Blocking prevents new admission, but it cannot revoke capacity that
+        // was already promised by a writable event. Expose only that promise;
+        // do not expose any otherwise uncommitted endpoint capacity.
+        return static_cast<std::uint32_t>((std::min)(
+                ledger.eventGrantedFrames,
+                static_cast<std::uint64_t>(ledger.capacityFrames)));
     }
 
     const std::uint64_t available = UncommittedAvailableFrames(ledger);
@@ -72,6 +77,19 @@ inline std::uint32_t GrantableEventFrames(
     return UncommittedAvailableFrames(ledger) >= requiredFrames
             ? requiredFrames
             : 0;
+}
+
+// The Win32 event and the logical grant are one promise. Clear both sides even
+// when the ledger already says zero: a signal can still be pending after an
+// opportunistic GetBuffer call consumed the grant without first waiting.
+template <typename ResetSignal>
+inline bool ClearEventGrantAndSignal(
+        std::uint64_t& eventGrantedFrames,
+        ResetSignal resetSignal) {
+    const bool hadGrant = eventGrantedFrames != 0;
+    eventGrantedFrames = 0;
+    resetSignal();
+    return hadGrant;
 }
 
 }  // namespace tickbytick::fake_wasapi

@@ -83,6 +83,10 @@ struct AudioClientState {
     // IAudioRenderClient::GetBuffer. It is part of the application's existing
     // logical endpoint capacity, never extra player-visible buffering.
     std::uint64_t fakeEventGrantedFrames = 0;
+    std::uint64_t fakeEventGrantsIssued = 0;
+    std::uint64_t fakeEventGrantsRedeemed = 0;
+    std::uint64_t fakeEventGrantsCancelled = 0;
+    std::uint64_t fakeEventGrantResignals = 0;
     std::uint64_t fakeFrameRemainder = 0;
     LONGLONG fakeLastUpdateQpc = 0;
     LONGLONG fakeNextEventQpc = 0;
@@ -120,7 +124,10 @@ struct RenderClientState {
 };
 
 void CancelFakeEventGrantLocked(AudioClientState& state);
+void RedeemFakeEventGrantLocked(AudioClientState& state);
+void FaultFakeEndpointLocked(AudioClientState& state);
 void BlockFakeAdmissionLocked(AudioClientState& state);
+void UnblockFakeAdmissionLocked(AudioClientState& state);
 tickbytick::fake_wasapi::IngressLedger FakeIngressLedgerLocked(
         const AudioClientState& state);
 
@@ -810,8 +817,7 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) 
         // Faulted describes the selected PID's whole renderer pipeline. It can
         // be published before Core has a usable stream id, so every fake
         // client in that PID must fail closed.
-        state.fakeFaulted = true;
-        BlockFakeAdmissionLocked(state);
+        FaultFakeEndpointLocked(state);
         return true;
     }
 
@@ -852,10 +858,10 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) 
         BlockFakeAdmissionLocked(state);
         return true;
     }
-    state.fakeAdmissionBlocked = false;
+    UnblockFakeAdmissionLocked(state);
 
     if (snapshot.consumedLogicalFrames < snapshot.consumedLogicalBaseline) {
-        state.fakeFaulted = true;
+        FaultFakeEndpointLocked(state);
         return true;
     }
     const std::uint64_t generationConsumed =
@@ -863,7 +869,7 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) 
     if (generationConsumed >
         (std::numeric_limits<std::uint64_t>::max)() -
                 snapshot.consumedLogicalOffset) {
-        state.fakeFaulted = true;
+        FaultFakeEndpointLocked(state);
         return true;
     }
     const std::uint64_t consumedLogical =
@@ -875,13 +881,13 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) 
         consumedLogical > submittedCeiling ||
         !tickbytick::fake_wasapi::IsWithinCapacity(
                 FakeIngressLedgerLocked(state))) {
-        state.fakeFaulted = true;
+        FaultFakeEndpointLocked(state);
         return true;
     }
     state.consumedLogicalFrames = consumedLogical;
 
     if (consumedLogical < state.accountedLogicalFrames) {
-        state.fakeFaulted = true;
+        FaultFakeEndpointLocked(state);
         return true;
     }
     const std::uint64_t releasableFrames =
@@ -905,7 +911,7 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) 
     if (state.fakeStarted &&
         releasedFrames > (std::numeric_limits<std::uint64_t>::max)() -
                                  state.fakeDevicePosition) {
-        state.fakeFaulted = true;
+        FaultFakeEndpointLocked(state);
         return true;
     }
     if (state.fakeStarted) {
@@ -976,20 +982,65 @@ UINT32 FakeClaimableFramesLocked(const AudioClientState& state) {
 }
 
 void CancelFakeEventGrantLocked(AudioClientState& state) {
-    if (state.fakeEventGrantedFrames == 0) {
-        return;
-    }
-    state.fakeEventGrantedFrames = 0;
-    if (state.fakeEvent != nullptr) {
-        ResetEvent(state.fakeEvent);
+    const bool hadGrant = tickbytick::fake_wasapi::ClearEventGrantAndSignal(
+            state.fakeEventGrantedFrames,
+            [&state]() {
+                if (state.fakeEvent != nullptr) {
+                    ResetEvent(state.fakeEvent);
+                }
+            });
+    if (hadGrant) {
+        ++state.fakeEventGrantsCancelled;
     }
 }
 
+void RedeemFakeEventGrantLocked(AudioClientState& state) {
+    const bool hadGrant = tickbytick::fake_wasapi::ClearEventGrantAndSignal(
+            state.fakeEventGrantedFrames,
+            [&state]() {
+                if (state.fakeEvent != nullptr) {
+                    ResetEvent(state.fakeEvent);
+                }
+            });
+    if (hadGrant) {
+        ++state.fakeEventGrantsRedeemed;
+    }
+}
+
+void FaultFakeEndpointLocked(AudioClientState& state) {
+    // A hard fault cannot honor a writable promise. Revoke it and clear the
+    // kernel signal before publishing the permanently blocked endpoint state.
+    CancelFakeEventGrantLocked(state);
+    state.fakeFaulted = true;
+    state.fakeAdmissionBlocked = true;
+}
+
 void BlockFakeAdmissionLocked(AudioClientState& state) {
-    if (!state.fakeAdmissionBlocked) {
-        CancelFakeEventGrantLocked(state);
+    if (!state.fakeAdmissionBlocked && state.fakeEventGrantedFrames == 0 &&
+        state.fakeEvent != nullptr) {
+        // No promise exists, so make sure a signal-only remainder cannot wake
+        // the player after the endpoint starts reporting full.
+        ResetEvent(state.fakeEvent);
     }
     state.fakeAdmissionBlocked = true;
+}
+
+void UnblockFakeAdmissionLocked(AudioClientState& state) {
+    const bool wasBlocked = state.fakeAdmissionBlocked;
+    state.fakeAdmissionBlocked = false;
+    if (!wasBlocked || state.fakeEventGrantedFrames == 0 ||
+        !state.fakeStarted || state.fakeEvent == nullptr) {
+        return;
+    }
+
+    // The original signal may already have released a waiter that chose not to
+    // redeem while the endpoint was blocked. Re-signal the same grant when the
+    // route resumes; this does not allocate or expose any additional capacity.
+    if (SetEvent(state.fakeEvent)) {
+        ++state.fakeEventGrantResignals;
+    } else {
+        CancelFakeEventGrantLocked(state);
+    }
 }
 
 bool TrySignalFakeEventLocked(AudioClientState& state) {
@@ -1017,6 +1068,7 @@ bool TrySignalFakeEventLocked(AudioClientState& state) {
         state.fakeEventGrantedFrames = 0;
         return false;
     }
+    ++state.fakeEventGrantsIssued;
     return true;
 }
 
@@ -1304,6 +1356,10 @@ void StoreFakeInitialization(IAudioClient* client,
     state.fakeDiscardPendingFrames = 0;
     state.fakeReservedFrames = 0;
     state.fakeEventGrantedFrames = 0;
+    state.fakeEventGrantsIssued = 0;
+    state.fakeEventGrantsRedeemed = 0;
+    state.fakeEventGrantsCancelled = 0;
+    state.fakeEventGrantResignals = 0;
     state.fakeFrameRemainder = 0;
     state.fakeLastUpdateQpc = 0;
     state.fakeNextEventQpc = 0;
@@ -1687,7 +1743,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                 invalidationReason = "virtual-accounting";
             }
             if (std::strcmp(invalidationReason, "none") != 0) {
-                state.fakeFaulted = true;
+                FaultFakeEndpointLocked(state);
                 fakeDeviceInvalidated = true;
             } else if (state.fakeOutput && hasReleaseState) {
                 if (sendSucceeded) {
@@ -1696,7 +1752,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                 }
                 if (state.fakeBridgeManaged) {
                     if (state.consumedLogicalFrames > state.successfulSubmittedFrames) {
-                        state.fakeFaulted = true;
+                        FaultFakeEndpointLocked(state);
                         fakeDeviceInvalidated = true;
                     } else if (sendSucceeded && frameCount > 0 &&
                                !queuedBeforeSend) {
@@ -1767,7 +1823,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             audioState.fakeOutput ? "on" : "off");
     }
     if (shouldLogFlow) {
-        Log("PCM flow. render=%p audio=%p intervalMs=%llu releaseCalls=%llu nonSilentFrames=%llu nonSilentBytes=%llu playerSilentFrames=%llu totalFrames=%llu maxReleaseGapMs=%llu sampleRate=%u queued=%llu hidden=%llu reserved=%llu eventGrant=%llu capacity=%u submitted=%llu logical=%llu accounted=%llu devicePosition=%llu managed=%s blocked=%s started=%s rendererState=%ld routeStream=%llu blockedStream=%llu generation=%ld coreLogical=%llu fakeOutput=%s",
+        Log("PCM flow. render=%p audio=%p intervalMs=%llu releaseCalls=%llu nonSilentFrames=%llu nonSilentBytes=%llu playerSilentFrames=%llu totalFrames=%llu maxReleaseGapMs=%llu sampleRate=%u queued=%llu hidden=%llu reserved=%llu eventGrant=%llu eventIssued=%llu eventRedeemed=%llu eventCancelled=%llu eventResignals=%llu capacity=%u submitted=%llu logical=%llu accounted=%llu devicePosition=%llu managed=%s blocked=%s started=%s rendererState=%ld routeStream=%llu blockedStream=%llu generation=%ld coreLogical=%llu fakeOutput=%s",
             self,
             renderState.audioClient,
             static_cast<unsigned long long>(flowIntervalMs),
@@ -1785,6 +1841,14 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             static_cast<unsigned long long>(audioState.fakeReservedFrames),
             static_cast<unsigned long long>(
                     audioState.fakeEventGrantedFrames),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantsIssued),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantsRedeemed),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantsCancelled),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantResignals),
             audioState.fakeBufferFrames,
             static_cast<unsigned long long>(audioState.successfulSubmittedFrames),
             static_cast<unsigned long long>(audioState.consumedLogicalFrames),
@@ -1897,10 +1961,11 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
                 claimableFrames = faulted ? 0 : FakeClaimableFramesLocked(state);
                 grantedFrames = state.fakeEventGrantedFrames;
                 if (!faulted && frameCount <= claimableFrames) {
-                    // A successful GetBuffer consumes the one outstanding
-                    // event promise. Any unused portion becomes ordinary
-                    // uncommitted logical capacity again.
-                    state.fakeEventGrantedFrames = 0;
+                    // A successful GetBuffer consumes both sides of the
+                    // promise. ResetEvent is required even if the client made
+                    // this call without waiting first; otherwise the old
+                    // signal can wake it again after the logical grant is gone.
+                    RedeemFakeEventGrantLocked(state);
                     state.fakeReservedFrames += frameCount;
                 }
                 audioState = state;
@@ -1920,15 +1985,42 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
         return AUDCLNT_E_DEVICE_INVALIDATED;
     }
     if (frameCount > claimableFrames) {
+        ControlSnapshot control{};
+        const bool hasControl = ReadControlSnapshot(&control);
         LogFrequent(
             FrequentLogEvent::FakeGetBufferUnavailable,
-            "Fake output GetBuffer request exceeds available frames. render=%p audio=%p requested=%u available=%u granted=%llu claimable=%u",
+            "Fake output GetBuffer request exceeds available frames. render=%p audio=%p requested=%u available=%u granted=%llu claimable=%u queued=%llu hidden=%llu reserved=%llu issued=%llu redeemed=%llu cancelled=%llu resignals=%llu started=%s blocked=%s managed=%s stream=%llu controlValid=%s rendererState=%ld routeStream=%llu blockedStream=%llu generation=%ld",
             self,
             fake->audioClient,
             frameCount,
             availableFrames,
             static_cast<unsigned long long>(grantedFrames),
-            claimableFrames);
+            claimableFrames,
+            static_cast<unsigned long long>(audioState.fakeQueuedFrames),
+            static_cast<unsigned long long>(
+                    audioState.fakeDiscardPendingFrames),
+            static_cast<unsigned long long>(audioState.fakeReservedFrames),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantsIssued),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantsRedeemed),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantsCancelled),
+            static_cast<unsigned long long>(
+                    audioState.fakeEventGrantResignals),
+            audioState.fakeStarted ? "yes" : "no",
+            audioState.fakeAdmissionBlocked ? "yes" : "no",
+            audioState.fakeBridgeManaged ? "yes" : "no",
+            static_cast<unsigned long long>(audioState.streamId),
+            hasControl && control.valid ? "yes" : "no",
+            hasControl && control.valid
+                    ? static_cast<long>(control.rendererState)
+                    : -1L,
+            static_cast<unsigned long long>(
+                    hasControl && control.valid ? control.streamId : 0),
+            static_cast<unsigned long long>(
+                    hasControl && control.valid ? control.blockedStreamId : 0),
+            hasControl && control.valid ? control.streamGeneration : -1L);
         return AUDCLNT_E_BUFFER_TOO_LARGE;
     }
 
@@ -2551,7 +2643,7 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
                            state.streamId)) {
             {
                 std::lock_guard<std::mutex> lock(g_stateMutex);
-                g_audioClients[self].fakeFaulted = true;
+                FaultFakeEndpointLocked(g_audioClients[self]);
             }
             Log("Fake output Initialize invalidated because the format message could not be delivered. audio=%p stream=%llu",
                 self,
@@ -2643,7 +2735,7 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                            state.streamId)) {
             {
                 std::lock_guard<std::mutex> lock(g_stateMutex);
-                g_audioClients[audioClient].fakeFaulted = true;
+                FaultFakeEndpointLocked(g_audioClients[audioClient]);
             }
             Log("Fake output InitializeSharedAudioStream invalidated because the format message could not be delivered. audio=%p stream=%llu",
                 audioClient,
@@ -3007,7 +3099,19 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
                 state.fakeLastUpdateQpc = nowQpc;
                 state.fakeDevicePositionQpc = nowQpc;
                 state.fakeNextEventQpc = nowQpc + QpcTicksForFakePeriod(state);
-                TrySignalFakeEventLocked(state);
+                if (state.fakeEventGrantedFrames != 0 &&
+                    state.fakeEvent != nullptr) {
+                    // Stop freezes new notifications but preserves a promise
+                    // whose waiter may already have been released. Re-signal
+                    // that same promise on restart instead of minting another.
+                    if (SetEvent(state.fakeEvent)) {
+                        ++state.fakeEventGrantResignals;
+                    } else {
+                        CancelFakeEventGrantLocked(state);
+                    }
+                } else {
+                    TrySignalFakeEventLocked(state);
+                }
             }
         }
         if (invalidated) {
@@ -3029,7 +3133,13 @@ HRESULT STDMETHODCALLTYPE HookStop(IAudioClient* self) {
             if (state.fakeFaulted) {
                 return AUDCLNT_E_DEVICE_INVALIDATED;
             }
-            CancelFakeEventGrantLocked(state);
+            if (state.fakeEventGrantedFrames == 0 &&
+                state.fakeEvent != nullptr) {
+                // Clear any signal left behind by an opportunistic GetBuffer.
+                // Preserve a real outstanding grant: a waiter may already be
+                // awake, and Stop must not revoke capacity promised to it.
+                ResetEvent(state.fakeEvent);
+            }
             state.fakeStarted = false;
             state.fakeLastUpdateQpc = 0;
             state.fakeNextEventQpc = 0;
@@ -3059,7 +3169,7 @@ HRESULT STDMETHODCALLTYPE HookReset(IAudioClient* self) {
                 if (state.fakeDiscardPendingFrames > state.fakeBufferFrames ||
                     state.fakeQueuedFrames >
                     state.fakeBufferFrames - state.fakeDiscardPendingFrames) {
-                    state.fakeFaulted = true;
+                    FaultFakeEndpointLocked(state);
                     return AUDCLNT_E_DEVICE_INVALIDATED;
                 }
                 // Reset makes the old padding invisible to the application,

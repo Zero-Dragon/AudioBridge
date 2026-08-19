@@ -61,6 +61,7 @@ constexpr int32_t kMinimumMaxBufferAdvanceMs = 50;
 constexpr int32_t kDefaultAsioBufferFrames = 0;
 constexpr std::size_t kMaxTrackedAudioStreamsPerPid = 32;
 constexpr std::uint64_t kActiveStreamHandoffGraceMs = 250;
+constexpr std::uint32_t kSilentBootstrapStartDelayMs = 350;
 constexpr std::size_t kMaxPendingLogChars = 1024U * 1024U;
 constexpr std::size_t kRetainedPendingLogChars = 768U * 1024U;
 #if defined(_WIN64)
@@ -2512,11 +2513,14 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
              stats.prebufferExitCount <
                      rendererDiagnosticStats_.prebufferExitCount);
     if (!rendererDiagnosticBaselineValid_ || countersRestarted) {
-        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u active=%s fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms capacity=%d ms packet=%u frames playerQueued=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld realtime=%s outputReady=%s underruns=%lld dropped=%lld",
+        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u startAccepted=%s callbackReady=%s silentDeferred=%s startupWait=%d ms fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms capacity=%d ms packet=%u frames playerQueued=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld realtime=%s outputReady=%s underruns=%lld dropped=%lld",
             pid,
             static_cast<unsigned long long>(streamId),
             stats.sourceSampleRate,
+            stats.startAccepted ? L"yes" : L"no",
             stats.streamActive ? L"yes" : L"no",
+            stats.silentStartDeferred ? L"yes" : L"no",
+            stats.startupWaitMs,
             stats.bufferedMs,
             stats.prebufferTargetMs,
             stats.applicationBufferMs,
@@ -2569,7 +2573,7 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
         const std::int64_t dropped =
                 delta(stats.totalFramesDropped,
                       rendererDiagnosticStats_.totalFramesDropped);
-        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld playerPending=%lld fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms packet=%u frames underruns=+%lld dropped=+%lld",
+        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld playerPending=%lld fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms packet=%u frames startAccepted=%s callbackReady=%s silentDeferred=%s startupWait=%d ms underruns=+%lld dropped=+%lld",
             static_cast<unsigned long long>(nowMs - rendererDiagnosticLastMs_),
             pid,
             static_cast<unsigned long long>(streamId),
@@ -2590,6 +2594,10 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
             stats.applicationBufferMs,
             stats.effectiveTimelineMs,
             stats.maximumRealPacketFrames,
+            stats.startAccepted ? L"yes" : L"no",
+            stats.streamActive ? L"yes" : L"no",
+            stats.silentStartDeferred ? L"yes" : L"no",
+            stats.startupWaitMs,
             static_cast<long long>(underruns),
             static_cast<long long>(dropped));
     }
@@ -2602,6 +2610,27 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
 void TickByTickCore::FeedbackThread() {
     while (running_.load(std::memory_order_acquire)) {
         renderer_.MaintainTimeline();
+        if (renderer_.IsDeferredSilenceStartDue(
+                    kSilentBootstrapStartDelayMs) &&
+            !pipelineFaulted_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+            if (renderer_.IsDeferredSilenceStartDue(
+                        kSilentBootstrapStartDelayMs) &&
+                running_.load(std::memory_order_acquire) &&
+                !pipelineFaulted_.load(std::memory_order_acquire)) {
+                std::wstring deferredStartError;
+                Log(L"Renderer deferred SILENT bootstrap start triggered after %u ms.",
+                    kSilentBootstrapStartDelayMs);
+                if (!renderer_.StartDeferredSilenceIfDue(
+                            kSilentBootstrapStartDelayMs,
+                            &deferredStartError)) {
+                    LatchPipelineFaultLocked(
+                            deferredStartError.empty()
+                                    ? L"ASIO could not start the retained silent bootstrap timeline."
+                                    : deferredStartError);
+                }
+            }
+        }
         PublishRendererCounters();
         const auto nowMs = NowMs();
         if (rendererDiagnosticLastMs_ == 0 ||
@@ -2612,6 +2641,14 @@ void TickByTickCore::FeedbackThread() {
             !pipelineFaulted_.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
             LatchPipelineFaultLocked(renderer_.FaultMessage());
+        } else if (renderer_.HasFirstOutputCallbackTimedOut() &&
+                   !pipelineFaulted_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+            if (renderer_.HasFirstOutputCallbackTimedOut() &&
+                !pipelineFaulted_.load(std::memory_order_acquire)) {
+                LatchPipelineFaultLocked(
+                        L"IASIO::start succeeded, but the ASIO driver did not complete its first output callback within 2000 ms; retained audio was not reassigned to another stream.");
+            }
         }
         Sleep(1);
     }
@@ -3102,12 +3139,16 @@ bool TickByTickCore::StartRendererForFormatLocked(
     const std::uint64_t previousStreamId = publishedStreamId_;
     const RendererStats handoffStartStats = renderer_.GetStats();
     const std::int64_t pendingAtHandoff = renderer_.PendingTimelineFrames();
-    Log(L"Renderer handoff begin. oldStream=%llu newStream=%llu oldRate=%u newRate=%u running=%s sameConfiguration=%s pending=%lld frames (%lld ms) fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms prebuffer=%s submittedOffset=%llu",
+    Log(L"Renderer handoff begin. oldStream=%llu newStream=%llu oldRate=%u newRate=%u running=%s startAccepted=%s callbackReady=%s silentDeferred=%s startupWait=%d ms sameConfiguration=%s pending=%lld frames (%lld ms) fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms prebuffer=%s submittedOffset=%llu",
         static_cast<unsigned long long>(previousStreamId),
         static_cast<unsigned long long>(streamId),
         previousSampleRate,
         format.Format.nSamplesPerSec,
         rendererWasRunning ? L"yes" : L"no",
+        handoffStartStats.startAccepted ? L"yes" : L"no",
+        handoffStartStats.streamActive ? L"yes" : L"no",
+        handoffStartStats.silentStartDeferred ? L"yes" : L"no",
+        handoffStartStats.startupWaitMs,
         configurationMatches ? L"yes" : L"no",
         static_cast<long long>(pendingAtHandoff),
         static_cast<long long>(FramesToMilliseconds(
@@ -3119,11 +3160,13 @@ bool TickByTickCore::StartRendererForFormatLocked(
         handoffStartStats.prebuffering ? L"yes" : L"no",
         static_cast<unsigned long long>(submittedFrames));
 
-    if (rendererWasRunning && handoffStartStats.streamActive) {
-        // Keep the old stream's route and logical clock live while preventing
-        // only the replacement endpoint from staging more than its current
-        // ReleaseBuffer. This separates the format-boundary gate from the old
-        // timeline that still has valid audio to play.
+    bool replacementRouteBlocked = false;
+    if (rendererWasRunning && pendingAtHandoff > 0 &&
+        !handoffStartStats.streamActive) {
+        // A short-lived endpoint may submit only an explicit SILENT packet and
+        // Reset before the real stream appears. Keep that accepted player
+        // silence owned by the old route, block the replacement endpoint, and
+        // let the real stream trigger hardware start without reassigning data.
         PublishRendererCounters();
         PublishRendererRoute(previousStreamId,
                              previousSampleRate,
@@ -3131,6 +3174,49 @@ bool TickByTickCore::StartRendererForFormatLocked(
                              publishedConsumedOffset_,
                              RendererState::Running,
                              streamId);
+        replacementRouteBlocked = true;
+
+        std::wstring startupError;
+        if (!handoffStartStats.startAccepted &&
+            !renderer_.EnsureStreamStarted(&startupError)) {
+            Log(L"Renderer handoff could not start retained timeline. oldStream=%llu newStream=%llu pending=%lld error=%s",
+                static_cast<unsigned long long>(previousStreamId),
+                static_cast<unsigned long long>(streamId),
+                static_cast<long long>(pendingAtHandoff),
+                startupError.c_str());
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            SetLastErrorLocked(startupError);
+            AppendLogTextLocked(L"[renderer] " + startupError + L"\r\n");
+            return false;
+        }
+        if (!renderer_.WaitForFirstOutputCallback(&startupError)) {
+            Log(L"Renderer handoff callback wait failed. oldStream=%llu newStream=%llu pending=%lld error=%s",
+                static_cast<unsigned long long>(previousStreamId),
+                static_cast<unsigned long long>(streamId),
+                static_cast<long long>(pendingAtHandoff),
+                startupError.c_str());
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            SetLastErrorLocked(startupError);
+            AppendLogTextLocked(L"[renderer] " + startupError + L"\r\n");
+            return false;
+        }
+    }
+
+    const RendererStats drainStartStats = renderer_.GetStats();
+    if (rendererWasRunning && drainStartStats.streamActive) {
+        // Keep the old stream's route and logical clock live while preventing
+        // only the replacement endpoint from staging more than its current
+        // ReleaseBuffer. This separates the format-boundary gate from the old
+        // timeline that still has valid audio to play.
+        if (!replacementRouteBlocked) {
+            PublishRendererCounters();
+            PublishRendererRoute(previousStreamId,
+                                 previousSampleRate,
+                                 publishedConsumedBaseline_,
+                                 publishedConsumedOffset_,
+                                 RendererState::Running,
+                                 streamId);
+        }
         const auto drainStartedMs = NowMs();
         std::wstring drainError;
         if (!WaitForCapturedDrainLocked(&drainError)) {
