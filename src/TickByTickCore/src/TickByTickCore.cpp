@@ -1,6 +1,7 @@
 #include "TickByTickCore.h"
 
 #include "AsioRenderer.h"
+#include "FormatHandoffState.h"
 #include "../../TickByTickHookShared/TickByTickHookProtocol.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <deque>
 #include <filesystem>
 #include <iterator>
 #include <limits>
@@ -47,7 +49,7 @@
 namespace tickbytick {
 namespace {
 
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\LOCAL\\TickByTickWasapiHook";
+constexpr const wchar_t* kPipeName = hook_protocol::kPipeName;
 constexpr wchar_t kHookReadyEventPrefix[] = L"Local\\TickByTickHookReady_";
 constexpr DWORD kHookReadyTimeoutMs = 5000;
 
@@ -74,7 +76,9 @@ using hook_protocol::HookControlBlock;
 using hook_protocol::PipeFormatMessage;
 using hook_protocol::PipeMessageHeader;
 using hook_protocol::PipePcmMessage;
+using hook_protocol::PipeStreamLifecycleMessage;
 using hook_protocol::RendererState;
+using hook_protocol::AdmissionState;
 
 const wchar_t* PrebufferTransitionName(std::int32_t value) {
     switch (static_cast<PrebufferTransitionReason>(value)) {
@@ -157,6 +161,18 @@ std::int64_t FramesToMilliseconds(std::int64_t frames, std::uint32_t sampleRate)
             ((frames % sampleRate) * 1000) / sampleRate;
 }
 
+std::uint32_t FramesFromMilliseconds(std::uint32_t sampleRate,
+                                     std::int32_t milliseconds) {
+    if (sampleRate == 0 || milliseconds <= 0) {
+        return 0;
+    }
+    const std::uint64_t frames =
+            (static_cast<std::uint64_t>(sampleRate) *
+             static_cast<std::uint32_t>(milliseconds) + 999U) / 1000U;
+    return static_cast<std::uint32_t>((std::min<std::uint64_t>)(
+            frames, (std::numeric_limits<std::uint32_t>::max)()));
+}
+
 struct DeviceInfo {
     std::wstring id;
     std::wstring name;
@@ -172,6 +188,44 @@ struct AudioStreamState {
     std::uint64_t formatSequence = 0;
     std::uint64_t nextPcmSequence = 1;
     std::uint64_t submittedFrames = 0;
+    std::uint64_t admittedFrames = 0;
+    DWORD streamEpoch = 1;
+    AdmissionState admissionState = AdmissionState::Pending;
+};
+
+struct IngressPcmPacket {
+    std::uint64_t sequence = 0;
+    std::uint64_t submittedFrames = 0;
+    std::uint32_t frameCount = 0;
+    std::uint32_t startFrame = 0;
+    std::uint32_t admittedEndFrame = 0;
+    bool silent = false;
+    std::vector<std::uint8_t> bytes;
+};
+
+struct PrebufferBank {
+    bool valid = false;
+    std::uint32_t pid = 0;
+    std::uint64_t streamId = 0;
+    DWORD streamEpoch = 0;
+    std::uint64_t formatKey = 0;
+    WAVEFORMATEXTENSIBLE format{};
+    std::uint32_t bytesPerFrame = 0;
+    std::uint32_t applicationBufferFrames = 0;
+    // The waiting queue must not shrink merely because a later runtime
+    // setting asks for a smaller T.  Same-endpoint configuration intervals
+    // preserve their already accepted FIFO, so keep the largest historical
+    // bounded capacity (or the exact merged occupancy) with the bank.
+    std::uint64_t waitingCapacityFrames = 0;
+    std::uint64_t waitingFrames = 0;
+    std::uint64_t admittedBufferedFrames = 0;
+    std::uint64_t firstPacketMs = 0;
+    bool hasNonSilentPacket = false;
+    std::deque<IngressPcmPacket> packets;
+
+    void Clear() {
+        *this = {};
+    }
 };
 
 struct AudioPidState {
@@ -1551,10 +1605,52 @@ private:
                               std::uint32_t sampleRate,
                               std::uint64_t consumedBaseline,
                               std::uint64_t consumedOffset,
-                              RendererState state,
-                              std::uint64_t blockedStreamId = 0);
+                              RendererState state);
     void PublishRendererCounters();
+    void PublishAdmission(std::uint32_t pid,
+                          std::uint64_t streamId,
+                          DWORD streamEpoch,
+                          AdmissionState state,
+                          std::uint64_t admittedFrames);
+    void ClearAdmission(std::uint32_t pid,
+                        std::uint64_t streamId,
+                        DWORD streamEpoch);
     void FeedbackThread();
+    void ProcessAudioPipeline();
+    void AdmitStandbyLocked(std::uint64_t nowMs);
+    std::uint64_t RetainedAdmissionFramesLocked(
+            const PrebufferBank& identity);
+    bool AdmitActiveWaitingLocked(std::wstring* outError);
+    void RetireWaitingOwnershipLocked(PrebufferBank& bank,
+                                      bool publishTerminalCredit,
+                                      bool clearBank);
+    bool TrimWaitingToAdmittedPrefixLocked(
+            PrebufferBank& bank,
+            bool publishTerminalCredit);
+    bool MoveUnadmittedWaitingToStandbyLocked(
+            PrebufferBank& active,
+            PrebufferBank& standby);
+    bool MergeSiblingWaitingLocked(PrebufferBank& source,
+                                   PrebufferBank& destination,
+                                   bool clearSourceBank = true);
+    bool DrainActiveAdmittedWaitingLocked(std::wstring* outError);
+    void BeginActiveDrainLocked(std::uint64_t nowMs);
+    bool StageAdmittedBankLocked(PrebufferBank& bank,
+                                 bool prepared,
+                                 std::uint64_t* outStagedFrames,
+                                 std::wstring* outError);
+    bool RequestStandbyLocked(std::uint32_t pid,
+                              std::uint64_t streamId,
+                              DWORD streamEpoch,
+                              const AudioStreamState& stream,
+                              std::uint64_t formatKey,
+                              PrebufferBank** outDestination = nullptr);
+    std::uint64_t FormatTargetKeyLocked(
+            const WAVEFORMATEXTENSIBLE& format,
+            std::uint32_t applicationBufferFrames) const;
+    void HandleStreamLifecycleMessage(DWORD pid,
+                                      const void* payload,
+                                      std::size_t payloadBytes);
     void LogRendererDiagnostics(std::uint64_t nowMs);
     void LatchPipelineFaultLocked(const std::wstring& error);
     bool WaitForCapturedDrainLocked(std::wstring* outError);
@@ -1645,6 +1741,22 @@ private:
     std::uint64_t rendererDiagnosticLastMs_ = 0;
     bool rendererDiagnosticBaselineValid_ = false;
     RendererStats rendererDiagnosticStats_{};
+    format_handoff::FormatHandoffState formatHandoff_{};
+    PrebufferBank activeBank_{};
+    PrebufferBank standbyBank_{};
+    // Once IASIO::start has been requested it is no longer cancellable, but
+    // the state must not call the bank Active until that request succeeds.
+    // Keep that one immutable candidate separate so Pipe ingress can still
+    // collect the latest replacement in standbyBank_ without blocking.
+    PrebufferBank startingBank_{};
+    bool preparedCommitInFlight_ = false;
+    bool preparedCommitAbandoned_ = false;
+    std::uint64_t preparedCommitEpoch_ = 0;
+    format_handoff::Target preparedCommitTarget_{};
+    bool activeDrainBegun_ = false;
+    std::uint64_t activeDrainStartedMs_ = 0;
+    std::uint64_t activeDrainBudgetMs_ = 0;
+    std::atomic<bool> admissionSlotExhausted_{false};
     AsioRenderer renderer_;
 };
 
@@ -1760,6 +1872,21 @@ int32_t TickByTickCore::StartTarget(const wchar_t* exePath,
         logBuffer_.clear();
         SetLastErrorLocked(L"OK");
     }
+    {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+        formatHandoff_ = {};
+        activeBank_.Clear();
+        standbyBank_.Clear();
+        startingBank_.Clear();
+        preparedCommitInFlight_ = false;
+        preparedCommitAbandoned_ = false;
+        preparedCommitEpoch_ = 0;
+        preparedCommitTarget_ = {};
+        activeDrainBegun_ = false;
+        activeDrainStartedMs_ = 0;
+        activeDrainBudgetMs_ = 0;
+        admissionSlotExhausted_.store(false, std::memory_order_release);
+    }
 
     IpcSecurityAttributes ipcSecurity;
     controlMapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE,
@@ -1832,6 +1959,17 @@ void TickByTickCore::Stop() {
     if (!running_.exchange(false)) {
         std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
         renderer_.Stop();
+        formatHandoff_ = {};
+        activeBank_.Clear();
+        standbyBank_.Clear();
+        startingBank_.Clear();
+        preparedCommitInFlight_ = false;
+        preparedCommitAbandoned_ = false;
+        preparedCommitEpoch_ = 0;
+        preparedCommitTarget_ = {};
+        activeDrainBegun_ = false;
+        activeDrainStartedMs_ = 0;
+        activeDrainBudgetMs_ = 0;
         return;
     }
 
@@ -1868,6 +2006,17 @@ void TickByTickCore::Stop() {
     {
         std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
         renderer_.Stop();
+        formatHandoff_ = {};
+        activeBank_.Clear();
+        standbyBank_.Clear();
+        startingBank_.Clear();
+        preparedCommitInFlight_ = false;
+        preparedCommitAbandoned_ = false;
+        preparedCommitEpoch_ = 0;
+        preparedCommitTarget_ = {};
+        activeDrainBegun_ = false;
+        activeDrainStartedMs_ = 0;
+        activeDrainBudgetMs_ = 0;
     }
 
     if (targetProcess_ != nullptr) {
@@ -2418,8 +2567,20 @@ void TickByTickCore::WriteControlState(std::uint32_t audioPid, bool finish) {
         InterlockedExchange(&control_->consumedLogicalBaselineHigh, 0);
         InterlockedExchange(&control_->consumedLogicalOffsetLow, 0);
         InterlockedExchange(&control_->consumedLogicalOffsetHigh, 0);
-        InterlockedExchange(&control_->blockedStreamIdLow, 0);
-        InterlockedExchange(&control_->blockedStreamIdHigh, 0);
+        for (auto& slot : control_->admissionSlots) {
+            InterlockedIncrement(&slot.sequence);
+            MemoryBarrier();
+            InterlockedExchange(&slot.pid, 0);
+            InterlockedExchange(&slot.state,
+                                static_cast<LONG>(AdmissionState::Empty));
+            InterlockedExchange(&slot.streamEpoch, 0);
+            InterlockedExchange(&slot.streamIdLow, 0);
+            InterlockedExchange(&slot.streamIdHigh, 0);
+            InterlockedExchange(&slot.admittedLow, 0);
+            InterlockedExchange(&slot.admittedHigh, 0);
+            MemoryBarrier();
+            InterlockedIncrement(&slot.sequence);
+        }
     }
     MemoryBarrier();
     InterlockedIncrement(&control_->configSequence);
@@ -2430,8 +2591,7 @@ void TickByTickCore::PublishRendererRoute(
         std::uint32_t sampleRate,
         std::uint64_t consumedBaseline,
         std::uint64_t consumedOffset,
-        RendererState state,
-        std::uint64_t blockedStreamId) {
+        RendererState state) {
     if (control_ == nullptr) {
         return;
     }
@@ -2452,10 +2612,6 @@ void TickByTickCore::PublishRendererRoute(
                         hook_protocol::CounterLow(consumedOffset));
     InterlockedExchange(&control_->consumedLogicalOffsetHigh,
                         hook_protocol::CounterHigh(consumedOffset));
-    InterlockedExchange(&control_->blockedStreamIdLow,
-                        hook_protocol::StreamIdLow(blockedStreamId));
-    InterlockedExchange(&control_->blockedStreamIdHigh,
-                        hook_protocol::StreamIdHigh(blockedStreamId));
     InterlockedExchange(&control_->rendererState, static_cast<LONG>(state));
     MemoryBarrier();
     InterlockedIncrement(&control_->configSequence);
@@ -2475,6 +2631,1655 @@ void TickByTickCore::PublishRendererCounters() {
                         hook_protocol::CounterHigh(logical));
     MemoryBarrier();
     InterlockedIncrement(&control_->counterSequence);
+}
+
+void TickByTickCore::PublishAdmission(
+        std::uint32_t pid,
+        std::uint64_t streamId,
+        DWORD streamEpoch,
+        AdmissionState state,
+        std::uint64_t admittedFrames) {
+    if (control_ == nullptr || pid == 0 ||
+        pid != lockedAudioPid_.load(std::memory_order_acquire) ||
+        streamId == 0 || streamEpoch == 0 ||
+        state == AdmissionState::Empty) {
+        return;
+    }
+    std::lock_guard<std::mutex> controlLock(controlStateMutex_);
+    std::size_t selected = hook_protocol::kAdmissionSlotCount;
+    std::size_t empty = hook_protocol::kAdmissionSlotCount;
+    for (std::size_t index = 0;
+         index < hook_protocol::kAdmissionSlotCount;
+         ++index) {
+        auto& slot = control_->admissionSlots[index];
+        const auto slotId = hook_protocol::JoinCounter(
+                slot.streamIdLow, slot.streamIdHigh);
+        if (slot.pid == static_cast<LONG>(pid) &&
+            slot.streamEpoch == static_cast<LONG>(streamEpoch) &&
+            slotId == streamId) {
+            selected = index;
+            break;
+        }
+        if (empty == hook_protocol::kAdmissionSlotCount &&
+            slot.state == static_cast<LONG>(AdmissionState::Empty)) {
+            empty = index;
+        }
+    }
+    if (selected == hook_protocol::kAdmissionSlotCount) {
+        if (empty == hook_protocol::kAdmissionSlotCount) {
+            // Never evict an authoritative Pending/Managed stream. Losing its
+            // slot would look like permanent zero credit to the Hook.
+            admissionSlotExhausted_.store(true, std::memory_order_release);
+            return;
+        }
+        selected = empty;
+    }
+    auto& slot = control_->admissionSlots[selected];
+    InterlockedIncrement(&slot.sequence);
+    MemoryBarrier();
+    InterlockedExchange(&slot.pid, static_cast<LONG>(pid));
+    InterlockedExchange(&slot.state, static_cast<LONG>(state));
+    InterlockedExchange(&slot.streamEpoch, static_cast<LONG>(streamEpoch));
+    InterlockedExchange(&slot.streamIdLow, hook_protocol::StreamIdLow(streamId));
+    InterlockedExchange(&slot.streamIdHigh, hook_protocol::StreamIdHigh(streamId));
+    InterlockedExchange(&slot.admittedLow,
+                        hook_protocol::CounterLow(admittedFrames));
+    InterlockedExchange(&slot.admittedHigh,
+                        hook_protocol::CounterHigh(admittedFrames));
+    MemoryBarrier();
+    InterlockedIncrement(&slot.sequence);
+}
+
+void TickByTickCore::ClearAdmission(std::uint32_t pid,
+                                    std::uint64_t streamId,
+                                    DWORD streamEpoch) {
+    if (control_ == nullptr || pid == 0 || streamId == 0 || streamEpoch == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> controlLock(controlStateMutex_);
+    for (auto& slot : control_->admissionSlots) {
+        if (slot.pid != static_cast<LONG>(pid) ||
+            slot.streamEpoch != static_cast<LONG>(streamEpoch) ||
+            hook_protocol::JoinCounter(slot.streamIdLow, slot.streamIdHigh) !=
+                    streamId) {
+            continue;
+        }
+        InterlockedIncrement(&slot.sequence);
+        MemoryBarrier();
+        InterlockedExchange(&slot.pid, 0);
+        InterlockedExchange(&slot.state,
+                            static_cast<LONG>(AdmissionState::Empty));
+        InterlockedExchange(&slot.streamEpoch, 0);
+        InterlockedExchange(&slot.streamIdLow, 0);
+        InterlockedExchange(&slot.streamIdHigh, 0);
+        InterlockedExchange(&slot.admittedLow, 0);
+        InterlockedExchange(&slot.admittedHigh, 0);
+        MemoryBarrier();
+        InterlockedIncrement(&slot.sequence);
+        return;
+    }
+}
+
+std::uint64_t TickByTickCore::FormatTargetKeyLocked(
+        const WAVEFORMATEXTENSIBLE& format,
+        std::uint32_t applicationBufferFrames) const {
+    std::wstring deviceId;
+    std::int32_t prebufferMs = 0;
+    std::int32_t maxAdvanceMs = 0;
+    std::int32_t bufferFrames = 0;
+    std::int32_t clockSource = -1;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        deviceId = selectedDeviceId_;
+        prebufferMs = prebufferMs_;
+        maxAdvanceMs = maxBufferAdvanceMs_;
+        bufferFrames = asioBufferFrames_;
+        clockSource = clockSourceIndex_;
+    }
+
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto append = [&hash](const void* bytes, std::size_t count) {
+        const auto* data = static_cast<const std::uint8_t*>(bytes);
+        for (std::size_t index = 0; index < count; ++index) {
+            hash ^= data[index];
+            hash *= 1099511628211ULL;
+        }
+    };
+    append(&format, sizeof(format));
+    // U participates in renderer compatibility: AsioRenderer sizes both its
+    // retained ring and conversion scratch space from the negotiated
+    // application buffer. Reusing a generation created for a smaller U can
+    // otherwise turn an otherwise valid same-format handoff into a partial
+    // write and a pipeline fault.
+    append(&applicationBufferFrames, sizeof(applicationBufferFrames));
+    append(&prebufferMs, sizeof(prebufferMs));
+    append(&maxAdvanceMs, sizeof(maxAdvanceMs));
+    append(&bufferFrames, sizeof(bufferFrames));
+    append(&clockSource, sizeof(clockSource));
+    if (!deviceId.empty()) {
+        append(deviceId.data(), deviceId.size() * sizeof(wchar_t));
+    }
+    return hash != 0 ? hash : 1;
+}
+
+void TickByTickCore::RetireWaitingOwnershipLocked(
+        PrebufferBank& bank,
+        bool publishTerminalCredit,
+        bool clearBank) {
+    if (!bank.valid) {
+        return;
+    }
+
+    const std::uint32_t pid = bank.pid;
+    const std::uint64_t streamId = bank.streamId;
+    const DWORD streamEpoch = bank.streamEpoch;
+    std::uint64_t terminalFrames = 0;
+    bool terminalOwnerStillCurrent = false;
+    const auto isSiblingOwner = [&bank, pid, streamId, streamEpoch](
+                                        const PrebufferBank& candidate) {
+        return &candidate != &bank && candidate.valid &&
+                candidate.pid == pid && candidate.streamId == streamId &&
+                candidate.streamEpoch == streamEpoch &&
+                (candidate.waitingFrames != 0 ||
+                 candidate.admittedBufferedFrames != 0 ||
+                 !candidate.packets.empty());
+    };
+    const bool hasSurvivingSibling = isSiblingOwner(activeBank_) ||
+            isSiblingOwner(standbyBank_) || isSiblingOwner(startingBank_);
+    if (publishTerminalCredit && !hasSurvivingSibling) {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        const auto pidIt = audioPids_.find(pid);
+        if (pidIt != audioPids_.end()) {
+            const auto streamIt = pidIt->second.streams.find(streamId);
+            if (streamIt != pidIt->second.streams.end() &&
+                streamIt->second.streamEpoch == streamEpoch) {
+                auto& stream = streamIt->second;
+                terminalFrames = stream.submittedFrames;
+                stream.admittedFrames = stream.submittedFrames;
+                stream.admissionState = AdmissionState::Bypassed;
+                terminalOwnerStillCurrent = true;
+            }
+        }
+    }
+
+    bank.packets.clear();
+    bank.waitingFrames = 0;
+    bank.admittedBufferedFrames = 0;
+    bank.firstPacketMs = 0;
+    bank.hasNonSilentPacket = false;
+    if (clearBank) {
+        bank.Clear();
+    }
+    if (publishTerminalCredit && terminalOwnerStillCurrent &&
+        !hasSurvivingSibling) {
+        // Bypassed is a terminal cumulative acknowledgement: Core retained
+        // the already admitted Active timeline, discarded only the waiting
+        // tail, and now relinquishes all remaining fake-WASAPI ownership.
+        PublishAdmission(pid,
+                         streamId,
+                         streamEpoch,
+                         AdmissionState::Bypassed,
+                         terminalFrames);
+    }
+}
+
+bool TickByTickCore::TrimWaitingToAdmittedPrefixLocked(
+        PrebufferBank& bank,
+        bool publishTerminalCredit) {
+    if (!bank.valid) {
+        return true;
+    }
+    std::deque<IngressPcmPacket> retainedPackets;
+    std::uint64_t retainedFrames = 0;
+    bool hasNonSilent = false;
+    for (auto& packet : bank.packets) {
+        if (packet.startFrame > packet.admittedEndFrame ||
+            packet.admittedEndFrame > packet.frameCount) {
+            return false;
+        }
+        const std::uint32_t admitted =
+                packet.admittedEndFrame - packet.startFrame;
+        if (admitted == 0) {
+            continue;
+        }
+        // The unadmitted suffix still belongs to the fake endpoint and may be
+        // retired on Reset/replacement.  The admitted prefix already belongs
+        // to Core's formal prebuffer even if a smaller prepared Ring has not
+        // physically accepted it yet.
+        packet.frameCount = packet.admittedEndFrame;
+        retainedFrames += admitted;
+        hasNonSilent = hasNonSilent || !packet.silent;
+        retainedPackets.push_back(std::move(packet));
+    }
+    if (retainedFrames != bank.admittedBufferedFrames) {
+        return false;
+    }
+    bank.packets = std::move(retainedPackets);
+    bank.waitingFrames = retainedFrames;
+    bank.admittedBufferedFrames = retainedFrames;
+    bank.hasNonSilentPacket = hasNonSilent;
+    if (bank.packets.empty()) {
+        bank.firstPacketMs = 0;
+    }
+
+    if (publishTerminalCredit) {
+        std::uint64_t terminalFrames = 0;
+        bool ownerStillCurrent = false;
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex_);
+            const auto pidIt = audioPids_.find(bank.pid);
+            if (pidIt != audioPids_.end()) {
+                const auto streamIt =
+                        pidIt->second.streams.find(bank.streamId);
+                if (streamIt != pidIt->second.streams.end() &&
+                    streamIt->second.streamEpoch == bank.streamEpoch) {
+                    auto& stream = streamIt->second;
+                    terminalFrames = stream.submittedFrames;
+                    stream.admittedFrames = stream.submittedFrames;
+                    stream.admissionState = AdmissionState::Bypassed;
+                    ownerStillCurrent = true;
+                }
+            }
+        }
+        if (ownerStillCurrent) {
+            PublishAdmission(bank.pid,
+                             bank.streamId,
+                             bank.streamEpoch,
+                             AdmissionState::Bypassed,
+                             terminalFrames);
+        }
+    }
+    return true;
+}
+
+bool TickByTickCore::MoveUnadmittedWaitingToStandbyLocked(
+        PrebufferBank& active,
+        PrebufferBank& standby) {
+    if (!active.valid || !standby.valid || &active == &standby ||
+        active.pid != standby.pid ||
+        active.streamId != standby.streamId ||
+        active.streamEpoch != standby.streamEpoch ||
+        active.bytesPerFrame != standby.bytesPerFrame ||
+        !WaveFormatsEqual(active.format, standby.format)) {
+        return false;
+    }
+
+    PrebufferBank suffix{};
+    suffix.valid = true;
+    suffix.pid = active.pid;
+    suffix.streamId = active.streamId;
+    suffix.streamEpoch = active.streamEpoch;
+    suffix.formatKey = standby.formatKey;
+    suffix.format = active.format;
+    suffix.bytesPerFrame = active.bytesPerFrame;
+    suffix.applicationBufferFrames = standby.applicationBufferFrames;
+    suffix.waitingCapacityFrames = active.waitingCapacityFrames;
+    suffix.firstPacketMs = active.firstPacketMs;
+
+    std::deque<IngressPcmPacket> retainedPackets;
+    std::uint64_t retainedFrames = 0;
+    std::uint64_t suffixFrames = 0;
+    bool retainedNonSilent = false;
+    bool suffixNonSilent = false;
+    try {
+        for (const auto& packet : active.packets) {
+            if (packet.startFrame > packet.admittedEndFrame ||
+                packet.admittedEndFrame > packet.frameCount) {
+                return false;
+            }
+            const std::uint32_t admitted =
+                    packet.admittedEndFrame - packet.startFrame;
+            const std::uint32_t unadmitted =
+                    packet.frameCount - packet.admittedEndFrame;
+            if (admitted != 0) {
+                IngressPcmPacket prefix = packet;
+                prefix.frameCount = packet.admittedEndFrame;
+                if (unadmitted != 0) {
+                    if (prefix.submittedFrames < unadmitted) {
+                        return false;
+                    }
+                    // Give the split prefix its true cumulative endpoint so a
+                    // later C -> B return can merge the two pieces without a
+                    // duplicate ordering key.
+                    prefix.submittedFrames -= unadmitted;
+                }
+                retainedFrames += admitted;
+                retainedNonSilent = retainedNonSilent || !prefix.silent;
+                retainedPackets.push_back(std::move(prefix));
+            }
+            if (unadmitted != 0) {
+                IngressPcmPacket tail = packet;
+                tail.startFrame = packet.admittedEndFrame;
+                tail.admittedEndFrame = tail.startFrame;
+                suffixFrames += unadmitted;
+                suffixNonSilent = suffixNonSilent || !tail.silent;
+                suffix.packets.push_back(std::move(tail));
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+    if (retainedFrames != active.admittedBufferedFrames ||
+        retainedFrames + suffixFrames != active.waitingFrames) {
+        return false;
+    }
+
+    active.packets = std::move(retainedPackets);
+    active.waitingFrames = retainedFrames;
+    active.admittedBufferedFrames = retainedFrames;
+    active.hasNonSilentPacket = retainedNonSilent;
+    if (active.packets.empty()) {
+        active.firstPacketMs = 0;
+    }
+
+    if (suffixFrames == 0) {
+        return true;
+    }
+    suffix.waitingFrames = suffixFrames;
+    suffix.admittedBufferedFrames = 0;
+    suffix.hasNonSilentPacket = suffixNonSilent;
+    suffix.waitingCapacityFrames = (std::max)(
+            suffix.waitingCapacityFrames, suffixFrames);
+    // Merge sorts by cumulative submission endpoint and moves Standby's
+    // existing admission quantity onto the earliest continuous FIFO prefix.
+    // Thus a later C packet can never retain credit ahead of this earlier B
+    // suffix merely because C was admitted while IASIO::start was in flight.
+    return MergeSiblingWaitingLocked(suffix, standby);
+}
+
+bool TickByTickCore::MergeSiblingWaitingLocked(
+        PrebufferBank& source,
+        PrebufferBank& destination,
+        bool clearSourceBank) {
+    if (!source.valid || !destination.valid || &source == &destination ||
+        source.pid != destination.pid ||
+        source.streamId != destination.streamId ||
+        source.streamEpoch != destination.streamEpoch ||
+        source.bytesPerFrame != destination.bytesPerFrame ||
+        !WaveFormatsEqual(source.format, destination.format)) {
+        return false;
+    }
+    const std::uint64_t mergedWaitingFrames =
+            source.waitingFrames + destination.waitingFrames;
+    const std::uint64_t mergedAdmittedFrames =
+            source.admittedBufferedFrames +
+            destination.admittedBufferedFrames;
+    if (mergedAdmittedFrames > mergedWaitingFrames) {
+        return false;
+    }
+    std::uint64_t packetWaitingFrames = 0;
+    const auto countPacketFrames = [&packetWaitingFrames](
+                                           const auto& packets) {
+        for (const auto& packet : packets) {
+            packetWaitingFrames += packet.frameCount - packet.startFrame;
+        }
+    };
+    countPacketFrames(source.packets);
+    countPacketFrames(destination.packets);
+    if (packetWaitingFrames != mergedWaitingFrames) {
+        return false;
+    }
+    auto sourceIt = source.packets.cbegin();
+    auto destinationIt = destination.packets.cbegin();
+    while (sourceIt != source.packets.cend() &&
+           destinationIt != destination.packets.cend()) {
+        if (sourceIt->submittedFrames == destinationIt->submittedFrames) {
+            return false;
+        }
+        if (sourceIt->submittedFrames < destinationIt->submittedFrames) {
+            ++sourceIt;
+        } else {
+            ++destinationIt;
+        }
+    }
+
+    std::deque<IngressPcmPacket> merged;
+    while (!source.packets.empty() || !destination.packets.empty()) {
+        const bool takeSource = destination.packets.empty() ||
+                (!source.packets.empty() &&
+                 source.packets.front().submittedFrames <
+                         destination.packets.front().submittedFrames);
+        auto& selected = takeSource ? source.packets : destination.packets;
+        merged.push_back(std::move(selected.front()));
+        selected.pop_front();
+    }
+    destination.packets = std::move(merged);
+    destination.waitingFrames = mergedWaitingFrames;
+    destination.admittedBufferedFrames = mergedAdmittedFrames;
+    destination.waitingCapacityFrames = (std::max)(
+            (std::max)(source.waitingCapacityFrames,
+                       destination.waitingCapacityFrames),
+            mergedWaitingFrames);
+    // Admission credit is cumulative for the stream, not attached to a
+    // particular bank packet. After merging sibling configuration intervals,
+    // normalize the same admitted quantity onto the earliest FIFO prefix so a
+    // later Stage can never skip an older unadmitted packet and reorder PCM.
+    std::uint64_t admissionRemaining = mergedAdmittedFrames;
+    for (auto& packet : destination.packets) {
+        packet.admittedEndFrame = packet.startFrame;
+        const std::uint32_t available = packet.frameCount - packet.startFrame;
+        const std::uint32_t admitted = static_cast<std::uint32_t>((std::min)(
+                admissionRemaining,
+                static_cast<std::uint64_t>(available)));
+        packet.admittedEndFrame += admitted;
+        admissionRemaining -= admitted;
+    }
+    if (destination.firstPacketMs == 0 ||
+        (source.firstPacketMs != 0 &&
+         source.firstPacketMs < destination.firstPacketMs)) {
+        destination.firstPacketMs = source.firstPacketMs;
+    }
+    destination.hasNonSilentPacket = destination.hasNonSilentPacket ||
+            source.hasNonSilentPacket;
+    if (clearSourceBank) {
+        source.Clear();
+    } else {
+        source.packets.clear();
+        source.waitingFrames = 0;
+        source.admittedBufferedFrames = 0;
+        source.firstPacketMs = 0;
+        source.hasNonSilentPacket = false;
+    }
+    return true;
+}
+
+std::uint64_t TickByTickCore::RetainedAdmissionFramesLocked(
+        const PrebufferBank& identity) {
+    if (!identity.valid) {
+        return 0;
+    }
+    const auto matches = [&identity](const PrebufferBank& candidate) {
+        return candidate.valid && candidate.pid == identity.pid &&
+                candidate.streamId == identity.streamId &&
+                candidate.streamEpoch == identity.streamEpoch;
+    };
+    std::uint64_t retained = 0;
+    const auto add = [&retained](std::uint64_t frames) {
+        retained = frames >
+                           (std::numeric_limits<std::uint64_t>::max)() -
+                                   retained
+                ? (std::numeric_limits<std::uint64_t>::max)()
+                : retained + frames;
+    };
+    if (matches(activeBank_)) {
+        add(activeBank_.admittedBufferedFrames);
+    }
+    if (matches(standbyBank_)) {
+        add(standbyBank_.admittedBufferedFrames);
+    }
+    if (matches(startingBank_)) {
+        add(startingBank_.admittedBufferedFrames);
+    }
+
+    // Frames already staged in the renderer are part of the same admission
+    // waterline even though StageAdmittedBankLocked removed them from the raw
+    // bank.  Counting them prevents B -> C -> B loops from granting a fresh T
+    // on every pass while IASIO::start is still in flight.
+    const bool rendererOwnsIdentity = preparedCommitInFlight_
+            ? matches(startingBank_)
+            : matches(activeBank_);
+    if (rendererOwnsIdentity) {
+        const std::int64_t rendererRetained =
+                renderer_.AdmissionRetentionFrames();
+        add(static_cast<std::uint64_t>((std::max<std::int64_t>)(
+                rendererRetained, 0)));
+    }
+    return retained;
+}
+
+void TickByTickCore::BeginActiveDrainLocked(std::uint64_t nowMs) {
+    if (activeDrainBegun_) {
+        return;
+    }
+    renderer_.BeginCapturedDrain();
+    activeDrainBegun_ = true;
+    activeDrainStartedMs_ = nowMs;
+
+    const std::uint64_t rendererFrames = static_cast<std::uint64_t>(
+            (std::max<std::int64_t>)(
+                    renderer_.AdmissionRetentionFrames(), 0));
+    const std::uint64_t retainedFrames =
+            activeBank_.admittedBufferedFrames >
+                            (std::numeric_limits<std::uint64_t>::max)() -
+                                    rendererFrames
+            ? (std::numeric_limits<std::uint64_t>::max)()
+            : rendererFrames + activeBank_.admittedBufferedFrames;
+    const std::uint32_t sampleRate =
+            activeBank_.format.Format.nSamplesPerSec;
+    const std::uint64_t retainedMs = sampleRate == 0
+            ? 0
+            : retainedFrames >
+                              ((std::numeric_limits<std::uint64_t>::max)() -
+                               sampleRate + 1U) /
+                                      1000U
+            ? (std::numeric_limits<std::uint64_t>::max)()
+            : (retainedFrames * 1000U + sampleRate - 1U) / sampleRate;
+    std::uint64_t configuredMs = 0;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        configuredMs = static_cast<std::uint64_t>((std::max)(
+                prebufferMs_, rendererPrebufferMs_));
+    }
+    const std::uint64_t nominalMs = (std::max)(retainedMs, configuredMs);
+    activeDrainBudgetMs_ = nominalMs >
+                    (std::numeric_limits<std::uint64_t>::max)() - 5000U
+            ? (std::numeric_limits<std::uint64_t>::max)()
+            : nominalMs + 5000U;
+}
+
+bool TickByTickCore::DrainActiveAdmittedWaitingLocked(
+        std::wstring* outError) {
+    if (!activeBank_.valid || !renderer_.IsRunning() ||
+        !activeDrainBegun_) {
+        return true;
+    }
+    while (!activeBank_.packets.empty()) {
+        auto& packet = activeBank_.packets.front();
+        if (packet.startFrame > packet.admittedEndFrame ||
+            packet.admittedEndFrame > packet.frameCount) {
+            if (outError != nullptr) {
+                *outError = L"The draining Active bank has an invalid FIFO admission boundary.";
+            }
+            return false;
+        }
+        if (packet.startFrame == packet.frameCount) {
+            activeBank_.packets.pop_front();
+            continue;
+        }
+        const std::uint32_t admitted =
+                packet.admittedEndFrame - packet.startFrame;
+        if (admitted == 0) {
+            break;
+        }
+        const std::int64_t available =
+                renderer_.AvailableTimelineWriteFrames();
+        if (available <= 0) {
+            break;
+        }
+        const std::uint32_t take = static_cast<std::uint32_t>((std::min)(
+                static_cast<std::uint64_t>(admitted),
+                static_cast<std::uint64_t>(available)));
+        if (activeBank_.waitingFrames < take ||
+            activeBank_.admittedBufferedFrames < take) {
+            if (outError != nullptr) {
+                *outError = L"The draining Active bank lost its retained frame accounting.";
+            }
+            return false;
+        }
+        std::wstring pushError;
+        const std::uint32_t written = packet.silent
+                ? renderer_.PushCapturedSilence(take, &pushError)
+                : renderer_.PushPcm(
+                          packet.bytes.data() +
+                                  static_cast<std::size_t>(packet.startFrame) *
+                                          activeBank_.bytesPerFrame,
+                          take,
+                          &pushError);
+        if (written != take || !pushError.empty()) {
+            if (outError != nullptr) {
+                *outError = pushError.empty()
+                        ? L"The draining ASIO Ring accepted only part of an already-admitted Active prefix."
+                        : pushError;
+            }
+            return false;
+        }
+        packet.startFrame += take;
+        activeBank_.waitingFrames -= take;
+        activeBank_.admittedBufferedFrames -= take;
+        if (packet.startFrame == packet.frameCount) {
+            activeBank_.packets.pop_front();
+        }
+    }
+    return true;
+}
+
+bool TickByTickCore::RequestStandbyLocked(
+        std::uint32_t pid,
+        std::uint64_t streamId,
+        DWORD streamEpoch,
+        const AudioStreamState& stream,
+        std::uint64_t formatKey,
+        PrebufferBank** outDestination) {
+    if (outDestination != nullptr) {
+        *outDestination = nullptr;
+    }
+    const format_handoff::Target target{
+            pid, streamEpoch, streamId, formatKey};
+
+    if (preparedCommitInFlight_) {
+        if (target == preparedCommitTarget_) {
+            if (!startingBank_.valid || startingBank_.pid != pid ||
+                startingBank_.streamId != streamId ||
+                startingBank_.streamEpoch != streamEpoch ||
+                startingBank_.formatKey != formatKey) {
+                return false;
+            }
+            // latest-wins also applies while IASIO::start is in flight. In a
+            // B -> C -> B sequence, the last B request cancels the deferred C;
+            // otherwise C would be replayed immediately after B commits.
+            if (standbyBank_.valid) {
+                const bool sameIngressIdentity =
+                        standbyBank_.pid == startingBank_.pid &&
+                        standbyBank_.streamId == startingBank_.streamId &&
+                        standbyBank_.streamEpoch == startingBank_.streamEpoch;
+                if (sameIngressIdentity) {
+                    // C may already contain admitted frames from the same
+                    // cumulative endpoint ledger. Preserve those raw packets
+                    // behind B instead of whole-stream terminal-crediting them.
+                    if (!MergeSiblingWaitingLocked(standbyBank_,
+                                                   startingBank_)) {
+                        return false;
+                    }
+                } else {
+                    RetireWaitingOwnershipLocked(standbyBank_, true, true);
+                }
+            }
+            if (outDestination != nullptr) {
+                *outDestination = &startingBank_;
+            }
+            return true;
+        }
+
+        const bool deferredMatches = standbyBank_.valid &&
+                standbyBank_.pid == pid &&
+                standbyBank_.streamId == streamId &&
+                standbyBank_.streamEpoch == streamEpoch &&
+                standbyBank_.formatKey == formatKey;
+        if (!deferredMatches) {
+            const bool preservesSameIngress = standbyBank_.valid &&
+                    standbyBank_.pid == pid &&
+                    standbyBank_.streamId == streamId &&
+                    standbyBank_.streamEpoch == streamEpoch;
+            if (standbyBank_.valid && !preservesSameIngress) {
+                RetireWaitingOwnershipLocked(standbyBank_, true, true);
+            }
+            standbyBank_.valid = true;
+            standbyBank_.pid = pid;
+            standbyBank_.streamId = streamId;
+            standbyBank_.streamEpoch = streamEpoch;
+            standbyBank_.formatKey = formatKey;
+            standbyBank_.format = stream.format;
+            standbyBank_.bytesPerFrame = stream.bytesPerFrame;
+            standbyBank_.applicationBufferFrames =
+                    stream.applicationBufferFrames;
+        }
+        PublishAdmission(pid,
+                         streamId,
+                         streamEpoch,
+                         AdmissionState::Pending,
+                         stream.admittedFrames);
+        if (outDestination != nullptr) {
+            *outDestination = &standbyBank_;
+        }
+        return true;
+    }
+
+    const auto request = formatHandoff_.Request(target);
+    if (!request.Accepted()) {
+        return false;
+    }
+
+    const bool returnedToActive =
+            request.disposition ==
+                    format_handoff::RequestDisposition::CancelledBackToActive ||
+            (request.disposition ==
+                     format_handoff::RequestDisposition::NoChange &&
+             formatHandoff_.CurrentPhase() == format_handoff::Phase::Active &&
+             formatHandoff_.HasActive() &&
+             formatHandoff_.ActiveTarget() == target);
+    if (returnedToActive) {
+        const bool activeMatches = activeBank_.valid &&
+                activeBank_.pid == pid && activeBank_.streamId == streamId &&
+                activeBank_.streamEpoch == streamEpoch &&
+                activeBank_.formatKey == formatKey;
+        if (!activeMatches) {
+            return false;
+        }
+
+        if (standbyBank_.valid) {
+            const bool sameIngressIdentity =
+                    standbyBank_.pid == activeBank_.pid &&
+                    standbyBank_.streamId == activeBank_.streamId &&
+                    standbyBank_.streamEpoch == activeBank_.streamEpoch;
+            if (sameIngressIdentity) {
+                if (!MergeSiblingWaitingLocked(standbyBank_, activeBank_)) {
+                    return false;
+                }
+            } else {
+                RetireWaitingOwnershipLocked(standbyBank_, true, true);
+            }
+        }
+        if (activeDrainBegun_) {
+            renderer_.EndCapturedDrain();
+        }
+        activeDrainBegun_ = false;
+        activeDrainStartedMs_ = 0;
+        activeDrainBudgetMs_ = 0;
+        if (outDestination != nullptr) {
+            *outDestination = &activeBank_;
+        }
+        PublishAdmission(pid,
+                         streamId,
+                         streamEpoch,
+                         AdmissionState::Pending,
+                         stream.admittedFrames);
+        PublishRendererRoute(streamId,
+                             stream.format.Format.nSamplesPerSec,
+                             publishedConsumedBaseline_,
+                             publishedConsumedOffset_,
+                             RendererState::Running);
+        return true;
+    }
+
+    const bool bankMatches = standbyBank_.valid && standbyBank_.pid == pid &&
+            standbyBank_.streamId == streamId &&
+            standbyBank_.streamEpoch == streamEpoch &&
+            standbyBank_.formatKey == formatKey;
+    if (!bankMatches) {
+        const bool preservesSameIngress = standbyBank_.valid &&
+                standbyBank_.pid == pid && standbyBank_.streamId == streamId &&
+                standbyBank_.streamEpoch == streamEpoch;
+        if (standbyBank_.valid && !preservesSameIngress) {
+            RetireWaitingOwnershipLocked(standbyBank_, true, true);
+        }
+        standbyBank_.valid = true;
+        standbyBank_.pid = pid;
+        standbyBank_.streamId = streamId;
+        standbyBank_.streamEpoch = streamEpoch;
+        standbyBank_.formatKey = formatKey;
+        standbyBank_.format = stream.format;
+        standbyBank_.bytesPerFrame = stream.bytesPerFrame;
+        standbyBank_.applicationBufferFrames =
+                stream.applicationBufferFrames;
+
+    }
+
+    const bool sameIngressIdentity = activeBank_.valid &&
+            activeBank_.pid == pid && activeBank_.streamId == streamId &&
+            activeBank_.streamEpoch == streamEpoch;
+    if (sameIngressIdentity &&
+        (!activeBank_.packets.empty() || activeBank_.waitingFrames != 0 ||
+         activeBank_.admittedBufferedFrames != 0)) {
+        // The formal prefix remains owned by the old Active configuration and
+        // drains before the switch. Retag only its unadmitted suffix into the
+        // latest Standby, preserving cumulative FIFO order and U ownership.
+        // This must also run when Standby already matched: that is the common
+        // prepared-commit B -> C window.
+        if (!MoveUnadmittedWaitingToStandbyLocked(activeBank_,
+                                                  standbyBank_)) {
+            return false;
+        }
+    }
+
+    const bool activeHasDifferentIngressOwner = activeBank_.valid &&
+            (activeBank_.pid != pid || activeBank_.streamId != streamId ||
+             activeBank_.streamEpoch != streamEpoch);
+    if (activeHasDifferentIngressOwner &&
+        (!activeBank_.packets.empty() || activeBank_.waitingFrames != 0 ||
+         activeBank_.admittedBufferedFrames != 0)) {
+        if (!TrimWaitingToAdmittedPrefixLocked(activeBank_, true)) {
+            return false;
+        }
+    }
+
+    if (formatHandoff_.HasActive() && renderer_.IsRunning() &&
+        !activeDrainBegun_) {
+        BeginActiveDrainLocked(NowMs());
+        Log(L"Format handoff draining Active bank. activeStream=%llu standbyStream=%llu epoch=%lu",
+            static_cast<unsigned long long>(
+                    formatHandoff_.ActiveTarget().streamId),
+            static_cast<unsigned long long>(streamId),
+            static_cast<unsigned long>(streamEpoch));
+    }
+
+    PublishAdmission(pid,
+                     streamId,
+                     streamEpoch,
+                     AdmissionState::Pending,
+                     stream.admittedFrames);
+    PublishRendererRoute(streamId,
+                         stream.format.Format.nSamplesPerSec,
+                         0,
+                         0,
+                         RendererState::Reconfiguring);
+    if (outDestination != nullptr) {
+        *outDestination = &standbyBank_;
+    }
+    return true;
+}
+
+void TickByTickCore::AdmitStandbyLocked(std::uint64_t nowMs) {
+    if (!standbyBank_.valid || standbyBank_.streamEpoch == 0) {
+        return;
+    }
+    std::int32_t prebufferMs = 0;
+    std::uint32_t requestedAsioBufferFrames = 0;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        prebufferMs = prebufferMs_;
+        requestedAsioBufferFrames = static_cast<std::uint32_t>((std::max)(
+                asioBufferFrames_, 0));
+    }
+    const std::uint64_t configuredTargetFrames = FramesFromMilliseconds(
+            standbyBank_.format.Format.nSamplesPerSec, prebufferMs);
+    // T=0 means no additional delay, not a one-frame producer throttle.
+    // Keep one real supply quantum so the ASIO callback can receive a useful
+    // page at a time; this quantum is delivery granularity, not Bridge delay.
+    const std::uint64_t zeroDelaySupplyFrames = (std::max<std::uint64_t>)(
+            1,
+            requestedAsioBufferFrames != 0
+                    ? requestedAsioBufferFrames
+                    : standbyBank_.format.Format.nSamplesPerSec / 100U);
+    const std::uint64_t targetFrames = configuredTargetFrames != 0
+            ? configuredTargetFrames
+            : zeroDelaySupplyFrames;
+    const std::uint64_t readyTargetFrames =
+            (std::max<std::uint64_t>)(1, configuredTargetFrames);
+    std::uint64_t retainedAdmittedFrames =
+            RetainedAdmissionFramesLocked(standbyBank_);
+    std::uint64_t admissionBudget = retainedAdmittedFrames < targetFrames
+            ? targetFrames - retainedAdmittedFrames
+            : 0;
+    std::uint64_t newlyAdmitted = 0;
+    for (auto& packet : standbyBank_.packets) {
+        if (admissionBudget == 0) {
+            break;
+        }
+        const std::uint32_t available =
+                packet.frameCount - packet.admittedEndFrame;
+        const std::uint32_t take = static_cast<std::uint32_t>((std::min)(
+                static_cast<std::uint64_t>(available), admissionBudget));
+        packet.admittedEndFrame += take;
+        standbyBank_.admittedBufferedFrames += take;
+        newlyAdmitted += take;
+        admissionBudget -= take;
+    }
+    retainedAdmittedFrames = retainedAdmittedFrames >
+                    (std::numeric_limits<std::uint64_t>::max)() - newlyAdmitted
+            ? (std::numeric_limits<std::uint64_t>::max)()
+            : retainedAdmittedFrames + newlyAdmitted;
+
+    std::uint64_t admittedTotal = 0;
+    if (newlyAdmitted != 0) {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        auto pidIt = audioPids_.find(standbyBank_.pid);
+        if (pidIt == audioPids_.end()) {
+            return;
+        }
+        auto streamIt = pidIt->second.streams.find(standbyBank_.streamId);
+        if (streamIt == pidIt->second.streams.end() ||
+            streamIt->second.streamEpoch != standbyBank_.streamEpoch ||
+            streamIt->second.admittedFrames >
+                    streamIt->second.submittedFrames ||
+            newlyAdmitted > streamIt->second.submittedFrames -
+                                    streamIt->second.admittedFrames) {
+            return;
+        }
+        streamIt->second.admittedFrames += newlyAdmitted;
+        streamIt->second.admissionState = AdmissionState::Managed;
+        admittedTotal = streamIt->second.admittedFrames;
+    } else {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        const auto pidIt = audioPids_.find(standbyBank_.pid);
+        if (pidIt != audioPids_.end()) {
+            const auto streamIt =
+                    pidIt->second.streams.find(standbyBank_.streamId);
+            if (streamIt != pidIt->second.streams.end() &&
+                streamIt->second.streamEpoch == standbyBank_.streamEpoch) {
+                admittedTotal = streamIt->second.admittedFrames;
+            }
+        }
+    }
+    if (newlyAdmitted != 0) {
+        PublishAdmission(standbyBank_.pid,
+                         standbyBank_.streamId,
+                         standbyBank_.streamEpoch,
+                         AdmissionState::Managed,
+                         admittedTotal);
+    }
+
+    const bool targetReady = retainedAdmittedFrames >= readyTargetFrames;
+    const bool startupDeadlineReached = standbyBank_.firstPacketMs != 0 &&
+            nowMs - standbyBank_.firstPacketMs >=
+                    kSilentBootstrapStartDelayMs;
+    if (standbyBank_.admittedBufferedFrames != 0 &&
+        (targetReady || startupDeadlineReached) &&
+        formatHandoff_.HasDesired() &&
+        formatHandoff_.DesiredTarget().pid == standbyBank_.pid &&
+        formatHandoff_.DesiredTarget().streamEpoch ==
+                standbyBank_.streamEpoch &&
+        formatHandoff_.DesiredTarget().streamId == standbyBank_.streamId &&
+        formatHandoff_.DesiredTarget().formatKey == standbyBank_.formatKey) {
+        formatHandoff_.MarkStandbyReady(formatHandoff_.DesiredEpoch());
+    }
+}
+
+bool TickByTickCore::AdmitActiveWaitingLocked(std::wstring* outError) {
+    if (!activeBank_.valid || !renderer_.IsRunning() ||
+        formatHandoff_.CurrentPhase() != format_handoff::Phase::Active) {
+        return true;
+    }
+    std::int32_t prebufferMs = 0;
+    std::uint32_t requestedAsioBufferFrames = 0;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        prebufferMs = prebufferMs_;
+        requestedAsioBufferFrames = static_cast<std::uint32_t>((std::max)(
+                asioBufferFrames_, 0));
+    }
+    const std::uint64_t configuredTargetFrames = FramesFromMilliseconds(
+            activeBank_.format.Format.nSamplesPerSec, prebufferMs);
+    std::uint64_t targetFrames = configuredTargetFrames;
+    if (targetFrames == 0) {
+        const RendererStats stats = renderer_.GetStats();
+        const std::uint64_t actualBufferFrames =
+                stats.asioActualBufferFrames > 0
+                ? static_cast<std::uint64_t>(stats.asioActualBufferFrames)
+                : 0;
+        targetFrames = (std::max<std::uint64_t>)(
+                1,
+                actualBufferFrames != 0
+                        ? actualBufferFrames
+                        : requestedAsioBufferFrames != 0
+                        ? requestedAsioBufferFrames
+                        : activeBank_.format.Format.nSamplesPerSec / 100U);
+    }
+    std::uint64_t pending = static_cast<std::uint64_t>((std::max<std::int64_t>)(
+            renderer_.PendingTimelineFrames(), 0));
+    if (pending >= targetFrames) {
+        return true;
+    }
+
+    std::uint64_t admittedNow = 0;
+    while (!activeBank_.packets.empty() && pending < targetFrames) {
+        auto& packet = activeBank_.packets.front();
+        const std::uint32_t remaining = packet.frameCount - packet.startFrame;
+        const std::uint32_t take = static_cast<std::uint32_t>((std::min)(
+                static_cast<std::uint64_t>(remaining), targetFrames - pending));
+        if (take == 0) {
+            break;
+        }
+        if (packet.admittedEndFrame < packet.startFrame) {
+            if (outError != nullptr) {
+                *outError = L"Active waiting packet has an invalid admission boundary.";
+            }
+            return false;
+        }
+        const std::uint32_t alreadyAdmitted =
+                (std::min)(take,
+                           packet.admittedEndFrame - packet.startFrame);
+        if (alreadyAdmitted > activeBank_.admittedBufferedFrames) {
+            if (outError != nullptr) {
+                *outError = L"Active waiting bank lost its pre-admitted frame accounting.";
+            }
+            return false;
+        }
+        std::wstring pushError;
+        const std::uint32_t written = packet.silent
+                ? renderer_.PushCapturedSilence(take, &pushError)
+                : renderer_.PushPcm(
+                          packet.bytes.data() +
+                                  static_cast<std::size_t>(packet.startFrame) *
+                                          activeBank_.bytesPerFrame,
+                          take,
+                          &pushError);
+        if (written != take || !pushError.empty()) {
+            if (outError != nullptr) {
+                *outError = pushError.empty()
+                        ? L"Active prebuffer could not accept waiting PCM."
+                        : pushError;
+            }
+            return false;
+        }
+        packet.startFrame += take;
+        if (packet.startFrame > packet.admittedEndFrame) {
+            packet.admittedEndFrame = packet.startFrame;
+        }
+        activeBank_.waitingFrames -= take;
+        activeBank_.admittedBufferedFrames -= alreadyAdmitted;
+        pending += take;
+        admittedNow += take - alreadyAdmitted;
+        if (packet.startFrame == packet.frameCount) {
+            activeBank_.packets.pop_front();
+        }
+    }
+
+    if (admittedNow != 0) {
+        std::uint64_t admittedTotal = 0;
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex_);
+            auto pidIt = audioPids_.find(activeBank_.pid);
+            if (pidIt == audioPids_.end()) {
+                return false;
+            }
+            auto streamIt = pidIt->second.streams.find(activeBank_.streamId);
+            if (streamIt == pidIt->second.streams.end() ||
+                streamIt->second.streamEpoch != activeBank_.streamEpoch ||
+                streamIt->second.admittedFrames >
+                        streamIt->second.submittedFrames ||
+                admittedNow > streamIt->second.submittedFrames -
+                                      streamIt->second.admittedFrames) {
+                return false;
+            }
+            streamIt->second.admittedFrames += admittedNow;
+            streamIt->second.admissionState = AdmissionState::Managed;
+            admittedTotal = streamIt->second.admittedFrames;
+        }
+        PublishAdmission(activeBank_.pid,
+                         activeBank_.streamId,
+                         activeBank_.streamEpoch,
+                         AdmissionState::Managed,
+                         admittedTotal);
+    }
+    return true;
+}
+
+bool TickByTickCore::StageAdmittedBankLocked(
+        PrebufferBank& bank,
+        bool prepared,
+        std::uint64_t* outStagedFrames,
+        std::wstring* outError) {
+    if (outStagedFrames != nullptr) {
+        *outStagedFrames = 0;
+    }
+    std::vector<AsioRenderer::CapturedBatchItem> batchItems;
+    try {
+        batchItems.reserve(bank.packets.size());
+    } catch (...) {
+        if (outError != nullptr) {
+            *outError = L"Core could not allocate the atomic Standby batch descriptor.";
+        }
+        return false;
+    }
+    std::uint64_t stagedFrames = 0;
+    std::uint64_t availableFrames = prepared
+            ? static_cast<std::uint64_t>((std::max<std::int64_t>)(
+                      renderer_.AvailableTimelineWriteFrames(), 0))
+            : (std::numeric_limits<std::uint64_t>::max)();
+    for (const auto& packet : bank.packets) {
+        if (packet.startFrame > packet.admittedEndFrame ||
+            packet.admittedEndFrame > packet.frameCount) {
+            if (outError != nullptr) {
+                *outError = L"The Standby prebuffer has an invalid FIFO admission boundary.";
+            }
+            return false;
+        }
+        if (packet.startFrame == packet.frameCount) {
+            continue;
+        }
+        std::uint32_t frames =
+                packet.admittedEndFrame - packet.startFrame;
+        if (frames == 0) {
+            // Admission is normalized to one FIFO prefix.  A later packet may
+            // not jump over this unadmitted tail.
+            break;
+        }
+        if (prepared) {
+            if (availableFrames == 0) {
+                break;
+            }
+            frames = static_cast<std::uint32_t>((std::min)(
+                    static_cast<std::uint64_t>(frames),
+                    availableFrames));
+        }
+        const std::uint8_t* packetData = packet.silent
+                ? nullptr
+                : packet.bytes.data() +
+                          static_cast<std::size_t>(packet.startFrame) *
+                                  bank.bytesPerFrame;
+        batchItems.push_back({packetData, frames, packet.silent});
+        stagedFrames += frames;
+        availableFrames -= prepared ? frames : 0;
+        if (frames < packet.admittedEndFrame - packet.startFrame) {
+            break;
+        }
+    }
+    if (stagedFrames == 0) {
+        if (outError != nullptr) {
+            *outError = L"The Standby prebuffer contained no admitted PCM that fit the prepared renderer.";
+        }
+        return false;
+    }
+    if (bank.waitingFrames < stagedFrames ||
+        bank.admittedBufferedFrames < stagedFrames) {
+        if (outError != nullptr) {
+            *outError = L"The Standby prebuffer lost its admitted batch accounting.";
+        }
+        return false;
+    }
+    std::uint64_t writtenFrames = 0;
+    std::wstring pushError;
+    if (!renderer_.PushCapturedBatch(batchItems,
+                                     prepared,
+                                     &writtenFrames,
+                                     &pushError) ||
+        writtenFrames != stagedFrames) {
+        if (outError != nullptr) {
+            *outError = pushError.empty()
+                    ? L"The ASIO Ring could not publish the complete Standby batch atomically."
+                    : pushError;
+        }
+        return false;
+    }
+
+    std::uint64_t remaining = stagedFrames;
+    while (remaining != 0 && !bank.packets.empty()) {
+        auto& packet = bank.packets.front();
+        const std::uint32_t admitted =
+                packet.admittedEndFrame - packet.startFrame;
+        const std::uint32_t take = static_cast<std::uint32_t>((std::min)(
+                remaining, static_cast<std::uint64_t>(admitted)));
+        packet.startFrame += take;
+        bank.waitingFrames -= take;
+        bank.admittedBufferedFrames -= take;
+        remaining -= take;
+        if (packet.startFrame == packet.frameCount) {
+            bank.packets.pop_front();
+        } else if (take == admitted) {
+            break;
+        }
+    }
+    if (remaining != 0) {
+        if (outError != nullptr) {
+            *outError = L"The Standby prebuffer could not retire its published batch prefix.";
+        }
+        return false;
+    }
+    if (outStagedFrames != nullptr) {
+        *outStagedFrames = stagedFrames;
+    }
+    return true;
+}
+
+void TickByTickCore::ProcessAudioPipeline() {
+    struct ReconfigureJob {
+        bool valid = false;
+        bool reuseRenderer = false;
+        std::uint64_t epoch = 0;
+        format_handoff::Target target{};
+        std::wstring deviceId;
+        WAVEFORMATEXTENSIBLE format{};
+        std::int32_t prebufferMs = 0;
+        std::int32_t maxAdvanceMs = 0;
+        std::uint32_t applicationBufferFrames = 0;
+        std::uint32_t asioBufferFrames = 0;
+        std::int32_t clockSourceIndex = -1;
+        std::uint64_t stagedFrames = 0;
+    } job;
+
+    std::wstring pipelineError;
+    bool reusedRenderer = false;
+    std::uint64_t reusedStagedFrames = 0;
+    {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+        if (pipelineFaulted_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (admissionSlotExhausted_.exchange(
+                    false, std::memory_order_acq_rel)) {
+            LatchPipelineFaultLocked(
+                    L"The admission-credit table is full; no active stream slot was evicted.");
+            return;
+        }
+        const std::uint64_t nowMs = NowMs();
+        AdmitStandbyLocked(nowMs);
+
+        // CommitPreparedStart runs on this feedback worker outside the routing
+        // lock. Pipe ingress remains live during the non-cancellable driver
+        // call and places a newer target in standbyBank_.
+        if (preparedCommitInFlight_) {
+            return;
+        }
+
+        if (formatHandoff_.CurrentPhase() != format_handoff::Phase::Active) {
+            if (formatHandoff_.HasActive() && renderer_.IsRunning()) {
+                if (!activeDrainBegun_) {
+                    BeginActiveDrainLocked(nowMs);
+                }
+                if (!DrainActiveAdmittedWaitingLocked(&pipelineError) &&
+                    pipelineError.empty()) {
+                    pipelineError =
+                            L"The already-admitted Active tail could not continue draining into ASIO.";
+                }
+                if (pipelineError.empty() &&
+                    !formatHandoff_.ActiveDrained()) {
+                    const bool reusableBoundaryReady = standbyBank_.valid &&
+                            formatHandoff_.StandbyReady() &&
+                            formatHandoff_.HasActive() &&
+                            activeBank_.waitingFrames == 0 &&
+                            activeBank_.admittedBufferedFrames == 0 &&
+                            standbyBank_.formatKey ==
+                                    formatHandoff_.ActiveTarget().formatKey &&
+                            standbyBank_.admittedBufferedFrames != 0 &&
+                            renderer_.AvailableTimelineWriteFrames() >=
+                                    static_cast<std::int64_t>(
+                                            standbyBank_.admittedBufferedFrames);
+                    const std::int64_t pendingTimeline =
+                            renderer_.PendingTimelineFrames();
+                    if (reusableBoundaryReady) {
+                        // The source/ASIO configuration is identical and the
+                        // ring has room for the whole admitted Standby. Appending
+                        // it now creates A-tail -> B as one ordered timeline;
+                        // the callback can never observe an empty gap, while A
+                        // still physically completes before B.
+                        formatHandoff_.MarkActiveDrained();
+                        activeDrainStartedMs_ = 0;
+                        activeDrainBudgetMs_ = 0;
+                    } else if (activeBank_.waitingFrames == 0 &&
+                               activeBank_.admittedBufferedFrames == 0 &&
+                               pendingTimeline == 0) {
+                        // Different configurations require a physically
+                        // confirmed empty ring, including any pre-admitted raw
+                        // Active tail, before the driver is stopped.
+                        renderer_.SettleCapturedDrain();
+                        formatHandoff_.MarkActiveDrained();
+                        activeDrainStartedMs_ = 0;
+                        activeDrainBudgetMs_ = 0;
+                    } else if (activeDrainStartedMs_ != 0 &&
+                               nowMs - activeDrainStartedMs_ >
+                                       activeDrainBudgetMs_) {
+                        pipelineError =
+                                L"Timed out while the confirmed Active prebuffer was draining for a format switch.";
+                    }
+                }
+            } else {
+                formatHandoff_.MarkActiveDrained();
+            }
+
+            if (pipelineError.empty()) {
+                const auto request = formatHandoff_.TryBeginReconfigure();
+                if (request.valid && standbyBank_.valid &&
+                    request.target.pid == standbyBank_.pid &&
+                    request.target.streamEpoch == standbyBank_.streamEpoch &&
+                    request.target.streamId == standbyBank_.streamId &&
+                    request.target.formatKey == standbyBank_.formatKey) {
+                    job.valid = true;
+                    job.epoch = request.epoch;
+                    job.target = request.target;
+                    job.format = standbyBank_.format;
+                    job.applicationBufferFrames =
+                            standbyBank_.applicationBufferFrames;
+                    job.stagedFrames = standbyBank_.admittedBufferedFrames;
+                    std::lock_guard<std::mutex> stateLock(stateMutex_);
+                    job.deviceId = selectedDeviceId_;
+                    job.prebufferMs = prebufferMs_;
+                    job.maxAdvanceMs = maxBufferAdvanceMs_;
+                    job.asioBufferFrames = static_cast<std::uint32_t>(
+                            (std::max)(asioBufferFrames_, 0));
+                    job.clockSourceIndex = clockSourceIndex_;
+                    job.reuseRenderer = rendererHasFormat_ &&
+                            renderer_.IsRunning() &&
+                            formatHandoff_.HasActive() &&
+                            request.target.formatKey ==
+                                    formatHandoff_.ActiveTarget().formatKey;
+                }
+            }
+        } else {
+            if (!AdmitActiveWaitingLocked(&pipelineError) &&
+                pipelineError.empty()) {
+                pipelineError =
+                        L"Active prebuffer admission failed without a renderer error.";
+            }
+        }
+
+        if (pipelineError.empty() && job.valid && job.reuseRenderer) {
+            // This path performs no driver call, so finish the transaction in
+            // the same routing critical section that selected the job. A
+            // Close/Reset cannot strand the renderer in drain mode between
+            // TryBeginReconfigure and the reusable commit.
+            const auto completion = formatHandoff_.CompleteReconfigure(
+                    job.epoch, true);
+            if (completion !=
+                        format_handoff::ReconfigureCompletion::ReadyToArm ||
+                !standbyBank_.valid ||
+                standbyBank_.pid != job.target.pid ||
+                standbyBank_.streamEpoch != job.target.streamEpoch ||
+                standbyBank_.streamId != job.target.streamId ||
+                standbyBank_.formatKey != job.target.formatKey) {
+                pipelineError =
+                        L"The same-config handoff lost its latest Standby bank.";
+            } else if (!StageAdmittedBankLocked(standbyBank_,
+                                                false,
+                                                &reusedStagedFrames,
+                                                &pipelineError) ||
+                       !formatHandoff_.CommitArmed(job.epoch)) {
+                if (pipelineError.empty()) {
+                    pipelineError =
+                            L"The same-config Standby could not cross its commit boundary.";
+                }
+            } else {
+                activeBank_ = std::move(standbyBank_);
+                standbyBank_.Clear();
+                if (activeDrainBegun_) {
+                    renderer_.EndCapturedDrain();
+                }
+                activeDrainBegun_ = false;
+                activeDrainStartedMs_ = 0;
+                activeDrainBudgetMs_ = 0;
+                publishedStreamId_ = activeBank_.streamId;
+                publishedConsumedBaseline_ = 0;
+                publishedConsumedOffset_ = 0;
+                {
+                    std::lock_guard<std::mutex> stateLock(stateMutex_);
+                    rendererPid_ = activeBank_.pid;
+                    rendererApplicationBufferFrames_ =
+                            activeBank_.applicationBufferFrames;
+                }
+                PublishRendererCounters();
+                PublishRendererRoute(activeBank_.streamId,
+                                     activeBank_.format.Format.nSamplesPerSec,
+                                     0,
+                                     0,
+                                     RendererState::Running);
+                reusedRenderer = true;
+                job.valid = false;
+            }
+        }
+
+        if (!pipelineError.empty()) {
+            LatchPipelineFaultLocked(pipelineError);
+            return;
+        }
+    }
+
+    if (reusedRenderer) {
+        Log(L"Bank handoff appended Standby behind the confirmed Active tail without restarting ASIO. epoch=%llu pid=%u stream=%llu streamEpoch=%lu rate=%u stagedFrames=%llu",
+            static_cast<unsigned long long>(job.epoch),
+            job.target.pid,
+            static_cast<unsigned long long>(job.target.streamId),
+            static_cast<unsigned long>(job.target.streamEpoch),
+            job.format.Format.nSamplesPerSec,
+            static_cast<unsigned long long>(reusedStagedFrames));
+        return;
+    }
+
+    if (!job.valid) {
+        return;
+    }
+
+    Log(L"ASIO reconfiguration begin. epoch=%llu stream=%llu rate=%u stagedFrames=%llu",
+        static_cast<unsigned long long>(job.epoch),
+        static_cast<unsigned long long>(job.target.streamId),
+        job.format.Format.nSamplesPerSec,
+        static_cast<unsigned long long>(job.stagedFrames));
+    std::wstring startError;
+    const bool startPrepared = renderer_.Start(
+            job.deviceId,
+            job.format,
+            job.prebufferMs,
+            job.maxAdvanceMs,
+            job.applicationBufferFrames,
+            job.asioBufferFrames,
+            job.clockSourceIndex,
+            &startError,
+            AsioRenderer::StartMode::PreparedHandoff);
+
+    bool stopPrepared = false;
+    bool beginCommit = false;
+    {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+        // Start(PreparedHandoff) has already stopped the previous driver
+        // generation. A stale result must never make that old configuration
+        // eligible for the same-config fast path.
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex_);
+            rendererHasFormat_ = false;
+            rendererPid_ = 0;
+            rendererDeviceId_.clear();
+            rendererFormat_ = {};
+            rendererApplicationBufferFrames_ = 0;
+        }
+        const auto completion = formatHandoff_.CompleteReconfigure(
+                job.epoch, startPrepared);
+        if (completion == format_handoff::ReconfigureCompletion::Stale) {
+            stopPrepared = startPrepared;
+            Log(L"Discarded stale ASIO reconfiguration result. epoch=%llu latestEpoch=%llu",
+                static_cast<unsigned long long>(job.epoch),
+                static_cast<unsigned long long>(
+                        formatHandoff_.DesiredEpoch()));
+        } else if (completion ==
+                   format_handoff::ReconfigureCompletion::FailedCurrent) {
+            pipelineError = startError.empty()
+                    ? L"ASIO could not prepare the latest Standby format."
+                    : startError;
+        } else if (completion !=
+                   format_handoff::ReconfigureCompletion::ReadyToArm) {
+            // Close/Reset or a newer request may cancel the exact epoch while
+            // the driver call is in flight. Its result is disposable, not a
+            // reason to fault the selected audio pipeline.
+            stopPrepared = startPrepared;
+            Log(L"Discarded cancelled ASIO reconfiguration result. epoch=%llu",
+                static_cast<unsigned long long>(job.epoch));
+        } else if (!standbyBank_.valid ||
+                   standbyBank_.pid != job.target.pid ||
+                   standbyBank_.streamEpoch != job.target.streamEpoch ||
+                   standbyBank_.streamId != job.target.streamId ||
+                   standbyBank_.formatKey != job.target.formatKey) {
+            stopPrepared = true;
+            // Treat a disappearing temporary stream like a cancelled epoch.
+            // The next real stream can establish a fresh target.
+            formatHandoff_ = {};
+            activeBank_.Clear();
+        } else {
+            std::uint64_t stagedFrames = 0;
+            if (!StageAdmittedBankLocked(standbyBank_,
+                                         true,
+                                         &stagedFrames,
+                                         &pipelineError)) {
+                stopPrepared = true;
+            } else {
+                startingBank_ = std::move(standbyBank_);
+                standbyBank_.Clear();
+                preparedCommitInFlight_ = true;
+                preparedCommitAbandoned_ = false;
+                preparedCommitEpoch_ = job.epoch;
+                preparedCommitTarget_ = job.target;
+                PublishRendererRoute(job.target.streamId,
+                                     job.format.Format.nSamplesPerSec,
+                                     0,
+                                     0,
+                                     RendererState::Reconfiguring);
+                beginCommit = true;
+            }
+        }
+    }
+
+    if (stopPrepared) {
+        renderer_.Stop();
+    }
+    if (!pipelineError.empty()) {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+        LatchPipelineFaultLocked(pipelineError);
+        return;
+    }
+    if (!beginCommit) {
+        return;
+    }
+
+    std::wstring commitError;
+    const bool startCommitted = renderer_.CommitPreparedStart(&commitError);
+
+    bool stopAfterCommit = false;
+    bool committed = false;
+    std::uint32_t committedPid = 0;
+    std::uint64_t committedStreamId = 0;
+    DWORD committedStreamEpoch = 0;
+    std::uint32_t committedSampleRate = 0;
+    {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+        const bool exactCommit = preparedCommitInFlight_ &&
+                preparedCommitEpoch_ == job.epoch &&
+                preparedCommitTarget_ == job.target;
+        const bool abandoned = !exactCommit || preparedCommitAbandoned_;
+        if (startCommitted && !abandoned &&
+            formatHandoff_.CommitArmed(job.epoch)) {
+            activeBank_ = std::move(startingBank_);
+            startingBank_.Clear();
+            preparedCommitInFlight_ = false;
+            preparedCommitAbandoned_ = false;
+            preparedCommitEpoch_ = 0;
+            preparedCommitTarget_ = {};
+            activeDrainBegun_ = false;
+            activeDrainStartedMs_ = 0;
+            activeDrainBudgetMs_ = 0;
+            committedPid = activeBank_.pid;
+            committedStreamId = activeBank_.streamId;
+            committedStreamEpoch = activeBank_.streamEpoch;
+            committedSampleRate = activeBank_.format.Format.nSamplesPerSec;
+            publishedStreamId_ = committedStreamId;
+            publishedConsumedBaseline_ = 0;
+            publishedConsumedOffset_ = 0;
+            rendererFaultResetAuthorized_ = false;
+            {
+                std::lock_guard<std::mutex> stateLock(stateMutex_);
+                rendererHasFormat_ = true;
+                rendererPid_ = committedPid;
+                rendererDeviceId_ = job.deviceId;
+                rendererFormat_ = activeBank_.format;
+                rendererPrebufferMs_ = job.prebufferMs;
+                rendererMaxBufferAdvanceMs_ = job.maxAdvanceMs;
+                rendererAsioBufferFrames_ =
+                        static_cast<std::int32_t>(job.asioBufferFrames);
+                rendererClockSourceIndex_ = job.clockSourceIndex;
+                rendererApplicationBufferFrames_ =
+                        activeBank_.applicationBufferFrames;
+            }
+            std::wstring activateError;
+            if (!renderer_.ActivatePreparedOutput(&activateError)) {
+                pipelineError = activateError.empty()
+                        ? L"Core committed the bank, but the prepared ASIO output gate could not open."
+                        : activateError;
+                stopAfterCommit = true;
+            } else {
+                PublishRendererCounters();
+                PublishRendererRoute(committedStreamId,
+                                     committedSampleRate,
+                                     0,
+                                     0,
+                                     RendererState::Running);
+                committed = true;
+            }
+
+            // A target that arrived after the non-cancellable start boundary
+            // becomes the one latest Standby. The just-started bank is now a
+            // real Active and must drain normally before that next switch.
+            if (committed && standbyBank_.valid) {
+                AudioStreamState deferredStream{};
+                bool foundDeferred = false;
+                {
+                    std::lock_guard<std::mutex> stateLock(stateMutex_);
+                    const auto pidIt = audioPids_.find(standbyBank_.pid);
+                    if (pidIt != audioPids_.end()) {
+                        const auto streamIt = pidIt->second.streams.find(
+                                standbyBank_.streamId);
+                        if (streamIt != pidIt->second.streams.end() &&
+                            streamIt->second.streamEpoch ==
+                                    standbyBank_.streamEpoch) {
+                            deferredStream = streamIt->second;
+                            foundDeferred = true;
+                        }
+                    }
+                }
+                if (!foundDeferred ||
+                    !RequestStandbyLocked(standbyBank_.pid,
+                                          standbyBank_.streamId,
+                                          standbyBank_.streamEpoch,
+                                          deferredStream,
+                                          standbyBank_.formatKey)) {
+                    pipelineError =
+                            L"The latest deferred Standby could not follow the committed ASIO bank.";
+                }
+            }
+        } else {
+            stopAfterCommit = startCommitted || renderer_.IsRunning();
+            const bool hasDeferredLatest = standbyBank_.valid;
+            if ((abandoned || hasDeferredLatest) && startingBank_.valid) {
+                const bool sameIngressIdentity = hasDeferredLatest &&
+                        standbyBank_.pid == startingBank_.pid &&
+                        standbyBank_.streamId == startingBank_.streamId &&
+                        standbyBank_.streamEpoch == startingBank_.streamEpoch;
+                if (sameIngressIdentity) {
+                    // B's staged prefix cannot be recovered after a failed
+                    // driver start, but every still-raw B packet remains part
+                    // of the same cumulative endpoint stream. Move it into the
+                    // latest C bank and normalize the admitted FIFO prefix.
+                    if (!MergeSiblingWaitingLocked(startingBank_,
+                                                   standbyBank_)) {
+                        pipelineError =
+                                L"The failed ASIO commit slot could not return its same-stream waiting PCM to the latest Standby.";
+                    }
+                } else {
+                    // The staged bank will never become Active. Relinquish
+                    // only its still-current fake-WASAPI ownership; lifecycle
+                    // Reset may already have advanced the epoch, in which case
+                    // no obsolete terminal slot is published.
+                    RetireWaitingOwnershipLocked(startingBank_, true, true);
+                }
+            } else {
+                startingBank_.Clear();
+            }
+            preparedCommitInFlight_ = false;
+            preparedCommitAbandoned_ = false;
+            preparedCommitEpoch_ = 0;
+            preparedCommitTarget_ = {};
+            activeBank_.Clear();
+            formatHandoff_ = {};
+            activeDrainBegun_ = false;
+            activeDrainStartedMs_ = 0;
+            activeDrainBudgetMs_ = 0;
+            {
+                std::lock_guard<std::mutex> stateLock(stateMutex_);
+                rendererHasFormat_ = false;
+                rendererPid_ = 0;
+                rendererDeviceId_.clear();
+                rendererFormat_ = {};
+                rendererApplicationBufferFrames_ = 0;
+            }
+
+            if (hasDeferredLatest && standbyBank_.valid) {
+                const format_handoff::Target deferredTarget{
+                        standbyBank_.pid,
+                        standbyBank_.streamEpoch,
+                        standbyBank_.streamId,
+                        standbyBank_.formatKey};
+                const auto deferredRequest =
+                        formatHandoff_.Request(deferredTarget);
+                if (deferredRequest.Accepted()) {
+                    formatHandoff_.MarkActiveDrained();
+                    // Re-enter through the ordinary T-or-deadline readiness
+                    // policy. A failed/stale B must not make a one-packet C
+                    // start early merely because it is already buffered.
+                    AdmitStandbyLocked(NowMs());
+                    PublishRendererRoute(standbyBank_.streamId,
+                                         standbyBank_.format.Format.nSamplesPerSec,
+                                         0,
+                                         0,
+                                         RendererState::Reconfiguring);
+                }
+            } else if (!abandoned) {
+                pipelineError = commitError.empty()
+                        ? L"IASIO::start failed before the Standby bank could become Active."
+                        : commitError;
+            }
+        }
+    }
+
+    if (stopAfterCommit) {
+        renderer_.Stop();
+    }
+    if (!pipelineError.empty()) {
+        std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+        LatchPipelineFaultLocked(pipelineError);
+        return;
+    }
+    if (committed) {
+        Log(L"ASIO handoff committed at successful start. epoch=%llu pid=%u stream=%llu streamEpoch=%lu rate=%u; callback remains Active-bank-only.",
+            static_cast<unsigned long long>(job.epoch),
+            committedPid,
+            static_cast<unsigned long long>(committedStreamId),
+            static_cast<unsigned long>(committedStreamEpoch),
+            committedSampleRate);
+    }
 }
 
 void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
@@ -2506,6 +4311,8 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
                      rendererDiagnosticStats_.totalBridgeSilentFramesQueued ||
              stats.totalBridgeSilentFramesPlayed <
                      rendererDiagnosticStats_.totalBridgeSilentFramesPlayed ||
+             stats.totalBridgeSilentFramesReplaced <
+                     rendererDiagnosticStats_.totalBridgeSilentFramesReplaced ||
              stats.totalOutputFrames < rendererDiagnosticStats_.totalOutputFrames ||
              stats.totalSilentFrames < rendererDiagnosticStats_.totalSilentFrames ||
              stats.prebufferEnterCount <
@@ -2513,7 +4320,7 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
              stats.prebufferExitCount <
                      rendererDiagnosticStats_.prebufferExitCount);
     if (!rendererDiagnosticBaselineValid_ || countersRestarted) {
-        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u startAccepted=%s callbackReady=%s silentDeferred=%s startupWait=%d ms fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms capacity=%d ms packet=%u frames playerQueued=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld realtime=%s outputReady=%s underruns=%lld dropped=%lld",
+        Log(L"Renderer flow baseline. pid=%u stream=%llu rate=%u startAccepted=%s callbackReady=%s silentDeferred=%s startupWait=%d ms fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms capacity=%d ms packet=%u frames playerQueued=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld bridgeReplaced=%lld bridgeVirtual=%lld output=%lld silentOutput=%lld realtime=%s outputReady=%s underruns=%lld dropped=%lld",
             pid,
             static_cast<unsigned long long>(streamId),
             stats.sourceSampleRate,
@@ -2533,6 +4340,8 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
             static_cast<long long>(stats.totalFramesPlayed),
             static_cast<long long>(stats.totalBridgeSilentFramesQueued),
             static_cast<long long>(stats.totalBridgeSilentFramesPlayed),
+            static_cast<long long>(stats.totalBridgeSilentFramesReplaced),
+            static_cast<long long>(stats.compensationBridgeFrames),
             static_cast<long long>(stats.totalOutputFrames),
             static_cast<long long>(stats.totalSilentFrames),
             CallbackRealtimeModeName(stats.callbackRealtimeMode),
@@ -2561,6 +4370,9 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
         const std::int64_t bridgePlayedFrames =
                 delta(stats.totalBridgeSilentFramesPlayed,
                       rendererDiagnosticStats_.totalBridgeSilentFramesPlayed);
+        const std::int64_t bridgeReplacedFrames =
+                delta(stats.totalBridgeSilentFramesReplaced,
+                      rendererDiagnosticStats_.totalBridgeSilentFramesReplaced);
         const std::int64_t outputFrames =
                 delta(stats.totalOutputFrames,
                       rendererDiagnosticStats_.totalOutputFrames);
@@ -2573,7 +4385,7 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
         const std::int64_t dropped =
                 delta(stats.totalFramesDropped,
                       rendererDiagnosticStats_.totalFramesDropped);
-        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld output=%lld silentOutput=%lld playerPending=%lld fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms packet=%u frames startAccepted=%s callbackReady=%s silentDeferred=%s startupWait=%d ms underruns=+%lld dropped=+%lld",
+        Log(L"Renderer flow. interval=%llu ms pid=%u stream=%llu rate=%u input=%lld real=%lld playerSilent=%lld logical=%lld played=%lld bridgeQueued=%lld bridgePlayed=%lld bridgeReplaced=%lld bridgeVirtual=%lld output=%lld silentOutput=%lld playerPending=%lld fill=%d ms additional=%d ms wasapi=%d ms effective=%d ms packet=%u frames startAccepted=%s callbackReady=%s silentDeferred=%s startupWait=%d ms underruns=+%lld dropped=+%lld",
             static_cast<unsigned long long>(nowMs - rendererDiagnosticLastMs_),
             pid,
             static_cast<unsigned long long>(streamId),
@@ -2586,6 +4398,8 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
             static_cast<long long>(confirmedFrames),
             static_cast<long long>(bridgeQueuedFrames),
             static_cast<long long>(bridgePlayedFrames),
+            static_cast<long long>(bridgeReplacedFrames),
+            static_cast<long long>(stats.compensationBridgeFrames),
             static_cast<long long>(outputFrames),
             static_cast<long long>(localSilentFrames),
             static_cast<long long>(inputFrames - confirmedFrames),
@@ -2609,7 +4423,7 @@ void TickByTickCore::LogRendererDiagnostics(std::uint64_t nowMs) {
 
 void TickByTickCore::FeedbackThread() {
     while (running_.load(std::memory_order_acquire)) {
-        renderer_.MaintainTimeline();
+        ProcessAudioPipeline();
         if (renderer_.IsDeferredSilenceStartDue(
                     kSilentBootstrapStartDelayMs) &&
             !pipelineFaulted_.load(std::memory_order_acquire)) {
@@ -2763,7 +4577,8 @@ void TickByTickCore::HandlePipeClient(HANDLE pipe) {
     for (;;) {
         PipeMessageHeader header{};
         if (!ReadExact(pipe, &header, sizeof(header)) ||
-            header.magic != hook_protocol::kPipeMagic) {
+            header.magic != hook_protocol::kPipeMagic ||
+            header.reserved != hook_protocol::kPipeProtocolVersion) {
             break;
         }
         if (header.payloadBytes > 64ull * 1024ull * 1024ull) {
@@ -2800,6 +4615,10 @@ void TickByTickCore::HandlePipeMessage(DWORD type,
         HandlePcmMessage(pid, payload.data(), payload.size());
         return;
     }
+    if (type == hook_protocol::kPipeStreamLifecycle) {
+        HandleStreamLifecycleMessage(pid, payload.data(), payload.size());
+        return;
+    }
     if (type == hook_protocol::kPipeFinish) {
         Log(L"Hook reported PCM finish for pid=%u", pid);
     }
@@ -2814,7 +4633,7 @@ void TickByTickCore::HandleFormatMessage(DWORD pid,
     const auto* message = static_cast<const PipeFormatMessage*>(payload);
     const WAVEFORMATEX& format = message->format.Format;
     const std::uint32_t bytesPerFrame = BytesPerFrame(format);
-    if (pid == 0 || message->streamId == 0 ||
+    if (pid == 0 || message->streamId == 0 || message->streamEpoch == 0 ||
         format.nSamplesPerSec == 0 || format.nChannels == 0 ||
         format.wBitsPerSample == 0 || bytesPerFrame == 0) {
         Log(L"Ignored invalid format from pid=%u", pid);
@@ -2822,11 +4641,18 @@ void TickByTickCore::HandleFormatMessage(DWORD pid,
     }
 
     bool shouldSelect = false;
+    bool duplicate = false;
+    bool stale = false;
+    bool conflictingDuplicate = false;
+    DWORD supersededEpoch = 0;
+    AdmissionState duplicateAdmissionState = AdmissionState::Pending;
+    std::uint64_t duplicateAdmittedFrames = 0;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         auto& state = audioPids_[pid];
 
         auto streamIt = state.streams.find(message->streamId);
+        const bool isNewStream = streamIt == state.streams.end();
         if (streamIt == state.streams.end()) {
             if (state.streams.size() >= kMaxTrackedAudioStreamsPerPid) {
                 auto oldest = state.streams.end();
@@ -2840,6 +4666,9 @@ void TickByTickCore::HandleFormatMessage(DWORD pid,
                     }
                 }
                 if (oldest != state.streams.end()) {
+                    ClearAdmission(pid,
+                                   oldest->first,
+                                   oldest->second.streamEpoch);
                     state.streams.erase(oldest);
                 }
             }
@@ -2848,23 +4677,78 @@ void TickByTickCore::HandleFormatMessage(DWORD pid,
         }
 
         const auto nowMs = NowMs();
-        streamIt->second.format = message->format;
-        streamIt->second.bytesPerFrame = bytesPerFrame;
-        streamIt->second.applicationBufferFrames =
-                message->applicationBufferFrames;
-        streamIt->second.lastFormatMs = nowMs;
-        state.latestStreamId = message->streamId;
-        state.lastFormatMs = nowMs;
-
-        std::uint32_t expected = 0;
-        shouldSelect = lockedAudioPid_.compare_exchange_strong(expected, pid);
-        if (lockedAudioPid_.load() == pid) {
-            // Remember the first usable stream, but do not initialize or
-            // reconfigure ASIO until that stream actually produces PCM.
-            if (state.activeStreamId == 0) {
-                state.activeStreamId = message->streamId;
+        auto& stream = streamIt->second;
+        if (!isNewStream && message->streamEpoch < stream.streamEpoch) {
+            stale = true;
+        } else if (!isNewStream &&
+                   message->streamEpoch == stream.streamEpoch) {
+            duplicate = WaveFormatsEqual(stream.format, message->format) &&
+                    stream.bytesPerFrame == bytesPerFrame &&
+                    stream.applicationBufferFrames ==
+                            message->applicationBufferFrames;
+            conflictingDuplicate = !duplicate;
+            if (duplicate) {
+                stream.lastFormatMs = nowMs;
+                state.latestStreamId = message->streamId;
+                state.lastFormatMs = nowMs;
+                duplicateAdmissionState = stream.admissionState;
+                duplicateAdmittedFrames = stream.admittedFrames;
             }
         }
+
+        if (!stale && !duplicate && !conflictingDuplicate) {
+            if (!isNewStream) {
+                supersededEpoch = stream.streamEpoch;
+            }
+            stream.nextPcmSequence = 1;
+            stream.submittedFrames = 0;
+            stream.admittedFrames = 0;
+            stream.admissionState = AdmissionState::Pending;
+            stream.format = message->format;
+            stream.bytesPerFrame = bytesPerFrame;
+            stream.applicationBufferFrames =
+                    message->applicationBufferFrames;
+            stream.lastFormatMs = nowMs;
+            stream.streamEpoch = message->streamEpoch;
+            state.latestStreamId = message->streamId;
+            state.lastFormatMs = nowMs;
+
+            std::uint32_t expected = 0;
+            shouldSelect = lockedAudioPid_.compare_exchange_strong(expected, pid);
+            if (lockedAudioPid_.load() == pid) {
+                // Remember the first usable stream, but do not initialize or
+                // reconfigure ASIO until that stream actually produces PCM.
+                if (state.activeStreamId == 0) {
+                    state.activeStreamId = message->streamId;
+                }
+            }
+        }
+    }
+
+    if (stale) {
+        Log(L"Ignored stale format epoch. pid=%u stream=%llu epoch=%lu",
+            pid,
+            static_cast<unsigned long long>(message->streamId),
+            static_cast<unsigned long>(message->streamEpoch));
+        return;
+    }
+    if (conflictingDuplicate) {
+        Log(L"Ignored conflicting duplicate format epoch. pid=%u stream=%llu epoch=%lu",
+            pid,
+            static_cast<unsigned long long>(message->streamId),
+            static_cast<unsigned long>(message->streamEpoch));
+        return;
+    }
+    if (duplicate) {
+        PublishAdmission(pid,
+                         message->streamId,
+                         message->streamEpoch,
+                         duplicateAdmissionState,
+                         duplicateAdmittedFrames);
+        return;
+    }
+    if (supersededEpoch != 0) {
+        ClearAdmission(pid, message->streamId, supersededEpoch);
     }
 
     if (shouldSelect) {
@@ -2876,6 +4760,182 @@ void TickByTickCore::HandleFormatMessage(DWORD pid,
         LogDetectedStream(pid, message->streamId, format);
     }
 
+    PublishAdmission(pid,
+                     message->streamId,
+                     message->streamEpoch,
+                     AdmissionState::Pending,
+                     0);
+
+}
+
+void TickByTickCore::HandleStreamLifecycleMessage(
+        DWORD pid,
+        const void* payload,
+        std::size_t payloadBytes) {
+    if (pid == 0 || payload == nullptr ||
+        payloadBytes < sizeof(PipeStreamLifecycleMessage)) {
+        return;
+    }
+    const auto* message =
+            static_cast<const PipeStreamLifecycleMessage*>(payload);
+    if (message->streamId == 0 || message->streamEpoch == 0) {
+        return;
+    }
+    const auto action = static_cast<hook_protocol::StreamLifecycleAction>(
+            message->action);
+    if (action != hook_protocol::StreamLifecycleAction::Reset &&
+        action != hook_protocol::StreamLifecycleAction::Close) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> routingLock(rendererRoutingMutex_);
+    AudioStreamState streamCopy{};
+    DWORD oldEpoch = 0;
+    bool known = false;
+    bool selectedProcess = false;
+    bool selectedStream = false;
+    bool staleClose = false;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        const auto pidIt = audioPids_.find(pid);
+        if (pidIt != audioPids_.end()) {
+            const auto streamIt = pidIt->second.streams.find(message->streamId);
+            if (streamIt != pidIt->second.streams.end()) {
+                auto& stream = streamIt->second;
+                oldEpoch = stream.streamEpoch;
+                known = true;
+                selectedProcess = lockedAudioPid_.load() == pid;
+                selectedStream =
+                        pidIt->second.activeStreamId == message->streamId;
+                if (action == hook_protocol::StreamLifecycleAction::Reset) {
+                    if (message->streamEpoch <= oldEpoch) {
+                        return;
+                    }
+                    stream.streamEpoch = message->streamEpoch;
+                    stream.nextPcmSequence = 1;
+                    stream.submittedFrames = 0;
+                    stream.admittedFrames = 0;
+                    stream.admissionState = AdmissionState::Pending;
+                    stream.lastPcmMs = 0;
+                    streamCopy = stream;
+                } else if (message->streamEpoch != oldEpoch) {
+                    staleClose = true;
+                }
+            }
+        }
+    }
+    if (!known) {
+        return;
+    }
+    if (staleClose) {
+        ClearAdmission(pid, message->streamId, message->streamEpoch);
+        Log(L"Ignored stale Stream Close. pid=%u stream=%llu messageEpoch=%lu currentEpoch=%lu",
+            pid,
+            static_cast<unsigned long long>(message->streamId),
+            static_cast<unsigned long>(message->streamEpoch),
+            static_cast<unsigned long>(oldEpoch));
+        return;
+    }
+
+    ClearAdmission(pid, message->streamId, oldEpoch);
+    if (!selectedProcess) {
+        Log(L"Ignored unselected process lifecycle for renderer routing. pid=%u stream=%llu epoch=%lu action=%lu",
+            pid,
+            static_cast<unsigned long long>(message->streamId),
+            static_cast<unsigned long>(message->streamEpoch),
+            static_cast<unsigned long>(message->action));
+        return;
+    }
+
+    const bool lifecycleTargetsActive = activeBank_.valid &&
+        activeBank_.pid == pid &&
+        activeBank_.streamId == message->streamId &&
+        activeBank_.streamEpoch == oldEpoch;
+    if (lifecycleTargetsActive) {
+        // Reset/Close retires only the unadmitted suffix.  A prepared handoff
+        // may have left an already-credited FIFO prefix outside the smaller
+        // physical Ring; that prefix is still formal Active prebuffer and must
+        // continue toward the DAC.
+        if (!TrimWaitingToAdmittedPrefixLocked(activeBank_, false)) {
+            LatchPipelineFaultLocked(
+                    L"Stream lifecycle could not preserve the admitted Active FIFO prefix.");
+            return;
+        }
+    }
+    const bool lifecycleTargetsStandby = standbyBank_.valid &&
+        standbyBank_.pid == pid &&
+        standbyBank_.streamId == message->streamId &&
+        standbyBank_.streamEpoch == oldEpoch;
+    const bool lifecycleTargetsStarting = startingBank_.valid &&
+        startingBank_.pid == pid &&
+        startingBank_.streamId == message->streamId &&
+        startingBank_.streamEpoch == oldEpoch;
+    if (lifecycleTargetsStandby) {
+        standbyBank_.Clear();
+    }
+    if (lifecycleTargetsStarting) {
+        RetireWaitingOwnershipLocked(startingBank_, false, false);
+        preparedCommitAbandoned_ = true;
+    }
+
+    if (action == hook_protocol::StreamLifecycleAction::Reset) {
+        const bool resetCurrentActive = lifecycleTargetsActive &&
+                !preparedCommitInFlight_ &&
+                formatHandoff_.CurrentPhase() ==
+                        format_handoff::Phase::Active;
+        if (selectedStream ||
+            resetCurrentActive || lifecycleTargetsStandby ||
+            lifecycleTargetsStarting) {
+            const std::uint64_t formatKey = FormatTargetKeyLocked(
+                    streamCopy.format,
+                    streamCopy.applicationBufferFrames);
+            RequestStandbyLocked(pid,
+                                 message->streamId,
+                                 message->streamEpoch,
+                                 streamCopy,
+                                 formatKey);
+        }
+        PublishAdmission(pid,
+                         message->streamId,
+                         message->streamEpoch,
+                         AdmissionState::Pending,
+                         0);
+        Log(L"Stream Reset received. pid=%u stream=%llu oldEpoch=%lu newEpoch=%lu; unadmitted waiting data cleared, Active prebuffer retained.",
+            pid,
+            static_cast<unsigned long long>(message->streamId),
+            static_cast<unsigned long>(oldEpoch),
+            static_cast<unsigned long>(message->streamEpoch));
+        return;
+    }
+
+    if (lifecycleTargetsStandby && !preparedCommitInFlight_) {
+        const auto phase = formatHandoff_.CurrentPhase();
+        if (formatHandoff_.HasActive() &&
+            (phase == format_handoff::Phase::Preparing ||
+             phase == format_handoff::Phase::Draining)) {
+            const auto cancellation = formatHandoff_.Request(
+                    formatHandoff_.ActiveTarget());
+            if (cancellation.disposition ==
+                format_handoff::RequestDisposition::CancelledBackToActive) {
+                if (activeDrainBegun_) {
+                    renderer_.EndCapturedDrain();
+                }
+                activeDrainBegun_ = false;
+                activeDrainStartedMs_ = 0;
+                activeDrainBudgetMs_ = 0;
+            }
+        } else if (phase == format_handoff::Phase::Reconfiguring ||
+                   phase == format_handoff::Phase::Arming ||
+                   !formatHandoff_.HasActive()) {
+            // Any in-flight driver result becomes unexpected/stale and is
+            // stopped by the worker. No closed Standby may be committed.
+            formatHandoff_ = {};
+        }
+    }
+    Log(L"Stream Close received. pid=%u stream=%llu epoch=%lu; unadmitted waiting data cleared.",
+        pid,
+        static_cast<unsigned long long>(message->streamId),
+        static_cast<unsigned long>(message->streamEpoch));
 }
 
 void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::size_t bytes) {
@@ -2896,10 +4956,8 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
     const std::uint8_t* pcm = data + sizeof(PipePcmMessage);
     const std::size_t pcmBytes = bytes - sizeof(PipePcmMessage);
 
-    std::uint32_t bytesPerFrame = 0;
-    WAVEFORMATEXTENSIBLE sourceFormat{};
+    AudioStreamState streamCopy{};
     bool streamActivated = false;
-    bool shouldEnsureRenderer = false;
     bool routeThisBuffer = true;
     std::uint64_t previousStreamId = 0;
     std::wstring validationError;
@@ -2915,9 +4973,11 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
                 validationError = L"PCM arrived for an unknown audio stream.";
             } else {
                 auto& stream = streamIt->second;
-                bytesPerFrame = stream.bytesPerFrame;
-                sourceFormat = stream.format;
-                if (message->sequence != stream.nextPcmSequence) {
+                streamCopy = stream;
+                if (message->streamEpoch == 0 ||
+                    message->streamEpoch != stream.streamEpoch) {
+                    validationError = L"PCM arrived for a stale or unknown stream epoch.";
+                } else if (message->sequence != stream.nextPcmSequence) {
                     validationError = L"PCM sequence discontinuity detected; accepted audio can no longer be accounted for exactly.";
                 } else if (stream.nextPcmSequence ==
                            (std::numeric_limits<std::uint64_t>::max)() ||
@@ -2925,7 +4985,7 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
                                    (std::numeric_limits<std::uint64_t>::max)() -
                                            message->frameCount) {
                     validationError = L"PCM accounting counter exhausted its supported range.";
-                } else if (message->frameCount == 0 || bytesPerFrame == 0) {
+                } else if (message->frameCount == 0 || stream.bytesPerFrame == 0) {
                     validationError = L"PCM message contains an invalid frame count or format.";
                 } else if (message->submittedFrames !=
                            stream.submittedFrames + message->frameCount) {
@@ -2936,13 +4996,14 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
                     if (!playerSilence &&
                         message->frameCount >
                                 (std::numeric_limits<std::size_t>::max)() /
-                                        bytesPerFrame) {
+                                        stream.bytesPerFrame) {
                         validationError = L"PCM payload size exceeds the current process architecture.";
                     }
                     const std::size_t expectedPcmBytes =
                             playerSilence || !validationError.empty()
                             ? 0
-                            : static_cast<std::size_t>(message->frameCount) * bytesPerFrame;
+                            : static_cast<std::size_t>(message->frameCount) *
+                                      stream.bytesPerFrame;
                     if (validationError.empty() && pcmBytes != expectedPcmBytes) {
                         validationError = L"PCM payload length does not match its declared frame count.";
                     }
@@ -2973,15 +5034,15 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
                         }
                     }
 
-                    shouldEnsureRenderer = routeThisBuffer &&
-                            (streamActivated ||
-                             !rendererHasFormat_ ||
-                             rendererPid_ != pid ||
-                             !WaveFormatsEqual(rendererFormat_, sourceFormat));
-
                     if (!routeThisBuffer) {
                         ++stream.nextPcmSequence;
                         stream.submittedFrames = message->submittedFrames;
+                        // Bypassed is a cumulative ownership boundary. Keep
+                        // the Core-side baseline at the same terminal counter
+                        // so a later ownership interval for this epoch can
+                        // resume from C rather than publishing a rollback.
+                        stream.admittedFrames = message->submittedFrames;
+                        stream.admissionState = AdmissionState::Bypassed;
                     }
                 }
             }
@@ -2993,6 +5054,11 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
         return;
     }
     if (!routeThisBuffer) {
+        PublishAdmission(pid,
+                         message->streamId,
+                         message->streamEpoch,
+                         AdmissionState::Bypassed,
+                         message->submittedFrames);
         return;
     }
     if (streamActivated) {
@@ -3000,35 +5066,118 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
             pid,
             static_cast<unsigned long long>(message->streamId),
             static_cast<unsigned long long>(previousStreamId),
-            sourceFormat.Format.nSamplesPerSec,
-            sourceFormat.Format.nChannels,
-            sourceFormat.Format.wBitsPerSample);
-    }
-    if ((shouldEnsureRenderer || !renderer_.IsRunning()) &&
-        !StartRendererForFormatLocked(pid, sourceFormat)) {
-        std::wstring error;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            error = lastError_;
-        }
-        LatchPipelineFaultLocked(error.empty()
-                                         ? L"ASIO renderer could not accept the selected PCM stream."
-                                         : error);
-        return;
+            streamCopy.format.Format.nSamplesPerSec,
+            streamCopy.format.Format.nChannels,
+            streamCopy.format.Format.wBitsPerSample);
     }
 
-    std::wstring renderError;
-    const bool playerSilence =
-            (message->flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-    const auto written = playerSilence
-            ? renderer_.PushCapturedSilence(message->frameCount, &renderError)
-            : renderer_.PushPcm(pcm, message->frameCount, &renderError);
-    if (written != message->frameCount || !renderError.empty()) {
-        LatchPipelineFaultLocked(renderError.empty()
-                                         ? L"ASIO renderer could not preserve every accepted PCM frame."
-                                         : renderError);
+    IngressPcmPacket packet{};
+    packet.sequence = message->sequence;
+    packet.submittedFrames = message->submittedFrames;
+    packet.frameCount = message->frameCount;
+    packet.silent = (message->flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+    if (!packet.silent) {
+        try {
+            packet.bytes.assign(pcm, pcm + pcmBytes);
+        } catch (...) {
+            LatchPipelineFaultLocked(L"Core could not allocate the PCM waiting packet.");
+            return;
+        }
+    }
+
+    const std::uint64_t formatKey = FormatTargetKeyLocked(
+            streamCopy.format,
+            streamCopy.applicationBufferFrames);
+    const format_handoff::Target target{
+            pid, message->streamEpoch, message->streamId, formatKey};
+    const bool routesToActive =
+            formatHandoff_.CurrentPhase() == format_handoff::Phase::Active &&
+            activeBank_.valid && activeBank_.pid == pid &&
+            activeBank_.streamId == message->streamId &&
+            activeBank_.streamEpoch == message->streamEpoch &&
+            activeBank_.formatKey == formatKey &&
+            formatHandoff_.HasActive() &&
+            formatHandoff_.ActiveTarget() == target;
+
+    PrebufferBank* destination = nullptr;
+    if (routesToActive) {
+        destination = &activeBank_;
+    } else {
+        const bool alreadyRoutedToStarting = preparedCommitInFlight_ &&
+                startingBank_.valid && startingBank_.pid == pid &&
+                startingBank_.streamId == message->streamId &&
+                startingBank_.streamEpoch == message->streamEpoch &&
+                startingBank_.formatKey == formatKey;
+        const bool alreadyRoutedToStandby = standbyBank_.valid &&
+                standbyBank_.pid == pid &&
+                standbyBank_.streamId == message->streamId &&
+                standbyBank_.streamEpoch == message->streamEpoch &&
+                standbyBank_.formatKey == formatKey;
+        if (alreadyRoutedToStarting) {
+            if (!RequestStandbyLocked(pid,
+                                      message->streamId,
+                                      message->streamEpoch,
+                                      streamCopy,
+                                      formatKey,
+                                      &destination)) {
+                LatchPipelineFaultLocked(
+                        L"Core could not merge the latest same-stream waiting interval into the ASIO commit slot.");
+                return;
+            }
+        } else if (alreadyRoutedToStandby) {
+            destination = &standbyBank_;
+        } else {
+            if (!RequestStandbyLocked(pid,
+                                      message->streamId,
+                                      message->streamEpoch,
+                                      streamCopy,
+                                      formatKey,
+                                      &destination)) {
+                LatchPipelineFaultLocked(
+                        L"Core could not establish the latest Standby prebuffer bank.");
+                return;
+            }
+        }
+    }
+
+    std::int32_t prebufferMs = 0;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        prebufferMs = prebufferMs_;
+    }
+    const std::uint64_t targetFrames = FramesFromMilliseconds(
+            streamCopy.format.Format.nSamplesPerSec, prebufferMs);
+    const std::uint64_t ingressFrames = (std::max<std::uint64_t>)(
+            streamCopy.applicationBufferFrames,
+            streamCopy.format.Format.nSamplesPerSec / 10U);
+    if (targetFrames >
+        (std::numeric_limits<std::uint64_t>::max)() - ingressFrames) {
+        LatchPipelineFaultLocked(
+                L"Core waiting bank capacity overflowed while accepting PCM.");
         return;
     }
+    const std::uint64_t baseBankCapacity = targetFrames + ingressFrames;
+    if (destination != nullptr) {
+        destination->waitingCapacityFrames = (std::max)(
+                destination->waitingCapacityFrames, baseBankCapacity);
+    }
+    const std::uint64_t bankCapacity = destination != nullptr
+            ? destination->waitingCapacityFrames
+            : 0;
+    if (destination == nullptr || !destination->valid ||
+        message->frameCount > bankCapacity ||
+        destination->waitingFrames > bankCapacity - message->frameCount) {
+        LatchPipelineFaultLocked(
+                L"Core waiting bank exceeded its bounded prebuffer plus fake-WASAPI capacity.");
+        return;
+    }
+    destination->waitingFrames += message->frameCount;
+    if (destination->firstPacketMs == 0) {
+        destination->firstPacketMs = NowMs();
+    }
+    destination->hasNonSilentPacket =
+            destination->hasNonSilentPacket || !packet.silent;
+    destination->packets.push_back(std::move(packet));
 
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -3043,6 +5192,7 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
             } else {
                 ++streamIt->second.nextPcmSequence;
                 streamIt->second.submittedFrames = message->submittedFrames;
+                streamIt->second.admissionState = AdmissionState::Pending;
             }
         }
     }
@@ -3050,7 +5200,9 @@ void TickByTickCore::HandlePcmMessage(DWORD pid, const std::uint8_t* data, std::
         LatchPipelineFaultLocked(validationError);
         return;
     }
-    PublishRendererCounters();
+    if (!routesToActive) {
+        AdmitStandbyLocked(NowMs());
+    }
 }
 
 void TickByTickCore::StartRendererForFormat(std::uint32_t pid,
@@ -3084,6 +5236,48 @@ bool TickByTickCore::StartRendererForFormatLocked(
                                    : rendererError);
         return false;
     }
+
+    // Configuration changes are scheduled through the same non-blocking
+    // Active/Standby state machine as player format changes. Driver stop,
+    // sample-rate setup, createBuffers, and start are never performed on the
+    // caller/Pipe thread below this point.
+    AudioStreamState scheduledStream{};
+    std::uint64_t scheduledStreamId = 0;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        const auto pidIt = audioPids_.find(pid);
+        if (pidIt == audioPids_.end()) {
+            SetLastErrorLocked(L"Cannot schedule ASIO without an audio stream.");
+            return false;
+        }
+        scheduledStreamId = PreferredAudioStreamId(pidIt->second);
+        const auto* stream = FindAudioStream(pidIt->second, scheduledStreamId);
+        if (stream == nullptr) {
+            SetLastErrorLocked(L"Cannot schedule ASIO without an authoritative audio stream.");
+            return false;
+        }
+        scheduledStream = *stream;
+    }
+    const std::uint64_t scheduledFormatKey = FormatTargetKeyLocked(
+            format,
+            scheduledStream.applicationBufferFrames);
+    const format_handoff::Target scheduledTarget{
+            pid,
+            scheduledStream.streamEpoch,
+            scheduledStreamId,
+            scheduledFormatKey};
+    if (formatHandoff_.CurrentPhase() == format_handoff::Phase::Active &&
+        formatHandoff_.HasActive() &&
+        formatHandoff_.ActiveTarget() == scheduledTarget) {
+        return true;
+    }
+    return RequestStandbyLocked(pid,
+                                scheduledStreamId,
+                                scheduledStream.streamEpoch,
+                                scheduledStream,
+                                scheduledFormatKey);
+
+#if 0
 
     std::wstring deviceId;
     std::int32_t prebufferMs = kDefaultPrebufferMs;
@@ -3270,9 +5464,9 @@ bool TickByTickCore::StartRendererForFormatLocked(
                          streamId);
 
     if (configurationMatches) {
-        // Preserve the fixed-delay boundary even when the ASIO hardware format
-        // does not change. Bridge silence is appended before the first packet
-        // of the new logical stream and is never replaced later.
+        // The old physical tail remains ordered. Prime only refreshes logical
+        // admission; callback-owned compensation establishes any later
+        // low-water placeholder without inserting a second physical T block.
         renderer_.PrimeTimeline();
         PublishRendererCounters();
         PublishRendererRoute(streamId,
@@ -3373,6 +5567,7 @@ bool TickByTickCore::StartRendererForFormatLocked(
         prebufferMs,
         maxBufferAdvanceMs);
     return true;
+#endif
 }
 
 bool TickByTickCore::LaunchAndInjectTarget(const std::filesystem::path& exePath,

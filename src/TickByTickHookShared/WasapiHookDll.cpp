@@ -29,6 +29,67 @@
 #include <unordered_set>
 #include <vector>
 
+namespace tickbytick::wasapi_hook_detail {
+
+inline bool HasValidQueueOwnership(std::uint64_t queuedFrames,
+                                   std::uint64_t unmanagedQueuedFrames) noexcept {
+    return unmanagedQueuedFrames <= queuedFrames;
+}
+
+inline std::uint64_t ManagedQueuedFrames(
+        std::uint64_t queuedFrames,
+        std::uint64_t unmanagedQueuedFrames) noexcept {
+    return HasValidQueueOwnership(queuedFrames, unmanagedQueuedFrames)
+            ? queuedFrames - unmanagedQueuedFrames
+            : 0;
+}
+
+inline bool ShouldAcquireAdmissionAuthority(
+        bool alreadyAuthoritative,
+        bool submissionInFlight,
+        std::uint64_t successfulSubmittedFrames,
+        std::uint64_t appliedAdmittedFrames) noexcept {
+    return alreadyAuthoritative || submissionInFlight ||
+            successfulSubmittedFrames > appliedAdmittedFrames;
+}
+
+inline bool FreezeAdmissionOnUnreadableControl(
+        bool authoritative,
+        bool terminalBypassPending) noexcept {
+    return authoritative || terminalBypassPending;
+}
+
+inline bool ApplyManagedCredit(std::uint64_t& queuedFrames,
+                               std::uint64_t unmanagedQueuedFrames,
+                               std::uint64_t creditFrames) noexcept {
+    if (!HasValidQueueOwnership(queuedFrames, unmanagedQueuedFrames) ||
+        creditFrames >
+                ManagedQueuedFrames(queuedFrames, unmanagedQueuedFrames)) {
+        return false;
+    }
+    queuedFrames -= creditFrames;
+    return true;
+}
+
+inline void AdvanceQueueByQpc(std::uint64_t& queuedFrames,
+                              std::uint64_t& unmanagedQueuedFrames,
+                              std::uint64_t advancedFrames,
+                              bool admissionManaged) noexcept {
+    const std::uint64_t unmanagedRetired = (std::min)(
+            unmanagedQueuedFrames,
+            (std::min)(queuedFrames, advancedFrames));
+    unmanagedQueuedFrames -= unmanagedRetired;
+    queuedFrames -= unmanagedRetired;
+    advancedFrames -= unmanagedRetired;
+    if (!admissionManaged && advancedFrames != 0) {
+        queuedFrames -= (std::min)(queuedFrames, advancedFrames);
+    }
+}
+
+}  // namespace tickbytick::wasapi_hook_detail
+
+#if !defined(TICKBYTICK_WASAPI_OWNERSHIP_TEST_ONLY)
+
 namespace {
 
 using CoCreateInstanceFn = HRESULT(WINAPI*)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
@@ -77,7 +138,11 @@ struct AudioClientState {
     std::uint64_t fakeDevicePosition = 0;
     LONGLONG fakeDevicePositionQpc = 0;
     std::uint64_t fakeQueuedFrames = 0;
-    std::uint64_t fakeDiscardPendingFrames = 0;
+    // Prefix ownership inside Q is split at the admission boundary. Frames
+    // queued before Core selected this process were never sent through the
+    // pipe, so only the endpoint/QPC clock may retire them. Admission Credit
+    // is allowed to retire Q - fakeUnmanagedQueuedFrames, never this portion.
+    std::uint64_t fakeUnmanagedQueuedFrames = 0;
     std::uint64_t fakeReservedFrames = 0;
     // Capacity promised by an emitted event callback but not yet claimed by
     // IAudioRenderClient::GetBuffer. It is part of the application's existing
@@ -91,13 +156,20 @@ struct AudioClientState {
     LONGLONG fakeLastUpdateQpc = 0;
     LONGLONG fakeNextEventQpc = 0;
     std::uint64_t streamId = 0;
+    DWORD streamEpoch = 1;
     std::uint64_t successfulSubmittedFrames = 0;
     std::uint64_t pendingSubmittedFrames = 0;
     std::uint64_t nextPcmSequence = 0;
-    std::uint64_t consumedLogicalFrames = 0;
-    std::uint64_t accountedLogicalFrames = 0;
-    bool fakeBridgeManaged = false;
-    bool fakeAdmissionBlocked = false;
+    std::uint64_t observedAdmittedFrames = 0;
+    std::uint64_t appliedAdmittedFrames = 0;
+    tickbytick::hook_protocol::AdmissionState admissionState =
+            tickbytick::hook_protocol::AdmissionState::Pending;
+    bool fakeAdmissionAuthoritative = false;
+    // Bypassed carries one final cumulative admission value. While stopped we
+    // retain authority until Start applies that terminal delta exactly once.
+    bool fakeAdmissionBypassPending = false;
+    bool fakeResetClean = true;
+    bool fakeResetInProgress = false;
     bool fakeFaulted = false;
     bool submissionInFlight = false;
 };
@@ -126,8 +198,6 @@ struct RenderClientState {
 void CancelFakeEventGrantLocked(AudioClientState& state);
 void RedeemFakeEventGrantLocked(AudioClientState& state);
 void FaultFakeEndpointLocked(AudioClientState& state);
-void BlockFakeAdmissionLocked(AudioClientState& state);
-void UnblockFakeAdmissionLocked(AudioClientState& state);
 tickbytick::fake_wasapi::IngressLedger FakeIngressLedgerLocked(
         const AudioClientState& state);
 
@@ -136,18 +206,29 @@ HMODULE g_module = nullptr;
 #define TICKBYTICK_WASAPI_HOOK_PIPE_NAME L"\\\\.\\pipe\\LOCAL\\TickByTickWasapiHook"
 #endif
 #define TICKBYTICK_HOOK_READY_EVENT_PREFIX L"Local\\TickByTickHookReady_"
-constexpr wchar_t kPipeName[] = TICKBYTICK_WASAPI_HOOK_PIPE_NAME;
+constexpr const wchar_t* kPipeName = tickbytick::hook_protocol::kPipeName;
 constexpr const wchar_t* kControlMapName = tickbytick::hook_protocol::kControlMapName;
 constexpr DWORD kPipeMagic = tickbytick::hook_protocol::kPipeMagic;
 constexpr DWORD kPipeText = tickbytick::hook_protocol::kPipeText;
 constexpr DWORD kPipeFormat = tickbytick::hook_protocol::kPipeFormat;
 constexpr DWORD kPipePcm = tickbytick::hook_protocol::kPipePcm;
 constexpr DWORD kPipeFinish = tickbytick::hook_protocol::kPipeFinish;
+constexpr DWORD kPipeStreamLifecycle =
+        tickbytick::hook_protocol::kPipeStreamLifecycle;
 using PipeMessageHeader = tickbytick::hook_protocol::PipeMessageHeader;
 using PipeFormatMessage = tickbytick::hook_protocol::PipeFormatMessage;
 using PipePcmMessage = tickbytick::hook_protocol::PipePcmMessage;
+using PipeStreamLifecycleMessage =
+        tickbytick::hook_protocol::PipeStreamLifecycleMessage;
 using HookControlBlock = tickbytick::hook_protocol::HookControlBlock;
 using RendererState = tickbytick::hook_protocol::RendererState;
+using AdmissionState = tickbytick::hook_protocol::AdmissionState;
+using tickbytick::wasapi_hook_detail::AdvanceQueueByQpc;
+using tickbytick::wasapi_hook_detail::ApplyManagedCredit;
+using tickbytick::wasapi_hook_detail::FreezeAdmissionOnUnreadableControl;
+using tickbytick::wasapi_hook_detail::HasValidQueueOwnership;
+using tickbytick::wasapi_hook_detail::ManagedQueuedFrames;
+using tickbytick::wasapi_hook_detail::ShouldAcquireAdmissionAuthority;
 
 struct ControlSnapshot {
     bool valid = false;
@@ -157,12 +238,14 @@ struct ControlSnapshot {
     RendererState rendererState = RendererState::Idle;
     LONG streamGeneration = 0;
     std::uint64_t streamId = 0;
-    std::uint64_t blockedStreamId = 0;
     std::uint32_t sampleRate = 0;
     std::uint32_t prebufferMs = 0;
-    std::uint64_t consumedLogicalFrames = 0;
-    std::uint64_t consumedLogicalBaseline = 0;
-    std::uint64_t consumedLogicalOffset = 0;
+};
+
+struct AdmissionSnapshot {
+    bool found = false;
+    AdmissionState state = AdmissionState::Empty;
+    std::uint64_t admittedFrames = 0;
 };
 
 struct FakeRenderClient {
@@ -330,31 +413,14 @@ bool ReadControlSnapshot(ControlSnapshot* snapshot) {
                 streamIdLow, streamIdHigh);
         candidate.sampleRate = static_cast<std::uint32_t>(control->sampleRate);
         const LONG prebufferMs = control->prebufferMs;
-        const LONG blockedStreamIdLow = control->blockedStreamIdLow;
-        const LONG blockedStreamIdHigh = control->blockedStreamIdHigh;
         MemoryBarrier();
         const LONG configAfter = control->configSequence;
         if (configBefore != configAfter || (configAfter & 1) != 0) {
             continue;
         }
 
-        const LONG counterBefore = control->counterSequence;
-        MemoryBarrier();
-        if ((counterBefore & 1) != 0) {
-            YieldProcessor();
-            continue;
-        }
-        const LONG logicalLow = control->consumedLogicalLow;
-        const LONG logicalHigh = control->consumedLogicalHigh;
-        const LONG baselineLow = control->consumedLogicalBaselineLow;
-        const LONG baselineHigh = control->consumedLogicalBaselineHigh;
-        const LONG offsetLow = control->consumedLogicalOffsetLow;
-        const LONG offsetHigh = control->consumedLogicalOffsetHigh;
-        MemoryBarrier();
-        const LONG counterAfter = control->counterSequence;
         const LONG configFinal = control->configSequence;
-        if (counterBefore != counterAfter || (counterAfter & 1) != 0 ||
-            configFinal != configAfter || (configFinal & 1) != 0) {
+        if (configFinal != configAfter || (configFinal & 1) != 0) {
             continue;
         }
 
@@ -367,19 +433,68 @@ bool ReadControlSnapshot(ControlSnapshot* snapshot) {
         candidate.prebufferMs = prebufferMs > 0
                 ? static_cast<std::uint32_t>(prebufferMs)
                 : 0;
-        candidate.blockedStreamId = tickbytick::hook_protocol::JoinCounter(
-                blockedStreamIdLow, blockedStreamIdHigh);
-        candidate.consumedLogicalFrames =
-                tickbytick::hook_protocol::JoinCounter(logicalLow, logicalHigh);
-        candidate.consumedLogicalBaseline =
-                tickbytick::hook_protocol::JoinCounter(baselineLow, baselineHigh);
-        candidate.consumedLogicalOffset =
-                tickbytick::hook_protocol::JoinCounter(offsetLow, offsetHigh);
         candidate.valid = true;
         *snapshot = candidate;
         return true;
     }
     return false;
+}
+
+bool ReadAdmissionSnapshot(DWORD pid,
+                           std::uint64_t streamId,
+                           DWORD streamEpoch,
+                           AdmissionSnapshot* snapshot) {
+    if (snapshot == nullptr || pid == 0 || streamId == 0 || streamEpoch == 0) {
+        return false;
+    }
+    *snapshot = {};
+    OpenControlMapping();
+    const HookControlBlock* control = g_control;
+    if (control == nullptr ||
+        control->protocolVersion != tickbytick::hook_protocol::kControlProtocolVersion) {
+        return false;
+    }
+
+    for (std::size_t index = 0;
+         index < tickbytick::hook_protocol::kAdmissionSlotCount;
+         ++index) {
+        const auto& slot = control->admissionSlots[index];
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const LONG before = slot.sequence;
+            MemoryBarrier();
+            if ((before & 1) != 0) {
+                YieldProcessor();
+                continue;
+            }
+            const LONG slotPid = slot.pid;
+            const LONG slotState = slot.state;
+            const LONG slotEpoch = slot.streamEpoch;
+            const LONG idLow = slot.streamIdLow;
+            const LONG idHigh = slot.streamIdHigh;
+            const LONG admittedLow = slot.admittedLow;
+            const LONG admittedHigh = slot.admittedHigh;
+            MemoryBarrier();
+            const LONG after = slot.sequence;
+            if (before != after || (after & 1) != 0) {
+                continue;
+            }
+            if (slotPid != static_cast<LONG>(pid) ||
+                slotEpoch != static_cast<LONG>(streamEpoch) ||
+                tickbytick::hook_protocol::JoinCounter(idLow, idHigh) != streamId) {
+                break;
+            }
+            if (slotState < static_cast<LONG>(AdmissionState::Pending) ||
+                slotState > static_cast<LONG>(AdmissionState::Faulted)) {
+                return false;
+            }
+            snapshot->found = true;
+            snapshot->state = static_cast<AdmissionState>(slotState);
+            snapshot->admittedFrames = tickbytick::hook_protocol::JoinCounter(
+                    admittedLow, admittedHigh);
+            return true;
+        }
+    }
+    return true;
 }
 
 bool EnsurePipeConnectedLocked() {
@@ -436,6 +551,7 @@ bool SendPipeMessage(DWORD type, const void* payload, std::uint64_t payloadBytes
 }
 
 bool SendPcmMessage(std::uint64_t streamId,
+                    DWORD streamEpoch,
                     std::uint64_t sequence,
                     std::uint64_t submittedFrames,
                     UINT32 frameCount,
@@ -447,7 +563,7 @@ bool SendPcmMessage(std::uint64_t streamId,
         *errorCode = ERROR_SUCCESS;
     }
     const bool playerSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-    if (streamId == 0 || sequence == 0 || frameCount == 0 ||
+    if (streamId == 0 || streamEpoch == 0 || sequence == 0 || frameCount == 0 ||
         (!playerSilent && (pcm == nullptr || pcmBytes == 0)) ||
         (playerSilent && pcmBytes != 0) ||
         pcmBytes > static_cast<std::uint64_t>(MAXDWORD) - sizeof(PipePcmMessage)) {
@@ -471,6 +587,7 @@ bool SendPcmMessage(std::uint64_t streamId,
     header.payloadBytes = sizeof(PipePcmMessage) + pcmBytes;
     PipePcmMessage message{};
     message.streamId = streamId;
+    message.streamEpoch = streamEpoch;
     message.sequence = sequence;
     message.submittedFrames = submittedFrames;
     message.frameCount = frameCount;
@@ -503,6 +620,20 @@ bool SendPcmMessage(std::uint64_t streamId,
         ClosePipeLocked();
     }
     return ok;
+}
+
+bool SendStreamLifecycleMessage(
+        std::uint64_t streamId,
+        DWORD streamEpoch,
+        tickbytick::hook_protocol::StreamLifecycleAction action) {
+    if (streamId == 0 || streamEpoch == 0) {
+        return false;
+    }
+    PipeStreamLifecycleMessage message{};
+    message.streamId = streamId;
+    message.streamEpoch = streamEpoch;
+    message.action = static_cast<DWORD>(action);
+    return SendPipeMessage(kPipeStreamLifecycle, &message, sizeof(message));
 }
 
 void EmitLogMessage(const char* message) {
@@ -631,17 +762,19 @@ void LogDeviceInvalidated(const char* operation,
     const bool hasControl = ReadControlSnapshot(&control) && control.valid;
     LogFrequent(
         FrequentLogEvent::DeviceInvalidated,
-        "%s returned AUDCLNT_E_DEVICE_INVALIDATED. audio=%p stream=%llu managed=%s queued=%llu retired=%llu reserved=%llu eventGrant=%llu submitted=%llu logical=%llu controlValid=%s controlPid=%lu controlStream=%llu rendererState=%ld",
+        "%s returned AUDCLNT_E_DEVICE_INVALIDATED. audio=%p stream=%llu epoch=%lu authoritative=%s queued=%llu unmanagedQueued=%llu reserved=%llu eventGrant=%llu submitted=%llu admittedObserved=%llu admittedApplied=%llu controlValid=%s controlPid=%lu controlStream=%llu rendererState=%ld",
         operation,
         audioClient,
         static_cast<unsigned long long>(state.streamId),
-        state.fakeBridgeManaged ? "yes" : "no",
+        static_cast<unsigned long>(state.streamEpoch),
+        state.fakeAdmissionAuthoritative ? "yes" : "no",
         static_cast<unsigned long long>(state.fakeQueuedFrames),
-        static_cast<unsigned long long>(state.fakeDiscardPendingFrames),
+        static_cast<unsigned long long>(state.fakeUnmanagedQueuedFrames),
         static_cast<unsigned long long>(state.fakeReservedFrames),
         static_cast<unsigned long long>(state.fakeEventGrantedFrames),
         static_cast<unsigned long long>(state.successfulSubmittedFrames),
-        static_cast<unsigned long long>(state.consumedLogicalFrames),
+        static_cast<unsigned long long>(state.observedAdmittedFrames),
+        static_cast<unsigned long long>(state.appliedAdmittedFrames),
         hasControl ? "yes" : "no",
         hasControl ? control.lockedPid : 0,
         static_cast<unsigned long long>(hasControl ? control.streamId : 0),
@@ -807,11 +940,40 @@ std::uint64_t QpcToHns(LONGLONG qpc) {
             ((ticks % frequency) * 10000000ull) / frequency;
 }
 
-bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) {
+bool ApplyAdmissionCreditLocked(AudioClientState& state) {
+    if (!HasValidQueueOwnership(state.fakeQueuedFrames,
+                                state.fakeUnmanagedQueuedFrames)) {
+        FaultFakeEndpointLocked(state);
+        return true;
+    }
+
     ControlSnapshot snapshot{};
     const bool hasSnapshot = ReadControlSnapshot(&snapshot);
-    const bool selectedProcess = hasSnapshot && snapshot.valid &&
-            snapshot.lockedPid == GetCurrentProcessId();
+    if (!hasSnapshot || !snapshot.valid) {
+        // A seqlock collision is not evidence that Core changed routes. Once
+        // admission owns submitted frames, freeze that ownership until a
+        // readable snapshot arrives; unmanaged prefill remains QPC-owned and
+        // is retired independently in AdvanceFakePlaybackLocked.
+        return FreezeAdmissionOnUnreadableControl(
+                state.fakeAdmissionAuthoritative,
+                state.fakeAdmissionBypassPending);
+    }
+
+    const bool selectedProcess =
+            snapshot.lockedPid == GetCurrentProcessId() &&
+            snapshot.fakeOutput && !snapshot.finish;
+    if (!selectedProcess) {
+        if (state.fakeAdmissionAuthoritative ||
+            state.fakeAdmissionBypassPending) {
+            // Once Core owns this endpoint's admission clock, silently
+            // falling back to QPC would either double-retire queued frames or
+            // acknowledge PCM that Core has stopped accepting. Force the
+            // player to rebuild the stream against the new route instead.
+            FaultFakeEndpointLocked(state);
+            return true;
+        }
+        return false;
+    }
     if (selectedProcess && snapshot.rendererState == RendererState::Faulted &&
         state.fakeOutput) {
         // Faulted describes the selected PID's whole renderer pipeline. It can
@@ -821,112 +983,94 @@ bool ApplyAuthoritativeProgressLocked(AudioClientState& state, LONGLONG nowQpc) 
         return true;
     }
 
-    if (selectedProcess && snapshot.blockedStreamId != 0 &&
-        snapshot.blockedStreamId == state.streamId && state.fakeOutput) {
-        state.fakeBridgeManaged = true;
-        BlockFakeAdmissionLocked(state);
-        return true;
-    }
-
-    if (selectedProcess &&
-        snapshot.rendererState == RendererState::Reconfiguring &&
-        snapshot.streamId != 0 &&
-        state.fakeOutput) {
-        // A nonzero route identifies an actual stream handoff. Freeze the
-        // selected PID until Core publishes its new timeline generation. The
-        // initial streamId=0 discovery state must remain writable so the first
-        // PCM packet can select and start ASIO.
-        state.fakeBridgeManaged = true;
-        BlockFakeAdmissionLocked(state);
-        return true;
-    }
-
-    const bool matchesStream = selectedProcess &&
-            snapshot.streamId != 0 && snapshot.streamId == state.streamId;
-    if (!matchesStream) {
-        // Once Core has taken custody of this stream, loss of a matching route
-        // freezes it rather than falling back to an unrelated wall clock.
-        if (state.fakeBridgeManaged) {
-            BlockFakeAdmissionLocked(state);
+    AdmissionSnapshot admission{};
+    const bool readable = selectedProcess && ReadAdmissionSnapshot(
+            GetCurrentProcessId(), state.streamId, state.streamEpoch, &admission);
+    if (readable && admission.found) {
+        state.admissionState = admission.state;
+        if (admission.state == AdmissionState::Pending ||
+            admission.state == AdmissionState::Managed) {
+            // A format-level Pending(0) slot is only an invitation; it cannot
+            // retroactively take ownership of Q that was queued while Core
+            // had not selected this process. Authority begins at the explicit
+            // pipe-submission boundary below, or remains active for an
+            // already-owned cumulative ledger.
+            if (ShouldAcquireAdmissionAuthority(
+                        state.fakeAdmissionAuthoritative,
+                        state.submissionInFlight,
+                        state.successfulSubmittedFrames,
+                        state.appliedAdmittedFrames)) {
+                state.fakeAdmissionAuthoritative = true;
+                state.fakeAdmissionBypassPending = false;
+            }
         }
-        return state.fakeBridgeManaged;
     }
-
-    state.fakeBridgeManaged = true;
-    if (snapshot.rendererState != RendererState::Running) {
-        // Reconfiguration and idle periods do not consume virtual WASAPI data.
-        BlockFakeAdmissionLocked(state);
-        return true;
-    }
-    UnblockFakeAdmissionLocked(state);
-
-    if (snapshot.consumedLogicalFrames < snapshot.consumedLogicalBaseline) {
+    if (admission.found && admission.state == AdmissionState::Faulted) {
         FaultFakeEndpointLocked(state);
         return true;
     }
-    const std::uint64_t generationConsumed =
-            snapshot.consumedLogicalFrames - snapshot.consumedLogicalBaseline;
-    if (generationConsumed >
-        (std::numeric_limits<std::uint64_t>::max)() -
-                snapshot.consumedLogicalOffset) {
-        FaultFakeEndpointLocked(state);
+    const bool bypassSnapshot = admission.found &&
+            admission.state == AdmissionState::Bypassed;
+    if (bypassSnapshot && !state.fakeAdmissionAuthoritative &&
+        !state.fakeAdmissionBypassPending) {
+        // A stream that was already fully bypassed has no Core-owned credit to
+        // settle. It remains on the ordinary QPC endpoint clock.
+        return false;
+    }
+    if (!state.fakeAdmissionAuthoritative) {
+        return false;
+    }
+    if (!admission.found) {
+        // Once a ReleaseBuffer has been handed to Core, a missing or stale
+        // slot means "no credit yet", never permission to fall back to QPC.
         return true;
     }
-    const std::uint64_t consumedLogical =
-            snapshot.consumedLogicalOffset + generationConsumed;
+
+    const std::uint64_t admittedFrames = admission.admittedFrames;
     const std::uint64_t submittedCeiling = state.submissionInFlight
             ? state.pendingSubmittedFrames
             : state.successfulSubmittedFrames;
-    if (consumedLogical < state.consumedLogicalFrames ||
-        consumedLogical > submittedCeiling ||
+    if (admittedFrames < state.observedAdmittedFrames ||
+        admittedFrames > submittedCeiling ||
         !tickbytick::fake_wasapi::IsWithinCapacity(
                 FakeIngressLedgerLocked(state))) {
         FaultFakeEndpointLocked(state);
         return true;
     }
-    state.consumedLogicalFrames = consumedLogical;
-
-    if (consumedLogical < state.accountedLogicalFrames) {
+    // A Bypassed slot is terminal only after its cumulative counter reaches
+    // the submission currently in flight. Until then it can be the stable
+    // terminal record for the previous packet and must not release authority.
+    const bool terminalBypass = bypassSnapshot &&
+            admittedFrames == submittedCeiling;
+    state.observedAdmittedFrames = admittedFrames;
+    if (terminalBypass) {
+        state.fakeAdmissionBypassPending = true;
+    }
+    if (!state.fakeStarted) {
+        return true;
+    }
+    if (admittedFrames < state.appliedAdmittedFrames) {
         FaultFakeEndpointLocked(state);
         return true;
     }
-    const std::uint64_t releasableFrames =
-            consumedLogical - state.accountedLogicalFrames;
-    const std::uint64_t discardedFrames = (std::min)(
-            state.fakeDiscardPendingFrames, releasableFrames);
-    state.fakeDiscardPendingFrames -= discardedFrames;
-    if (!state.fakeStarted && state.fakeHasStarted) {
-        // Stop freezes both padding and IAudioClock. Core may continue retiring
-        // its protected timeline, but ordinary player padding is not exposed
-        // as consumed until the client starts again.
-        state.accountedLogicalFrames += discardedFrames;
-        return true;
-    }
-    state.accountedLogicalFrames = consumedLogical;
-    const std::uint64_t queuedReleaseBudget =
-            releasableFrames - discardedFrames;
-    const std::uint64_t releasedFrames =
-            (std::min)(state.fakeQueuedFrames, queuedReleaseBudget);
-    state.fakeQueuedFrames -= releasedFrames;
-    if (state.fakeStarted &&
-        releasedFrames > (std::numeric_limits<std::uint64_t>::max)() -
-                                 state.fakeDevicePosition) {
+    const std::uint64_t credit = admittedFrames - state.appliedAdmittedFrames;
+    if (!ApplyManagedCredit(state.fakeQueuedFrames,
+                            state.fakeUnmanagedQueuedFrames,
+                            credit)) {
         FaultFakeEndpointLocked(state);
         return true;
     }
-    if (state.fakeStarted) {
-        state.fakeDevicePosition += releasedFrames;
-    }
-    if (state.fakeStarted && releasedFrames != 0) {
-        state.fakeDevicePositionQpc = nowQpc;
+    state.appliedAdmittedFrames = admittedFrames;
+    if (terminalBypass) {
+        state.fakeAdmissionBypassPending = false;
+        state.fakeAdmissionAuthoritative = false;
+        return false;
     }
     return true;
 }
 
 void AdvanceFakePlaybackLocked(AudioClientState& state, LONGLONG nowQpc) {
-    if (ApplyAuthoritativeProgressLocked(state, nowQpc)) {
-        return;
-    }
+    const bool admissionManaged = ApplyAdmissionCreditLocked(state);
     if (!state.fakeStarted) {
         state.fakeLastUpdateQpc = 0;
         return;
@@ -955,8 +1099,10 @@ void AdvanceFakePlaybackLocked(AudioClientState& state, LONGLONG nowQpc) {
     if (advancedFrames > 0) {
         state.fakeDevicePositionQpc = nowQpc;
     }
-    state.fakeQueuedFrames -=
-            (std::min)(state.fakeQueuedFrames, advancedFrames);
+    AdvanceQueueByQpc(state.fakeQueuedFrames,
+                      state.fakeUnmanagedQueuedFrames,
+                      advancedFrames,
+                      admissionManaged);
 }
 
 tickbytick::fake_wasapi::IngressLedger FakeIngressLedgerLocked(
@@ -964,10 +1110,8 @@ tickbytick::fake_wasapi::IngressLedger FakeIngressLedgerLocked(
     return {
             state.fakeBufferFrames,
             state.fakeQueuedFrames,
-            state.fakeDiscardPendingFrames,
             state.fakeReservedFrames,
             state.fakeEventGrantedFrames,
-            state.fakeAdmissionBlocked,
     };
 }
 
@@ -1009,38 +1153,9 @@ void RedeemFakeEventGrantLocked(AudioClientState& state) {
 
 void FaultFakeEndpointLocked(AudioClientState& state) {
     // A hard fault cannot honor a writable promise. Revoke it and clear the
-    // kernel signal before publishing the permanently blocked endpoint state.
+    // kernel signal before publishing the invalid endpoint state.
     CancelFakeEventGrantLocked(state);
     state.fakeFaulted = true;
-    state.fakeAdmissionBlocked = true;
-}
-
-void BlockFakeAdmissionLocked(AudioClientState& state) {
-    if (!state.fakeAdmissionBlocked && state.fakeEventGrantedFrames == 0 &&
-        state.fakeEvent != nullptr) {
-        // No promise exists, so make sure a signal-only remainder cannot wake
-        // the player after the endpoint starts reporting full.
-        ResetEvent(state.fakeEvent);
-    }
-    state.fakeAdmissionBlocked = true;
-}
-
-void UnblockFakeAdmissionLocked(AudioClientState& state) {
-    const bool wasBlocked = state.fakeAdmissionBlocked;
-    state.fakeAdmissionBlocked = false;
-    if (!wasBlocked || state.fakeEventGrantedFrames == 0 ||
-        !state.fakeStarted || state.fakeEvent == nullptr) {
-        return;
-    }
-
-    // The original signal may already have released a waiter that chose not to
-    // redeem while the endpoint was blocked. Re-signal the same grant when the
-    // route resumes; this does not allocate or expose any additional capacity.
-    if (SetEvent(state.fakeEvent)) {
-        ++state.fakeEventGrantResignals;
-    } else {
-        CancelFakeEventGrantLocked(state);
-    }
 }
 
 bool TrySignalFakeEventLocked(AudioClientState& state) {
@@ -1069,6 +1184,23 @@ bool TrySignalFakeEventLocked(AudioClientState& state) {
         return false;
     }
     ++state.fakeEventGrantsIssued;
+    return true;
+}
+
+bool ResignalFakeEventGrantLocked(AudioClientState& state) {
+    if (!state.fakeOutput || state.fakeFaulted || !state.fakeStarted ||
+        state.fakeEvent == nullptr || state.fakeEventGrantedFrames == 0) {
+        return false;
+    }
+
+    // Auto-reset events can be consumed by a waiter that does not immediately
+    // redeem GetBuffer. Ring the same promise again on the next endpoint
+    // period; this does not mint capacity or alter G.
+    if (!SetEvent(state.fakeEvent)) {
+        CancelFakeEventGrantLocked(state);
+        return false;
+    }
+    ++state.fakeEventGrantResignals;
     return true;
 }
 
@@ -1178,7 +1310,8 @@ bool LogWaveFormat(const char* source,
                    DWORD streamFlags,
                    UINT32 periodInFrames,
                    UINT32 applicationBufferFrames,
-                   std::uint64_t streamId) {
+                   std::uint64_t streamId,
+                   DWORD streamEpoch = 1) {
     const bool frequentFakeInitialization =
             source != nullptr && std::strncmp(source, "Fake ", 5) == 0;
     if (format == nullptr) {
@@ -1260,6 +1393,7 @@ bool LogWaveFormat(const char* source,
     message.shareMode = static_cast<DWORD>(shareMode);
     message.periodFrames = periodInFrames;
     message.applicationBufferFrames = applicationBufferFrames;
+    message.streamEpoch = streamEpoch;
     message.streamId = streamId;
     return SendPipeMessage(kPipeFormat, &message, sizeof(message));
 }
@@ -1353,7 +1487,7 @@ void StoreFakeInitialization(IAudioClient* client,
     state.fakeDevicePosition = 0;
     state.fakeDevicePositionQpc = 0;
     state.fakeQueuedFrames = 0;
-    state.fakeDiscardPendingFrames = 0;
+    state.fakeUnmanagedQueuedFrames = 0;
     state.fakeReservedFrames = 0;
     state.fakeEventGrantedFrames = 0;
     state.fakeEventGrantsIssued = 0;
@@ -1363,13 +1497,17 @@ void StoreFakeInitialization(IAudioClient* client,
     state.fakeFrameRemainder = 0;
     state.fakeLastUpdateQpc = 0;
     state.fakeNextEventQpc = 0;
+    state.streamEpoch = 1;
     state.successfulSubmittedFrames = 0;
     state.pendingSubmittedFrames = 0;
     state.nextPcmSequence = 0;
-    state.consumedLogicalFrames = 0;
-    state.accountedLogicalFrames = 0;
-    state.fakeBridgeManaged = false;
-    state.fakeAdmissionBlocked = false;
+    state.observedAdmittedFrames = 0;
+    state.appliedAdmittedFrames = 0;
+    state.admissionState = AdmissionState::Pending;
+    state.fakeAdmissionAuthoritative = false;
+    state.fakeAdmissionBypassPending = false;
+    state.fakeResetClean = true;
+    state.fakeResetInProgress = false;
     state.fakeFaulted = existingFault;
     state.submissionInFlight = false;
 }
@@ -1637,9 +1775,6 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
     const bool captureEnabled = hasControl
             ? control.lockedPid == currentPid && !control.finish
             : g_lockedAudioPid.load() == currentPid && !g_finishCapture.load();
-    const bool feedbackMatches = hasControl && control.valid &&
-            control.lockedPid == currentPid &&
-            control.streamId != 0 && control.streamId == renderState.streamId;
     const bool pipelineFaulted = hasControl && control.valid &&
             control.lockedPid == currentPid &&
             control.rendererState == RendererState::Faulted;
@@ -1672,6 +1807,14 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
         if (audioIt != g_audioClients.end()) {
             audioIt->second.pendingSubmittedFrames = nextSubmittedFrames;
             audioIt->second.submissionInFlight = true;
+            // This is the only transition that can open a new admission-owned
+            // cumulative ledger. A bare Pending(0) format slot cannot claim
+            // older QPC-owned prefill; those frames remain separately counted
+            // in fakeUnmanagedQueuedFrames until the endpoint clock retires
+            // them.
+            audioIt->second.fakeAdmissionAuthoritative = true;
+            audioIt->second.fakeAdmissionBypassPending = false;
+            audioIt->second.admissionState = AdmissionState::Pending;
             // Move GetBuffer ownership into submitted padding atomically. A
             // temporary reserved=0/queued=old gap would expose fake capacity
             // to the event pump and could emit a stale writable signal.
@@ -1692,6 +1835,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
     if (canSend) {
         sendAttempted = true;
         sendSucceeded = SendPcmMessage(renderState.streamId,
+                                       audioState.streamEpoch,
                                        nextSequence,
                                        nextSubmittedFrames,
                                        frameCount,
@@ -1721,10 +1865,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                                                   renderState.pendingFrames);
             }
             state.submissionInFlight = false;
-            const bool authoritativeStream = state.fakeBridgeManaged || feedbackMatches;
-            if (feedbackMatches) {
-                state.fakeBridgeManaged = true;
-            }
+            const bool authoritativeStream = state.fakeAdmissionAuthoritative;
             if (state.fakeOutput && pipelineFaulted) {
                 invalidationReason = "renderer-fault";
             } else if (state.fakeOutput && submittedOverflow) {
@@ -1746,12 +1887,19 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                 FaultFakeEndpointLocked(state);
                 fakeDeviceInvalidated = true;
             } else if (state.fakeOutput && hasReleaseState) {
+                if (frameCount > 0) {
+                    // Reset cleanliness is an endpoint contract, not a pipe
+                    // delivery property. Fallback/bypassed fake streams also
+                    // become non-reset as soon as ReleaseBuffer commits data.
+                    state.fakeResetClean = false;
+                }
                 if (sendSucceeded) {
                     state.successfulSubmittedFrames = nextSubmittedFrames;
                     state.nextPcmSequence = nextSequence;
                 }
-                if (state.fakeBridgeManaged) {
-                    if (state.consumedLogicalFrames > state.successfulSubmittedFrames) {
+                if (state.fakeAdmissionAuthoritative) {
+                    if (state.observedAdmittedFrames >
+                        state.successfulSubmittedFrames) {
                         FaultFakeEndpointLocked(state);
                         fakeDeviceInvalidated = true;
                     } else if (sendSucceeded && frameCount > 0 &&
@@ -1760,9 +1908,10 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
                     }
                 } else if (frameCount > 0 && !queuedBeforeSend) {
                     state.fakeQueuedFrames += frameCount;
+                    state.fakeUnmanagedQueuedFrames += frameCount;
                 }
                 if (sendSucceeded && !state.fakeFaulted) {
-                    // Re-read logical admission after the pipe write. When Core
+                    // Re-read admission after the pipe write. When Core
                     // has already handled this packet, this immediately frees
                     // the two-period ingress window; otherwise the feedback
                     // thread supplies the same update on its next 1 ms tick.
@@ -1823,7 +1972,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             audioState.fakeOutput ? "on" : "off");
     }
     if (shouldLogFlow) {
-        Log("PCM flow. render=%p audio=%p intervalMs=%llu releaseCalls=%llu nonSilentFrames=%llu nonSilentBytes=%llu playerSilentFrames=%llu totalFrames=%llu maxReleaseGapMs=%llu sampleRate=%u queued=%llu hidden=%llu reserved=%llu eventGrant=%llu eventIssued=%llu eventRedeemed=%llu eventCancelled=%llu eventResignals=%llu capacity=%u submitted=%llu logical=%llu accounted=%llu devicePosition=%llu managed=%s blocked=%s started=%s rendererState=%ld routeStream=%llu blockedStream=%llu generation=%ld coreLogical=%llu fakeOutput=%s",
+        Log("PCM flow. render=%p audio=%p intervalMs=%llu releaseCalls=%llu nonSilentFrames=%llu nonSilentBytes=%llu playerSilentFrames=%llu totalFrames=%llu maxReleaseGapMs=%llu sampleRate=%u queued=%llu unmanagedQueued=%llu reserved=%llu eventGrant=%llu eventIssued=%llu eventRedeemed=%llu eventCancelled=%llu eventResignals=%llu capacity=%u stream=%llu epoch=%lu submitted=%llu admittedObserved=%llu admittedApplied=%llu devicePosition=%llu authoritative=%s admissionState=%ld started=%s rendererState=%ld routeStream=%llu generation=%ld fakeOutput=%s",
             self,
             renderState.audioClient,
             static_cast<unsigned long long>(flowIntervalMs),
@@ -1837,7 +1986,7 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             audioState.format.Format.nSamplesPerSec,
             static_cast<unsigned long long>(audioState.fakeQueuedFrames),
             static_cast<unsigned long long>(
-                    audioState.fakeDiscardPendingFrames),
+                    audioState.fakeUnmanagedQueuedFrames),
             static_cast<unsigned long long>(audioState.fakeReservedFrames),
             static_cast<unsigned long long>(
                     audioState.fakeEventGrantedFrames),
@@ -1850,20 +1999,18 @@ CaptureResult CaptureReleasedBuffer(IAudioRenderClient* self, UINT32 frameCount,
             static_cast<unsigned long long>(
                     audioState.fakeEventGrantResignals),
             audioState.fakeBufferFrames,
+            static_cast<unsigned long long>(audioState.streamId),
+            static_cast<unsigned long>(audioState.streamEpoch),
             static_cast<unsigned long long>(audioState.successfulSubmittedFrames),
-            static_cast<unsigned long long>(audioState.consumedLogicalFrames),
-            static_cast<unsigned long long>(audioState.accountedLogicalFrames),
+            static_cast<unsigned long long>(audioState.observedAdmittedFrames),
+            static_cast<unsigned long long>(audioState.appliedAdmittedFrames),
             static_cast<unsigned long long>(audioState.fakeDevicePosition),
-            audioState.fakeBridgeManaged ? "yes" : "no",
-            audioState.fakeAdmissionBlocked ? "yes" : "no",
+            audioState.fakeAdmissionAuthoritative ? "yes" : "no",
+            static_cast<long>(audioState.admissionState),
             audioState.fakeStarted ? "yes" : "no",
             control.valid ? static_cast<long>(control.rendererState) : -1L,
             static_cast<unsigned long long>(control.valid ? control.streamId : 0),
-            static_cast<unsigned long long>(
-                    control.valid ? control.blockedStreamId : 0),
             control.valid ? control.streamGeneration : -1L,
-            static_cast<unsigned long long>(
-                    control.valid ? control.consumedLogicalFrames : 0),
             audioState.fakeOutput ? "on" : "off");
     }
 
@@ -1910,7 +2057,6 @@ ULONG STDMETHODCALLTYPE FakeRenderRelease(IAudioRenderClient* self) {
                     audioState.fakeReservedFrames -=
                             (std::min<std::uint64_t>)(audioState.fakeReservedFrames,
                                                       renderIt->second.pendingFrames);
-                    CancelFakeEventGrantLocked(audioState);
                 }
                 g_renderClients.erase(renderIt);
                 removed = true;
@@ -1941,12 +2087,16 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
         Log("Fake output GetBuffer out-of-order. render=%p frames=%u", self, frameCount);
         return AUDCLNT_E_OUT_OF_ORDER;
     }
+    if (frameCount == 0) {
+        return S_OK;
+    }
 
     AudioClientState audioState{};
     UINT32 availableFrames = 0;
     UINT32 claimableFrames = 0;
     std::uint64_t grantedFrames = 0;
     bool initialized = false;
+    bool resetInProgress = false;
     bool faulted = false;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -1955,12 +2105,23 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
             auto& state = audioIt->second;
             initialized = state.fakeInitialized && state.hasFormat;
             if (initialized) {
-                AdvanceFakePlaybackLocked(state, QpcNow());
+                resetInProgress = state.fakeResetInProgress;
+                if (!resetInProgress) {
+                    AdvanceFakePlaybackLocked(state, QpcNow());
+                }
                 faulted = state.fakeFaulted;
-                availableFrames = faulted ? 0 : FakeAvailableFramesLocked(state);
-                claimableFrames = faulted ? 0 : FakeClaimableFramesLocked(state);
+                availableFrames = faulted || resetInProgress
+                        ? 0
+                        : FakeAvailableFramesLocked(state);
+                claimableFrames = faulted || resetInProgress
+                        ? 0
+                        : FakeClaimableFramesLocked(state);
                 grantedFrames = state.fakeEventGrantedFrames;
-                if (!faulted && frameCount <= claimableFrames) {
+                if (!faulted && !resetInProgress &&
+                    state.fakeReservedFrames != 0) {
+                    claimableFrames = 0;
+                } else if (!faulted && !resetInProgress &&
+                           frameCount <= claimableFrames) {
                     // A successful GetBuffer consumes both sides of the
                     // promise. ResetEvent is required even if the client made
                     // this call without waiting first; otherwise the old
@@ -1980,6 +2141,9 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
             frameCount);
         return AUDCLNT_E_NOT_INITIALIZED;
     }
+    if (resetInProgress) {
+        return AUDCLNT_E_BUFFER_OPERATION_PENDING;
+    }
     if (faulted) {
         LogDeviceInvalidated("Fake output GetBuffer", fake->audioClient, audioState);
         return AUDCLNT_E_DEVICE_INVALIDATED;
@@ -1989,7 +2153,7 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
         const bool hasControl = ReadControlSnapshot(&control);
         LogFrequent(
             FrequentLogEvent::FakeGetBufferUnavailable,
-            "Fake output GetBuffer request exceeds available frames. render=%p audio=%p requested=%u available=%u granted=%llu claimable=%u queued=%llu hidden=%llu reserved=%llu issued=%llu redeemed=%llu cancelled=%llu resignals=%llu started=%s blocked=%s managed=%s stream=%llu controlValid=%s rendererState=%ld routeStream=%llu blockedStream=%llu generation=%ld",
+            "Fake output GetBuffer request exceeds available frames. render=%p audio=%p requested=%u available=%u granted=%llu claimable=%u queued=%llu unmanagedQueued=%llu reserved=%llu issued=%llu redeemed=%llu cancelled=%llu resignals=%llu started=%s authoritative=%s stream=%llu epoch=%lu admitted=%llu controlValid=%s rendererState=%ld routeStream=%llu generation=%ld",
             self,
             fake->audioClient,
             frameCount,
@@ -1998,7 +2162,7 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
             claimableFrames,
             static_cast<unsigned long long>(audioState.fakeQueuedFrames),
             static_cast<unsigned long long>(
-                    audioState.fakeDiscardPendingFrames),
+                    audioState.fakeUnmanagedQueuedFrames),
             static_cast<unsigned long long>(audioState.fakeReservedFrames),
             static_cast<unsigned long long>(
                     audioState.fakeEventGrantsIssued),
@@ -2009,17 +2173,16 @@ HRESULT STDMETHODCALLTYPE FakeRenderGetBuffer(IAudioRenderClient* self, UINT32 f
             static_cast<unsigned long long>(
                     audioState.fakeEventGrantResignals),
             audioState.fakeStarted ? "yes" : "no",
-            audioState.fakeAdmissionBlocked ? "yes" : "no",
-            audioState.fakeBridgeManaged ? "yes" : "no",
+            audioState.fakeAdmissionAuthoritative ? "yes" : "no",
             static_cast<unsigned long long>(audioState.streamId),
+            static_cast<unsigned long>(audioState.streamEpoch),
+            static_cast<unsigned long long>(audioState.observedAdmittedFrames),
             hasControl && control.valid ? "yes" : "no",
             hasControl && control.valid
                     ? static_cast<long>(control.rendererState)
                     : -1L,
             static_cast<unsigned long long>(
                     hasControl && control.valid ? control.streamId : 0),
-            static_cast<unsigned long long>(
-                    hasControl && control.valid ? control.blockedStreamId : 0),
             hasControl && control.valid ? control.streamGeneration : -1L);
         return AUDCLNT_E_BUFFER_TOO_LARGE;
     }
@@ -2083,6 +2246,9 @@ HRESULT STDMETHODCALLTYPE FakeRenderReleaseBuffer(IAudioRenderClient* self, UINT
             frameCount,
             flags);
         return AUDCLNT_E_INVALID_SIZE;
+    }
+    if ((flags & ~AUDCLNT_BUFFERFLAGS_SILENT) != 0) {
+        return E_INVALIDARG;
     }
     fake->bufferOutstanding = false;
     const CaptureResult capture = CaptureReleasedBuffer(self, frameCount, flags);
@@ -2621,6 +2787,13 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
     }
 
     if (FakeOutputEnabled()) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            const auto it = g_audioClients.find(self);
+            if (it != g_audioClients.end() && it->second.fakeInitialized) {
+                return AUDCLNT_E_ALREADY_INITIALIZED;
+            }
+        }
         StoreFakeInitialization(self,
                                 format,
                                 shareMode,
@@ -2640,7 +2813,8 @@ HRESULT STDMETHODCALLTYPE HookInitialize(IAudioClient* self,
                            streamFlags,
                            state.fakePeriodFrames,
                            state.fakeBufferFrames,
-                           state.streamId)) {
+                           state.streamId,
+                           state.streamEpoch)) {
             {
                 std::lock_guard<std::mutex> lock(g_stateMutex);
                 FaultFakeEndpointLocked(g_audioClients[self]);
@@ -2710,6 +2884,13 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
 
     auto* audioClient = static_cast<IAudioClient*>(self);
     if (FakeOutputEnabled()) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            const auto it = g_audioClients.find(audioClient);
+            if (it != g_audioClients.end() && it->second.fakeInitialized) {
+                return AUDCLNT_E_ALREADY_INITIALIZED;
+            }
+        }
         StoreFakeInitialization(audioClient,
                                 format,
                                 AUDCLNT_SHAREMODE_SHARED,
@@ -2732,7 +2913,8 @@ HRESULT STDMETHODCALLTYPE HookInitializeSharedAudioStream(IAudioClient3* self,
                            streamFlags,
                            periodInFrames,
                            state.fakeBufferFrames,
-                           state.streamId)) {
+                           state.streamId,
+                           state.streamEpoch)) {
             {
                 std::lock_guard<std::mutex> lock(g_stateMutex);
                 FaultFakeEndpointLocked(g_audioClients[audioClient]);
@@ -2942,10 +3124,9 @@ HRESULT STDMETHODCALLTYPE HookGetStreamLatency(IAudioClient* self, REFERENCE_TIM
             Log("Fake output GetStreamLatency before Initialize. audio=%p", self);
             return AUDCLNT_E_NOT_INITIALIZED;
         }
-        const UINT32 latencyFrames = state.fakePrebufferFrames != 0
-                ? state.fakePrebufferFrames
-                : state.fakeBufferFrames;
-        *latency = HnsFromFrames(latencyFrames,
+        // The extra Core prebuffer is downstream safety/delay and must not
+        // change the endpoint contract reported to the player.
+        *latency = HnsFromFrames(state.fakeBufferFrames,
                                  state.format.Format.nSamplesPerSec,
                                  state.fakeDefaultPeriod);
         return S_OK;
@@ -2970,13 +3151,10 @@ HRESULT STDMETHODCALLTYPE HookGetCurrentPadding(IAudioClient* self, UINT32* padd
                 faulted = state.fakeFaulted;
                 diagnosticState = state;
                 if (!faulted) {
-                    // Managed streams expose only player frames not yet
-                    // admitted into Core's protected playout horizon. During
-                    // a format boundary the endpoint reports a full ingress
-                    // window; probe streams retain the legacy QPC queue.
-                    *paddingFrames = state.fakeAdmissionBlocked
-                            ? state.fakeBufferFrames
-                            : static_cast<UINT32>(state.fakeQueuedFrames);
+                    // Q is the only player-visible padding. A format boundary
+                    // stops naturally when Core withholds admission credit;
+                    // no separate synthetic "full" switch is needed.
+                    *paddingFrames = static_cast<UINT32>(state.fakeQueuedFrames);
                 }
                 initialized = true;
             }
@@ -3064,6 +3242,7 @@ HRESULT STDMETHODCALLTYPE HookGetDevicePeriod(IAudioClient* self,
 HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
     if (!g_isBootstrapping && FakeOutputEnabled()) {
         bool invalidated = false;
+        HRESULT startResult = S_OK;
         AudioClientState diagnosticState{};
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -3072,44 +3251,64 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
                 Log("Fake output Start before Initialize. audio=%p", self);
                 return AUDCLNT_E_NOT_INITIALIZED;
             }
+            if (state.fakeResetInProgress) {
+                return AUDCLNT_E_BUFFER_OPERATION_PENDING;
+            }
             AdvanceFakePlaybackLocked(state, QpcNow());
             if (state.fakeFaulted) {
                 invalidated = true;
                 diagnosticState = state;
-            } else if (!state.fakeStarted) {
+            } else if (state.fakeStarted) {
+                startResult = AUDCLNT_E_NOT_STOPPED;
+            } else if ((state.streamFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) != 0 &&
+                       state.fakeEvent == nullptr) {
+                startResult = AUDCLNT_E_EVENTHANDLE_NOT_SET;
+            } else {
                 const LONGLONG nowQpc = QpcNow();
-                if (state.fakeHasStarted &&
-                    state.consumedLogicalFrames >= state.accountedLogicalFrames) {
-                    // Frames retired while Stop was active are discarded from
-                    // virtual padding without advancing the paused clock.
-                    const std::uint64_t releasableFrames =
-                            state.consumedLogicalFrames -
-                            state.accountedLogicalFrames;
-                    const std::uint64_t discardedFrames = (std::min)(
-                            state.fakeDiscardPendingFrames, releasableFrames);
-                    state.fakeDiscardPendingFrames -= discardedFrames;
-                    const std::uint64_t queuedRelease = (std::min)(
-                            state.fakeQueuedFrames,
-                            releasableFrames - discardedFrames);
-                    state.fakeQueuedFrames -= queuedRelease;
-                    state.accountedLogicalFrames = state.consumedLogicalFrames;
+                const bool invalidQueueOwnership = !HasValidQueueOwnership(
+                        state.fakeQueuedFrames,
+                        state.fakeUnmanagedQueuedFrames);
+                if (invalidQueueOwnership ||
+                    state.observedAdmittedFrames < state.appliedAdmittedFrames ||
+                    state.observedAdmittedFrames - state.appliedAdmittedFrames >
+                            ManagedQueuedFrames(
+                                    state.fakeQueuedFrames,
+                                    state.fakeUnmanagedQueuedFrames)) {
+                    FaultFakeEndpointLocked(state);
+                    invalidated = true;
+                    diagnosticState = state;
+                } else {
+                    // Admission may continue while Stop freezes the public
+                    // padding and clock. Apply that accumulated credit exactly
+                    // once when the endpoint resumes.
+                    const std::uint64_t credit =
+                            state.observedAdmittedFrames -
+                            state.appliedAdmittedFrames;
+                    ApplyManagedCredit(state.fakeQueuedFrames,
+                                       state.fakeUnmanagedQueuedFrames,
+                                       credit);
+                    state.appliedAdmittedFrames =
+                            state.observedAdmittedFrames;
+                    if (state.fakeAdmissionBypassPending) {
+                        state.fakeAdmissionBypassPending = false;
+                        state.fakeAdmissionAuthoritative = false;
+                    }
                 }
-                state.fakeStarted = true;
-                state.fakeHasStarted = true;
-                state.fakeLastUpdateQpc = nowQpc;
-                state.fakeDevicePositionQpc = nowQpc;
-                state.fakeNextEventQpc = nowQpc + QpcTicksForFakePeriod(state);
-                if (state.fakeEventGrantedFrames != 0 &&
+                if (!invalidated) {
+                    state.fakeStarted = true;
+                    state.fakeHasStarted = true;
+                    state.fakeResetClean = false;
+                    state.fakeLastUpdateQpc = nowQpc;
+                    state.fakeDevicePositionQpc = nowQpc;
+                    state.fakeNextEventQpc = nowQpc + QpcTicksForFakePeriod(state);
+                }
+                if (!invalidated && state.fakeEventGrantedFrames != 0 &&
                     state.fakeEvent != nullptr) {
                     // Stop freezes new notifications but preserves a promise
                     // whose waiter may already have been released. Re-signal
                     // that same promise on restart instead of minting another.
-                    if (SetEvent(state.fakeEvent)) {
-                        ++state.fakeEventGrantResignals;
-                    } else {
-                        CancelFakeEventGrantLocked(state);
-                    }
-                } else {
+                    ResignalFakeEventGrantLocked(state);
+                } else if (!invalidated) {
                     TrySignalFakeEventLocked(state);
                 }
             }
@@ -3118,20 +3317,30 @@ HRESULT STDMETHODCALLTYPE HookStart(IAudioClient* self) {
             LogDeviceInvalidated("Fake output Start", self, diagnosticState);
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
+        if (FAILED(startResult)) {
+            return startResult;
+        }
         Log("Fake output Start. audio=%p", self);
-        return S_OK;
+        return startResult;
     }
     return g_originalStart(self);
 }
 
 HRESULT STDMETHODCALLTYPE HookStop(IAudioClient* self) {
     if (!g_isBootstrapping && FakeOutputEnabled()) {
+        HRESULT stopResult = S_OK;
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
+            if (!state.fakeInitialized) {
+                return AUDCLNT_E_NOT_INITIALIZED;
+            }
             AdvanceFakePlaybackLocked(state, QpcNow());
             if (state.fakeFaulted) {
                 return AUDCLNT_E_DEVICE_INVALIDATED;
+            }
+            if (!state.fakeStarted) {
+                stopResult = S_FALSE;
             }
             if (state.fakeEventGrantedFrames == 0 &&
                 state.fakeEvent != nullptr) {
@@ -3147,52 +3356,96 @@ HRESULT STDMETHODCALLTYPE HookStop(IAudioClient* self) {
         LogFrequent(FrequentLogEvent::FakeStop,
                     "Fake output Stop. audio=%p",
                     self);
-        return S_OK;
+        return stopResult;
     }
     return g_originalStop(self);
 }
 
 HRESULT STDMETHODCALLTYPE HookReset(IAudioClient* self) {
     if (!g_isBootstrapping && FakeOutputEnabled()) {
+        std::lock_guard<std::mutex> submissionLock(g_submissionMutex);
+        std::uint64_t streamId = 0;
+        DWORD nextEpoch = 0;
+        HRESULT resetResult = S_OK;
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
+            if (!state.fakeInitialized) {
+                return AUDCLNT_E_NOT_INITIALIZED;
+            }
             const LONGLONG nowQpc = QpcNow();
             AdvanceFakePlaybackLocked(state, nowQpc);
             if (state.fakeFaulted) {
                 return AUDCLNT_E_DEVICE_INVALIDATED;
             }
+            if (state.fakeStarted) {
+                return AUDCLNT_E_NOT_STOPPED;
+            }
+            if (state.fakeReservedFrames != 0 || state.submissionInFlight) {
+                return AUDCLNT_E_BUFFER_OPERATION_PENDING;
+            }
+            const bool alreadyReset = state.fakeResetClean &&
+                    !state.fakeHasStarted && state.fakeDevicePosition == 0 &&
+                    state.fakeQueuedFrames == 0 &&
+                    state.fakeReservedFrames == 0 &&
+                    state.fakeEventGrantedFrames == 0 &&
+                    state.successfulSubmittedFrames == 0 &&
+                    state.observedAdmittedFrames == 0 &&
+                    state.appliedAdmittedFrames == 0;
+            if (alreadyReset) {
+                return S_FALSE;
+            }
+            if (state.streamEpoch == MAXDWORD) {
+                FaultFakeEndpointLocked(state);
+                return AUDCLNT_E_DEVICE_INVALIDATED;
+            }
+            streamId = state.streamId;
+            nextEpoch = state.streamEpoch + 1;
+            state.fakeResetInProgress = true;
             state.fakeDevicePosition = 0;
             state.fakeDevicePositionQpc = nowQpc;
             state.fakeHasStarted = false;
-            if (state.fakeBridgeManaged) {
-                if (state.fakeDiscardPendingFrames > state.fakeBufferFrames ||
-                    state.fakeQueuedFrames >
-                    state.fakeBufferFrames - state.fakeDiscardPendingFrames) {
-                    FaultFakeEndpointLocked(state);
-                    return AUDCLNT_E_DEVICE_INVALIDATED;
-                }
-                // Reset makes the old padding invisible to the application,
-                // but Core may already own those frames. Keep that retired
-                // backlog against endpoint capacity until Core admits those
-                // player frames into its protected timeline, so repeated
-                // Reset/Start cycles cannot stack virtual ingress windows.
-                state.fakeDiscardPendingFrames += state.fakeQueuedFrames;
-            } else {
-                state.fakeDiscardPendingFrames = 0;
-                state.accountedLogicalFrames = 0;
-            }
             state.fakeQueuedFrames = 0;
-            state.fakeReservedFrames = 0;
+            state.fakeUnmanagedQueuedFrames = 0;
             CancelFakeEventGrantLocked(state);
             state.fakeFrameRemainder = 0;
-            state.fakeLastUpdateQpc = state.fakeStarted ? nowQpc : 0;
-            state.fakeNextEventQpc = state.fakeStarted
-                    ? nowQpc + QpcTicksForFakePeriod(state)
-                    : 0;
+            state.fakeLastUpdateQpc = 0;
+            state.fakeNextEventQpc = 0;
+            state.streamEpoch = nextEpoch;
+            state.successfulSubmittedFrames = 0;
+            state.pendingSubmittedFrames = 0;
+            state.nextPcmSequence = 0;
+            state.observedAdmittedFrames = 0;
+            state.appliedAdmittedFrames = 0;
+            state.admissionState = AdmissionState::Pending;
+            state.fakeAdmissionAuthoritative = false;
+            state.fakeAdmissionBypassPending = false;
+            state.fakeResetClean = true;
         }
-        Log("Fake output Reset. audio=%p", self);
-        return S_OK;
+        const bool lifecycleSent = SendStreamLifecycleMessage(
+                streamId,
+                nextEpoch,
+                tickbytick::hook_protocol::StreamLifecycleAction::Reset);
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            const auto stateIt = g_audioClients.find(self);
+            if (stateIt != g_audioClients.end()) {
+                auto& state = stateIt->second;
+                state.fakeResetInProgress = false;
+                if (!lifecycleSent) {
+                    FaultFakeEndpointLocked(state);
+                    resetResult = AUDCLNT_E_DEVICE_INVALIDATED;
+                }
+            } else {
+                resetResult = AUDCLNT_E_DEVICE_INVALIDATED;
+            }
+        }
+        Log("Fake output Reset. audio=%p stream=%llu epoch=%lu hr=0x%08lX",
+            self,
+            static_cast<unsigned long long>(streamId),
+            static_cast<unsigned long>(nextEpoch),
+            static_cast<unsigned long>(resetResult));
+        return resetResult;
     }
     return g_originalReset(self);
 }
@@ -3202,6 +3455,20 @@ HRESULT STDMETHODCALLTYPE HookSetEventHandle(IAudioClient* self, HANDLE eventHan
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             auto& state = g_audioClients[self];
+            if (!state.fakeInitialized) {
+                return AUDCLNT_E_NOT_INITIALIZED;
+            }
+            if (state.fakeFaulted) {
+                return AUDCLNT_E_DEVICE_INVALIDATED;
+            }
+            if ((state.streamFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) == 0) {
+                return AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED;
+            }
+            DWORD handleFlags = 0;
+            if (eventHandle == nullptr ||
+                !GetHandleInformation(eventHandle, &handleFlags)) {
+                return E_INVALIDARG;
+            }
             CancelFakeEventGrantLocked(state);
             state.fakeEvent = eventHandle;
             if (state.fakeStarted && state.fakeEvent != nullptr) {
@@ -3325,10 +3592,20 @@ HRESULT STDMETHODCALLTYPE HookReleaseBuffer(IAudioRenderClient* self, UINT32 fra
 ULONG STDMETHODCALLTYPE HookAudioClientRelease(IAudioClient* self) {
     const ULONG refs = g_originalAudioClientRelease(self);
     if (refs == 0) {
+        std::lock_guard<std::mutex> submissionLock(g_submissionMutex);
         bool removed = false;
+        std::uint64_t streamId = 0;
+        DWORD streamEpoch = 0;
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
-            removed = g_audioClients.erase(self) > 0;
+            const auto it = g_audioClients.find(self);
+            if (it != g_audioClients.end()) {
+                streamId = it->second.streamId;
+                streamEpoch = it->second.streamEpoch;
+                CancelFakeEventGrantLocked(it->second);
+                g_audioClients.erase(it);
+                removed = true;
+            }
         }
         if (removed) {
             const auto count = g_audioClientCount.fetch_sub(1) - 1;
@@ -3336,6 +3613,15 @@ ULONG STDMETHODCALLTYPE HookAudioClientRelease(IAudioClient* self) {
                         "IAudioClient released. active clients=%u ptr=%p",
                         count,
                         self);
+            if (streamId != 0 && streamEpoch != 0 &&
+                !SendStreamLifecycleMessage(
+                        streamId,
+                        streamEpoch,
+                        tickbytick::hook_protocol::StreamLifecycleAction::Close)) {
+                Log("Audio stream Close lifecycle message could not be delivered. stream=%llu epoch=%lu",
+                    static_cast<unsigned long long>(streamId),
+                    static_cast<unsigned long>(streamEpoch));
+            }
         }
     }
     return refs;
@@ -3833,8 +4119,13 @@ void PumpFakeEvents() {
     for (auto& item : g_audioClients) {
         auto& state = item.second;
         AdvanceFakePlaybackLocked(state, now);
-        if ((state.fakeNextEventQpc == 0 || now >= state.fakeNextEventQpc) &&
-            TrySignalFakeEventLocked(state)) {
+        if (state.fakeNextEventQpc == 0 || now >= state.fakeNextEventQpc) {
+            const bool signaled = state.fakeEventGrantedFrames != 0
+                    ? ResignalFakeEventGrantLocked(state)
+                    : TrySignalFakeEventLocked(state);
+            if (!signaled) {
+                continue;
+            }
             const LONGLONG ticks = QpcTicksForFakePeriod(state);
             state.fakeNextEventQpc =
                     state.fakeNextEventQpc > 0 ? state.fakeNextEventQpc + ticks
@@ -4079,3 +4370,5 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     }
     return TRUE;
 }
+
+#endif  // !defined(TICKBYTICK_WASAPI_OWNERSHIP_TEST_ONLY)

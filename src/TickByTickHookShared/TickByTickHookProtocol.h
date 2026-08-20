@@ -15,20 +15,27 @@
 
 namespace tickbytick::hook_protocol {
 
-constexpr LONG kControlProtocolVersion = 7;
-constexpr wchar_t kControlMapName[] = L"Local\\TickByTickWasapiHookControlV7";
+constexpr LONG kControlProtocolVersion = 8;
+constexpr wchar_t kControlMapName[] = L"Local\\TickByTickWasapiHookControlV8";
+constexpr wchar_t kPipeName[] =
+        L"\\\\.\\pipe\\LOCAL\\TickByTickWasapiHookV8";
+constexpr DWORD kPipeProtocolVersion =
+        static_cast<DWORD>(kControlProtocolVersion);
 
 constexpr DWORD kPipeMagic = 0x48504241;  // ABPH
 constexpr DWORD kPipeText = 1;
 constexpr DWORD kPipeFormat = 2;
 constexpr DWORD kPipePcm = 3;
 constexpr DWORD kPipeFinish = 4;
+constexpr DWORD kPipeStreamLifecycle = 5;
 
 struct PipeMessageHeader {
     DWORD magic = kPipeMagic;
     DWORD type = 0;
     DWORD pid = 0;
-    DWORD reserved = 0;
+    // The versioned name isolates major revisions. This field additionally
+    // rejects a stale peer before either side interprets its payload layout.
+    DWORD reserved = kPipeProtocolVersion;
     std::uint64_t payloadBytes = 0;
 };
 
@@ -42,7 +49,9 @@ struct PipeFormatMessage {
     // the user-configured additional prebuffer when sizing the protected
     // timeline and its hard retention boundary.
     DWORD applicationBufferFrames = 0;
-    DWORD reserved = 0;
+    // Reset starts a new accounting epoch without changing the IAudioClient
+    // identity or its fixed source format.
+    DWORD streamEpoch = 1;
     std::uint64_t streamId = 0;
 };
 
@@ -52,8 +61,21 @@ struct PipePcmMessage {
     std::uint64_t streamId = 0;
     std::uint64_t sequence = 0;
     std::uint64_t submittedFrames = 0;
+    DWORD streamEpoch = 0;
     DWORD frameCount = 0;
     DWORD flags = 0;
+    DWORD reserved = 0;
+};
+
+enum class StreamLifecycleAction : DWORD {
+    Reset = 1,
+    Close = 2,
+};
+
+struct PipeStreamLifecycleMessage {
+    std::uint64_t streamId = 0;
+    DWORD streamEpoch = 0;
+    DWORD action = 0;
 };
 
 enum class RendererState : LONG {
@@ -62,6 +84,29 @@ enum class RendererState : LONG {
     Running = 2,
     Faulted = 3,
 };
+
+// Admission is the hand-off from the fake endpoint waiting queue into a Core
+// prebuffer bank. It is deliberately independent of DAC/ASIO consumption.
+enum class AdmissionState : LONG {
+    Empty = 0,
+    Pending = 1,
+    Managed = 2,
+    Bypassed = 3,
+    Faulted = 4,
+};
+
+struct HookAdmissionSlot {
+    volatile LONG sequence = 0;
+    volatile LONG pid = 0;
+    volatile LONG state = static_cast<LONG>(AdmissionState::Empty);
+    volatile LONG streamEpoch = 0;
+    volatile LONG streamIdLow = 0;
+    volatile LONG streamIdHigh = 0;
+    volatile LONG admittedLow = 0;
+    volatile LONG admittedHigh = 0;
+};
+
+constexpr std::size_t kAdmissionSlotCount = 32;
 
 // The mapping is shared by 32-bit hooks, 64-bit hooks, and the matching Core.
 // Every field is 32-bit so a read-only Win32 hook can take tear-free 64-bit
@@ -87,30 +132,32 @@ struct HookControlBlock {
     volatile LONG consumedLogicalOffsetLow = 0;
     volatile LONG consumedLogicalOffsetHigh = 0;
     volatile LONG prebufferMs = 0;
-    // A pending replacement stream can be blocked while the currently
-    // published stream continues to drain and report logical progress.
-    volatile LONG blockedStreamIdLow = 0;
-    volatile LONG blockedStreamIdHigh = 0;
+    HookAdmissionSlot admissionSlots[kAdmissionSlotCount]{};
 };
 
 static_assert(sizeof(PipeMessageHeader) == 24);
+static_assert(offsetof(PipeMessageHeader, reserved) == 12);
 static_assert(offsetof(PipeMessageHeader, payloadBytes) == 16);
 static_assert(sizeof(PipeFormatMessage) == 72);
 static_assert(offsetof(PipeFormatMessage, applicationBufferFrames) == 56);
+static_assert(offsetof(PipeFormatMessage, streamEpoch) == 60);
 static_assert(offsetof(PipeFormatMessage, streamId) == 64);
-static_assert(sizeof(PipePcmMessage) == 32);
+static_assert(sizeof(PipePcmMessage) == 40);
 static_assert(offsetof(PipePcmMessage, streamId) == 0);
 static_assert(offsetof(PipePcmMessage, sequence) == 8);
 static_assert(offsetof(PipePcmMessage, submittedFrames) == 16);
-static_assert(offsetof(PipePcmMessage, frameCount) == 24);
-static_assert(offsetof(PipePcmMessage, flags) == 28);
-static_assert(sizeof(HookControlBlock) == 80);
+static_assert(offsetof(PipePcmMessage, streamEpoch) == 24);
+static_assert(offsetof(PipePcmMessage, frameCount) == 28);
+static_assert(offsetof(PipePcmMessage, flags) == 32);
+static_assert(sizeof(PipeStreamLifecycleMessage) == 16);
+static_assert(sizeof(HookAdmissionSlot) == 32);
+static_assert(sizeof(HookControlBlock) == 1096);
 static_assert(alignof(HookControlBlock) == alignof(LONG));
 static_assert(offsetof(HookControlBlock, configSequence) == 16);
 static_assert(offsetof(HookControlBlock, counterSequence) == 40);
 static_assert(offsetof(HookControlBlock, consumedLogicalOffsetHigh) == 64);
 static_assert(offsetof(HookControlBlock, prebufferMs) == 68);
-static_assert(offsetof(HookControlBlock, blockedStreamIdLow) == 72);
+static_assert(offsetof(HookControlBlock, admissionSlots) == 72);
 
 inline std::uint64_t ReadStreamId(const HookControlBlock& control) noexcept {
     const auto low = static_cast<std::uint32_t>(control.streamIdLow);

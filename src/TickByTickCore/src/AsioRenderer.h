@@ -40,6 +40,7 @@ enum class PrebufferTransitionReason : std::int32_t {
 struct RendererStats {
     bool startAccepted = false;
     bool streamActive = false;
+    bool preparedStartPending = false;
     bool silentStartDeferred = false;
     std::int32_t startupWaitMs = 0;
     bool prebuffering = false;
@@ -53,6 +54,8 @@ struct RendererStats {
     std::int64_t totalLogicalFrames = 0;
     std::int64_t totalBridgeSilentFramesQueued = 0;
     std::int64_t totalBridgeSilentFramesPlayed = 0;
+    std::int64_t totalBridgeSilentFramesReplaced = 0;
+    std::int64_t compensationBridgeFrames = 0;
     std::int64_t bufferedFrames = 0;
     std::int32_t bufferedMs = 0;
     std::int64_t bufferCapacityFrames = 0;
@@ -117,11 +120,23 @@ public:
         std::uint64_t endIndex = 0;
     };
 
+    struct WriteBatch {
+        std::uint64_t startIndex = 0;
+        std::uint64_t cursor = 0;
+        bool valid = false;
+    };
+
     bool Reset(std::uint32_t bytesPerFrame, std::uint32_t capacityFrames);
     void Clear();
     std::uint32_t Push(const std::uint8_t* data, std::uint32_t frameCount);
     std::uint32_t PushCapturedSilence(std::uint32_t frameCount);
     std::uint32_t PushBridgeSilence(std::uint32_t frameCount);
+    WriteBatch BeginWriteBatch() const;
+    std::uint32_t StageWrite(WriteBatch* batch,
+                             const std::uint8_t* data,
+                             std::uint32_t frameCount,
+                             FrameOwner owner);
+    bool CommitWriteBatch(const WriteBatch& batch);
     DispatchResult Dispatch(std::uint8_t* data, std::uint32_t frameCount);
     bool ConfirmDispatch(std::uint64_t endIndex);
     void RollbackDispatch();
@@ -163,12 +178,23 @@ private:
 
 class AsioRenderer {
 public:
+    enum class StartMode : std::uint8_t {
+        Normal = 0,
+        PreparedHandoff = 1,
+    };
+
     enum class SourceSampleKind {
         Unknown,
         Float32,
         Pcm16,
         Pcm24,
         Pcm32,
+    };
+
+    struct CapturedBatchItem {
+        const std::uint8_t* data = nullptr;
+        std::uint32_t frameCount = 0;
+        bool silent = false;
     };
 
     AsioRenderer() = default;
@@ -184,13 +210,25 @@ public:
                std::uint32_t applicationBufferFrames,
                std::uint32_t requestedBufferFrames,
                std::int32_t requestedClockSourceIndex,
-               std::wstring* outError);
+               std::wstring* outError,
+               StartMode startMode = StartMode::Normal);
     void Stop();
     std::uint32_t PushPcm(const std::uint8_t* data,
                           std::uint32_t frameCount,
                           std::wstring* outError = nullptr);
     std::uint32_t PushCapturedSilence(std::uint32_t frameCount,
                                       std::wstring* outError = nullptr);
+    std::uint32_t PushPreparedPcm(const std::uint8_t* data,
+                                  std::uint32_t frameCount,
+                                  std::wstring* outError = nullptr);
+    std::uint32_t PushPreparedSilence(std::uint32_t frameCount,
+                                      std::wstring* outError = nullptr);
+    bool PushCapturedBatch(const std::vector<CapturedBatchItem>& items,
+                           bool prepared,
+                           std::uint64_t* outWrittenFrames,
+                           std::wstring* outError = nullptr);
+    bool CommitPreparedStart(std::wstring* outError = nullptr);
+    bool ActivatePreparedOutput(std::wstring* outError = nullptr);
     RendererStats GetStats() const;
     bool IsRunning() const;
     std::int64_t ConfirmedCapturedFrames() const;
@@ -198,6 +236,8 @@ public:
     std::int64_t ConfirmedOutputFrames() const;
     std::int64_t PendingCapturedFrames() const;
     std::int64_t PendingTimelineFrames() const;
+    std::int64_t AvailableTimelineWriteFrames() const;
+    std::int64_t AdmissionRetentionFrames();
     bool EnsureStreamStarted(std::wstring* outError = nullptr);
     bool StartDeferredSilenceIfDue(std::uint32_t delayMs,
                                    std::wstring* outError = nullptr);
@@ -207,6 +247,7 @@ public:
     void PrimeTimeline();
     void MaintainTimeline();
     void BeginCapturedDrain();
+    void SettleCapturedDrain();
     void EndCapturedDrain();
     bool HasFault() const;
     std::wstring FaultMessage() const;
@@ -250,6 +291,7 @@ private:
         std::uint32_t outputFrames = 0;
         std::uint32_t capturedFrames = 0;
         std::uint32_t bridgeSilentFrames = 0;
+        std::uint32_t compensationBridgeFrames = 0;
         std::uint32_t managedSilentFrames = 0;
         std::uint32_t underrunSilentFrames = 0;
     };
@@ -284,6 +326,7 @@ private:
     std::uint32_t PushCapturedFrames(const std::uint8_t* data,
                                      std::uint32_t frameCount,
                                      bool silence,
+                                     bool prepared,
                                      std::wstring* outError);
     const std::uint8_t* ConvertCapturedFramesLocked(const std::uint8_t* data,
                                                     std::uint32_t frameCount);
@@ -291,6 +334,13 @@ private:
     void UpdateLogicalAdmissionLocked();
     bool ConfirmOutputPage(long doubleBufferIndex);
     void RollbackOutputPages();
+    void ReconcileCompensationBridgeForCallback(bool draining) noexcept;
+    std::uint32_t ClaimCompensationBridgeForCallback(
+            std::uint32_t maximumFrames) noexcept;
+    bool RetireCompensationBridgeForCallback(
+            std::uint32_t frameCount) noexcept;
+    std::uint32_t CancelQueuedCompensationBridge(
+            bool countAsReplaced) noexcept;
     void RequestAsioFault(AsioFaultCode code, std::uint32_t detail = 0) noexcept;
     void FinalizePendingAsioFault();
     bool LatchFault(const std::wstring& message);
@@ -338,6 +388,11 @@ private:
     // IASIO::start() returning success does not prove that the driver has
     // entered its output callback loop.
     std::atomic<bool> startAccepted_{false};
+    std::atomic<bool> preparedStartPending_{false};
+    // A prepared driver may synchronously callback from inside IASIO::start.
+    // Keep staged PCM undispatchable until Core has atomically published the
+    // matching bank as Active.
+    std::atomic<bool> preparedOutputActive_{true};
     std::atomic<std::uint64_t> startAcceptedAtMs_{0};
     std::atomic<std::uint64_t> deferredSilentStartAtMs_{0};
     // Tri-state WaitOnAddress gate. Cancellation changes the observed value
@@ -350,6 +405,7 @@ private:
     std::atomic<std::int32_t> callbackRealtimeMode_{0};
 
     WAVEFORMATEXTENSIBLE format_{};
+    StartMode startMode_ = StartMode::Normal;
     SourceSampleKind sourceKind_ = SourceSampleKind::Unknown;
     SampleConversionMode sampleConversionMode_ = SampleConversionMode::Direct;
     ASIOSampleType outputAsioSampleType_ = ASIOSTLastEntry;
@@ -392,6 +448,18 @@ private:
     std::atomic<std::int64_t> totalLogicalFrames_{0};
     std::atomic<std::int64_t> totalBridgeSilentFramesQueued_{0};
     std::atomic<std::int64_t> totalBridgeSilentFramesPlayed_{0};
+    std::atomic<std::int64_t> totalBridgeSilentFramesReplaced_{0};
+    // High 32 bits: queued, replaceable virtual Bridge frames. Low 32 bits:
+    // frames already dispatched in ASIO pages. A single packed CAS keeps the
+    // transfer queued -> in-flight and drain cancellation indivisible on x86
+    // and x64; the callback remains the only ordinary state writer.
+    alignas(8) std::atomic<std::uint64_t> compensationBridgeState_{0};
+    // Callback-side seqlock. Producers advance logical admission only from a
+    // stable Ring-position + virtual-Bridge snapshot.
+    std::atomic<std::uint64_t> compensationStateSequence_{0};
+    std::atomic<std::uint64_t> compensationBridgeCancelSerial_{0};
+    std::atomic<std::uint64_t> compensationBridgeBarrierFrame_{0};
+    std::uint64_t observedCompensationBridgeCancelSerial_ = 0;
     std::atomic<std::uint32_t> maximumRealPacketFrames_{0};
     std::atomic<std::int64_t> underrunCount_{0};
     std::atomic<std::uint64_t> prebufferEnterCount_{0};

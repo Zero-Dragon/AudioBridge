@@ -1,4 +1,5 @@
 #include "AsioRenderer.h"
+#include "CompensationBridgePolicy.h"
 #include "PcmSampleConverter.h"
 
 #include <avrt.h>
@@ -15,6 +16,8 @@
 namespace tickbytick {
 namespace {
 
+namespace bridge = compensation_bridge;
+
 std::atomic<AsioRenderer*> g_activeRenderer{nullptr};
 std::atomic<bool> g_asioDriverPoisoned{false};
 std::atomic<std::uint32_t> g_asioCallbackEntrants{0};
@@ -22,6 +25,9 @@ std::mutex g_asioClockProbeMutex;
 
 constexpr DWORD kFirstOutputCallbackTimeoutMs = 2000;
 constexpr auto kControlMessagePumpInterval = std::chrono::milliseconds(2);
+
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
+              "The ASIO callback requires lock-free 64-bit Bridge accounting.");
 
 void EnsureCurrentThreadMessageQueue() noexcept {
     MSG message{};
@@ -707,6 +713,62 @@ std::uint32_t RawFrameRingBuffer::PushBridgeSilence(std::uint32_t frameCount) {
     return PushSilence(frameCount, FrameOwner::Bridge);
 }
 
+RawFrameRingBuffer::WriteBatch RawFrameRingBuffer::BeginWriteBatch() const {
+    const std::uint64_t writeIndex =
+            writeIndex_.load(std::memory_order_relaxed);
+    return {writeIndex, writeIndex, true};
+}
+
+std::uint32_t RawFrameRingBuffer::StageWrite(
+        WriteBatch* batch,
+        const std::uint8_t* data,
+        std::uint32_t frameCount,
+        FrameOwner owner) {
+    if (batch == nullptr) {
+        return 0;
+    }
+    if (!batch->valid || frameCount == 0 || bytesPerFrame_ == 0 ||
+        bytes_.empty()) {
+        batch->valid = false;
+        return 0;
+    }
+    const std::uint64_t publishedWrite =
+            writeIndex_.load(std::memory_order_relaxed);
+    if (publishedWrite != batch->startIndex ||
+        batch->cursor < batch->startIndex) {
+        batch->valid = false;
+        return 0;
+    }
+    const std::uint64_t readIndex =
+            confirmedReadIndex_.load(std::memory_order_acquire);
+    const std::size_t requestedBytes =
+            static_cast<std::size_t>(frameCount) * bytesPerFrame_;
+    if (requestedBytes > AvailableWriteBytes(readIndex, batch->cursor)) {
+        batch->valid = false;
+        return 0;
+    }
+    if (data == nullptr) {
+        ZeroInto(batch->cursor, requestedBytes);
+    } else {
+        CopyInto(batch->cursor, data, requestedBytes);
+    }
+    MarkFrames(batch->cursor, frameCount, owner);
+    batch->cursor += requestedBytes;
+    return frameCount;
+}
+
+bool RawFrameRingBuffer::CommitWriteBatch(const WriteBatch& batch) {
+    if (!batch.valid || batch.cursor < batch.startIndex ||
+        writeIndex_.load(std::memory_order_relaxed) != batch.startIndex) {
+        return false;
+    }
+    // All bytes, conversion results, and owner marks become visible to the
+    // callback as one timeline extension. It can observe either the old tail
+    // or the complete batch, never a packet prefix.
+    writeIndex_.store(batch.cursor, std::memory_order_release);
+    return true;
+}
+
 std::uint32_t RawFrameRingBuffer::PushSilence(std::uint32_t frameCount,
                                               FrameOwner owner) {
     if (frameCount == 0 || bytesPerFrame_ == 0 || bytes_.empty()) {
@@ -924,7 +986,8 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
                          std::uint32_t applicationBufferFrames,
                          std::uint32_t requestedBufferFrames,
                          std::int32_t requestedClockSourceIndex,
-                         std::wstring* outError) {
+                         std::wstring* outError,
+                         StartMode startMode) {
     Stop();
     if ((faultRequested_.load(std::memory_order_acquire) &&
          !faulted_.load(std::memory_order_acquire)) ||
@@ -940,6 +1003,7 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ResetStats();
+        startMode_ = startMode;
         format_ = format;
         sourceBytesPerFrame_ = BytesPerFrame(format_.Format);
         sampleRate_ = format_.Format.nSamplesPerSec;
@@ -971,8 +1035,8 @@ bool AsioRenderer::Start(const std::wstring& deviceId,
         maxBufferAdvanceFrames_ =
                 FramesFromMs(sampleRate_, static_cast<std::uint32_t>(maxBufferAdvanceMs_));
         // The application buffer is already real player-owned timeline. Keep
-        // bridge seeding, low-water silence, and logical admission based only
-        // on the configured additional delay; adding the application capacity
+        // cold seeding, callback compensation, and logical admission based
+        // only on the configured additional delay; adding application capacity
         // here would either duplicate it as silence or release a whole startup
         // burst immediately. The combined value is the retention budget used
         // when allocating the ring below.
@@ -1076,6 +1140,8 @@ void AsioRenderer::Stop() {
     }
     callbackActive_.clear(std::memory_order_release);
     startAccepted_.store(false, std::memory_order_release);
+    preparedStartPending_.store(false, std::memory_order_release);
+    preparedOutputActive_.store(false, std::memory_order_release);
     startAcceptedAtMs_.store(0, std::memory_order_release);
     deferredSilentStartAtMs_.store(0, std::memory_order_release);
     SetPrebuffering(
@@ -1098,6 +1164,7 @@ void AsioRenderer::Stop() {
     outputBytesPerFrame_ = 0;
     sampleConversionMode_ = SampleConversionMode::Direct;
     outputReadyState_.store(0, std::memory_order_relaxed);
+    startMode_ = StartMode::Normal;
     capturedDrainActive_.store(false, std::memory_order_release);
     minimumTimelineFrames_ = 0;
     admittedTimelineEndFrame_ = 0;
@@ -1106,17 +1173,138 @@ void AsioRenderer::Stop() {
 std::uint32_t AsioRenderer::PushPcm(const std::uint8_t* data,
                                     std::uint32_t frameCount,
                                     std::wstring* outError) {
-    return PushCapturedFrames(data, frameCount, false, outError);
+    return PushCapturedFrames(data, frameCount, false, false, outError);
 }
 
 std::uint32_t AsioRenderer::PushCapturedSilence(std::uint32_t frameCount,
                                                 std::wstring* outError) {
-    return PushCapturedFrames(nullptr, frameCount, true, outError);
+    return PushCapturedFrames(nullptr, frameCount, true, false, outError);
+}
+
+std::uint32_t AsioRenderer::PushPreparedPcm(const std::uint8_t* data,
+                                            std::uint32_t frameCount,
+                                            std::wstring* outError) {
+    return PushCapturedFrames(data, frameCount, false, true, outError);
+}
+
+std::uint32_t AsioRenderer::PushPreparedSilence(std::uint32_t frameCount,
+                                                std::wstring* outError) {
+    return PushCapturedFrames(nullptr, frameCount, true, true, outError);
+}
+
+bool AsioRenderer::PushCapturedBatch(
+        const std::vector<CapturedBatchItem>& items,
+        bool prepared,
+        std::uint64_t* outWrittenFrames,
+        std::wstring* outError) {
+    if (outWrittenFrames != nullptr) {
+        *outWrittenFrames = 0;
+    }
+    if (items.empty() || !running_.load(std::memory_order_acquire)) {
+        if (outError != nullptr) {
+            *outError = items.empty()
+                    ? L"The captured PCM batch is empty."
+                    : L"The ASIO renderer is not running.";
+        }
+        return false;
+    }
+
+    std::uint64_t totalFrames = 0;
+    std::uint64_t silentFrames = 0;
+    std::uint32_t maximumRealItemFrames = 0;
+    {
+        std::lock_guard<std::mutex> producerLock(producerMutex_);
+        if (!running_.load(std::memory_order_acquire) ||
+            prepared !=
+                    preparedStartPending_.load(std::memory_order_acquire)) {
+            if (outError != nullptr) {
+                *outError = L"The renderer changed generation while the captured batch was being prepared.";
+            }
+            return false;
+        }
+        if (!prepared &&
+            !startAccepted_.load(std::memory_order_acquire)) {
+            if (outError != nullptr) {
+                *outError = L"An atomic Active-bank append requires an already-started ASIO stream.";
+            }
+            return false;
+        }
+        UpdateLogicalAdmissionLocked();
+
+        auto batch = ringBuffer_.BeginWriteBatch();
+        for (const auto& item : items) {
+            if (item.frameCount == 0 || (!item.silent && item.data == nullptr)) {
+                if (outError != nullptr) {
+                    *outError = L"The captured PCM batch contains an invalid item.";
+                }
+                return false;
+            }
+            const std::uint8_t* retainedData = nullptr;
+            if (!item.silent) {
+                retainedData = ConvertCapturedFramesLocked(
+                        item.data, item.frameCount);
+                if (retainedData == nullptr) {
+                    if (outError != nullptr) {
+                        *outError = L"The captured PCM batch could not be converted to the active ASIO sample format.";
+                    }
+                    return false;
+                }
+            }
+            const std::uint32_t staged = ringBuffer_.StageWrite(
+                    &batch,
+                    retainedData,
+                    item.frameCount,
+                    RawFrameRingBuffer::FrameOwner::Player);
+            if (staged != item.frameCount) {
+                if (outError != nullptr) {
+                    *outError = L"The ASIO Ring does not have room for the complete captured PCM batch.";
+                }
+                return false;
+            }
+            totalFrames += staged;
+            if (item.silent) {
+                silentFrames += staged;
+            } else {
+                maximumRealItemFrames = (std::max)(
+                        maximumRealItemFrames, staged);
+            }
+        }
+        if (!ringBuffer_.CommitWriteBatch(batch)) {
+            if (outError != nullptr) {
+                *outError = L"The captured PCM batch lost its single-producer commit boundary.";
+            }
+            return false;
+        }
+        totalFramesQueued_.fetch_add(
+                static_cast<std::int64_t>(totalFrames),
+                std::memory_order_relaxed);
+        totalPlayerSilentFrames_.fetch_add(
+                static_cast<std::int64_t>(silentFrames),
+                std::memory_order_relaxed);
+        if (maximumRealItemFrames != 0) {
+            const std::uint32_t previousMaximum =
+                    maximumRealPacketFrames_.load(std::memory_order_relaxed);
+            if (maximumRealItemFrames > previousMaximum) {
+                maximumRealPacketFrames_.store(
+                        maximumRealItemFrames, std::memory_order_release);
+            }
+        }
+        UpdateLogicalAdmissionLocked();
+    }
+
+    if (outWrittenFrames != nullptr) {
+        *outWrittenFrames = totalFrames;
+    }
+    // Prepared batches start only at CommitPreparedStart. Non-prepared batch
+    // appends were required to be already started before the one-way Ring
+    // publication, so no fallible operation remains after CommitWriteBatch.
+    return true;
 }
 
 std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
                                                std::uint32_t frameCount,
                                                bool silence,
+                                               bool prepared,
                                                std::wstring* outError) {
     if (frameCount == 0) {
         return 0;
@@ -1133,6 +1321,16 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
         }
         return 0;
     }
+    const bool preparedStartPending =
+            preparedStartPending_.load(std::memory_order_acquire);
+    if (prepared != preparedStartPending) {
+        if (outError != nullptr) {
+            *outError = prepared
+                    ? L"The renderer is not awaiting a prepared handoff."
+                    : L"The prepared handoff must be staged and committed before ordinary PCM can be pushed.";
+        }
+        return 0;
+    }
 
     std::uint32_t written = 0;
     std::uint32_t pendingFrames = 0;
@@ -1145,11 +1343,16 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
             }
             return 0;
         }
+        if (prepared !=
+            preparedStartPending_.load(std::memory_order_acquire)) {
+            if (outError != nullptr) {
+                *outError = prepared
+                        ? L"The prepared handoff was committed before this PCM packet could be staged."
+                        : L"The renderer is still staging a prepared handoff.";
+            }
+            return 0;
+        }
         UpdateLogicalAdmissionLocked();
-        // Restore the fixed-delay floor before appending newly captured PCM.
-        // Appending first can raise the pending count and suppress silence that
-        // must remain ordered ahead of the new packet.
-        MaintainTimelineLocked();
         if (silence) {
             written = ringBuffer_.PushCapturedSilence(frameCount);
         } else {
@@ -1192,7 +1395,7 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
         }
         return written;
     }
-    if (written > 0) {
+    if (written > 0 && !prepared) {
         if (silence && !startAccepted_.load(std::memory_order_acquire)) {
             std::uint64_t expected = 0;
             deferredSilentStartAtMs_.compare_exchange_strong(
@@ -1205,6 +1408,63 @@ std::uint32_t AsioRenderer::PushCapturedFrames(const std::uint8_t* data,
         }
     }
     return written;
+}
+
+bool AsioRenderer::CommitPreparedStart(std::wstring* outError) {
+    if (!running_.load(std::memory_order_acquire)) {
+        if (outError != nullptr) {
+            const std::wstring fault = FaultMessage();
+            *outError = !fault.empty()
+                    ? fault
+                    : L"The renderer is not running.";
+        }
+        return false;
+    }
+    if (!preparedStartPending_.load(std::memory_order_acquire)) {
+        if (outError != nullptr) {
+            *outError = L"The renderer has no prepared handoff to commit.";
+        }
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> producerLock(producerMutex_);
+        if (!running_.load(std::memory_order_acquire) ||
+            !preparedStartPending_.load(std::memory_order_acquire)) {
+            if (outError != nullptr) {
+                *outError = L"The prepared handoff stopped or was already committed.";
+            }
+            return false;
+        }
+        if (ringBuffer_.PendingFrames() == 0) {
+            if (outError != nullptr) {
+                *outError = L"The prepared handoff contains no staged PCM frames.";
+            }
+            return false;
+        }
+
+        // Publish the mode transition without appending physical Bridge
+        // frames. The staged Standby already represents the one configured T
+        // budget; callback-owned virtual compensation begins only after Core
+        // opens the prepared output gate.
+        preparedStartPending_.store(false, std::memory_order_release);
+        deferredSilentStartAtMs_.store(0, std::memory_order_release);
+    }
+
+    return TryStartStreamIfReady(outError);
+}
+
+bool AsioRenderer::ActivatePreparedOutput(std::wstring* outError) {
+    if (!running_.load(std::memory_order_acquire) ||
+        !startAccepted_.load(std::memory_order_acquire) ||
+        preparedStartPending_.load(std::memory_order_acquire)) {
+        if (outError != nullptr) {
+            *outError = L"The prepared ASIO stream is not ready for Active-bank output.";
+        }
+        return false;
+    }
+    preparedOutputActive_.store(true, std::memory_order_release);
+    return true;
 }
 
 const std::uint8_t* AsioRenderer::ConvertCapturedFramesLocked(
@@ -1281,6 +1541,8 @@ RendererStats AsioRenderer::GetStats() const {
     }
 
     stats.startAccepted = startAccepted_.load(std::memory_order_relaxed);
+    stats.preparedStartPending =
+            preparedStartPending_.load(std::memory_order_relaxed);
     const LONG callbackState = InterlockedCompareExchange(
             const_cast<LONG*>(&firstOutputCallbackState_),
             static_cast<LONG>(FirstOutputCallbackState::Awaiting),
@@ -1315,6 +1577,11 @@ RendererStats AsioRenderer::GetStats() const {
             totalBridgeSilentFramesQueued_.load(std::memory_order_relaxed);
     stats.totalBridgeSilentFramesPlayed =
             totalBridgeSilentFramesPlayed_.load(std::memory_order_relaxed);
+    stats.totalBridgeSilentFramesReplaced =
+            totalBridgeSilentFramesReplaced_.load(std::memory_order_relaxed);
+    stats.compensationBridgeFrames = static_cast<std::int64_t>(
+            bridge::OutstandingFrames(
+                    compensationBridgeState_.load(std::memory_order_relaxed)));
     const auto recent = GetRecentSilenceStats(
             stats.totalOutputFrames, stats.totalSilentFrames);
     stats.recentOutputFrames = recent.outputFrames;
@@ -1389,26 +1656,37 @@ std::int64_t AsioRenderer::PendingTimelineFrames() const {
     return ringBuffer_.PendingFrames();
 }
 
+std::int64_t AsioRenderer::AvailableTimelineWriteFrames() const {
+    const std::int64_t capacity = ringBuffer_.CapacityFrames();
+    const std::int64_t pending = ringBuffer_.PendingFrames();
+    return (std::max<std::int64_t>)(capacity - pending, 0);
+}
+
+std::int64_t AsioRenderer::AdmissionRetentionFrames() {
+    std::lock_guard<std::mutex> producerLock(producerMutex_);
+    // Stop publishes running=false before it mutates the ring under this
+    // producer lock; Start publishes running=true only after the control
+    // thread has finished resetting it. Check first so a Core pipe thread
+    // never reads non-atomic ring metadata across a renderer generation.
+    if (!running_.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    // Admission is the player/Core storage contract. Virtual compensation
+    // silence neither owns player PCM nor occupies Ring capacity, including
+    // after it has been dispatched to an ASIO page, so it must not consume
+    // this budget and suppress the real PCM that is meant to replace it.
+    return ringBuffer_.PendingFrames();
+}
+
 void AsioRenderer::PrimeTimeline() {
     if (!running_.load(std::memory_order_acquire)) {
         return;
     }
     std::lock_guard<std::mutex> producerLock(producerMutex_);
     UpdateLogicalAdmissionLocked();
-    if (capturedDrainActive_.load(std::memory_order_acquire)) {
-        return;
-    }
-    const std::uint32_t pendingFrames = ringBuffer_.PendingFrames();
-    if (pendingFrames < prebufferFrames_) {
-        const std::uint32_t neededFrames = prebufferFrames_ - pendingFrames;
-        const std::uint32_t written = ringBuffer_.PushBridgeSilence(neededFrames);
-        totalBridgeSilentFramesQueued_.fetch_add(written, std::memory_order_relaxed);
-        if (written != neededFrames) {
-            totalFramesDropped_.fetch_add(neededFrames - written,
-                                          std::memory_order_relaxed);
-        }
-    }
-    UpdateLogicalAdmissionLocked();
+    // Normal generations are seeded once in CreateBuffersOnControlThread.
+    // Prepared banks already waited for their own T budget. Re-priming here
+    // would create a second delay; steady compensation is callback-owned.
 }
 
 void AsioRenderer::MaintainTimeline() {
@@ -1420,16 +1698,53 @@ void AsioRenderer::MaintainTimeline() {
 }
 
 void AsioRenderer::UpdateLogicalAdmissionLocked() {
-    const std::uint64_t confirmedFrame = ringBuffer_.ConfirmedPositionFrames();
-    const std::uint64_t writeFrame = ringBuffer_.WritePositionFrames();
-    const std::uint64_t horizonEnd = confirmedFrame + prebufferFrames_;
-    const std::uint64_t targetEnd = (std::min)(writeFrame, horizonEnd);
+    std::uint64_t confirmedFrame = 0;
+    std::uint64_t writeFrame = 0;
+    std::uint64_t compensationState = 0;
+    std::uint64_t stableSequence = 0;
+    bool stableSnapshot = false;
+    for (std::uint32_t attempt = 0; attempt < 4; ++attempt) {
+        const std::uint64_t sequenceBefore =
+                compensationStateSequence_.load(std::memory_order_acquire);
+        if ((sequenceBefore & 1U) != 0) {
+            YieldProcessor();
+            continue;
+        }
+        confirmedFrame = ringBuffer_.ConfirmedPositionFrames();
+        writeFrame = ringBuffer_.WritePositionFrames();
+        compensationState =
+                compensationBridgeState_.load(std::memory_order_acquire);
+        const std::uint64_t sequenceAfter =
+                compensationStateSequence_.load(std::memory_order_acquire);
+        if (bridge::IsStableSequenceSnapshot(
+                    sequenceBefore, sequenceAfter)) {
+            stableSnapshot = true;
+            stableSequence = sequenceAfter;
+            break;
+        }
+    }
+    if (!stableSnapshot) {
+        // Logical admission is monotonic. Skipping one producer pass is safer
+        // than advancing through a virtual-silence insertion in progress; the
+        // next packet/feedback pass will retry.
+        return;
+    }
+
+    const std::uint64_t targetEnd = bridge::LogicalTargetEnd(
+            confirmedFrame,
+            writeFrame,
+            prebufferFrames_,
+            compensationState);
     if (targetEnd <= admittedTimelineEndFrame_) {
         return;
     }
 
     const std::uint64_t playerFrames = ringBuffer_.CountPlayerFrames(
             admittedTimelineEndFrame_, targetEnd);
+    if (compensationStateSequence_.load(std::memory_order_acquire) !=
+        stableSequence) {
+        return;
+    }
     if (playerFrames != 0) {
         totalLogicalFrames_.fetch_add(
                 static_cast<std::int64_t>(playerFrames),
@@ -1441,27 +1756,21 @@ void AsioRenderer::UpdateLogicalAdmissionLocked() {
 void AsioRenderer::MaintainTimelineLocked() {
     UpdateLogicalAdmissionLocked();
     if (!running_.load(std::memory_order_acquire) ||
+        preparedStartPending_.load(std::memory_order_acquire) ||
         capturedDrainActive_.load(std::memory_order_acquire)) {
         return;
     }
 
-    const std::uint32_t pendingFrames = ringBuffer_.PendingFrames();
-    if (pendingFrames < minimumTimelineFrames_) {
-        const std::uint32_t neededFrames = minimumTimelineFrames_ - pendingFrames;
-        const std::uint32_t written = ringBuffer_.PushBridgeSilence(neededFrames);
-        totalBridgeSilentFramesQueued_.fetch_add(written, std::memory_order_relaxed);
-        if (written != neededFrames) {
-            totalFramesDropped_.fetch_add(neededFrames - written,
-                                          std::memory_order_relaxed);
-        }
-    }
-    UpdateLogicalAdmissionLocked();
-
+    const std::uint64_t pendingFrames = ringBuffer_.PendingFrames();
+    const std::uint64_t compensationFrames = bridge::OutstandingFrames(
+            compensationBridgeState_.load(std::memory_order_acquire));
     if (prebuffering_.load(std::memory_order_acquire) &&
-        ringBuffer_.PendingFrames() >= prebufferFrames_) {
+        pendingFrames + compensationFrames >= prebufferFrames_) {
         SetPrebuffering(false,
                         PrebufferTransitionReason::Refilled,
-                        ringBuffer_.PendingFrames());
+                        static_cast<std::uint32_t>((std::min<std::uint64_t>)(
+                                pendingFrames + compensationFrames,
+                                (std::numeric_limits<std::uint32_t>::max)())));
     }
 }
 
@@ -1469,9 +1778,19 @@ void AsioRenderer::BeginCapturedDrain() {
     std::lock_guard<std::mutex> producerLock(producerMutex_);
     UpdateLogicalAdmissionLocked();
     capturedDrainActive_.store(true, std::memory_order_release);
+    compensationBridgeCancelSerial_.fetch_add(1, std::memory_order_acq_rel);
+    CancelQueuedCompensationBridge(false);
     SetPrebuffering(false,
                     PrebufferTransitionReason::DrainBegin,
                     ringBuffer_.AvailableReadFrames());
+}
+
+void AsioRenderer::SettleCapturedDrain() {
+    // Refresh the final player-owned admission while keeping the no-Bridge
+    // drain gate closed. A same-config bank can now be appended directly
+    // behind the confirmed old timeline before low-water maintenance resumes.
+    std::lock_guard<std::mutex> producerLock(producerMutex_);
+    UpdateLogicalAdmissionLocked();
 }
 
 void AsioRenderer::EndCapturedDrain() {
@@ -1510,7 +1829,16 @@ void AsioRenderer::OnAsioBufferSwitch(long doubleBufferIndex,
         return;
     }
     InterlockedExchange(&callbackExecuting_, TRUE);
-    const auto finishCallback = [this] {
+    bool compensationSequenceOpen = false;
+    std::uint64_t compensationSequenceFinal = 0;
+    const auto finishCallback = [this,
+                                 &compensationSequenceOpen,
+                                 &compensationSequenceFinal] {
+        if (compensationSequenceOpen) {
+            compensationStateSequence_.store(
+                    compensationSequenceFinal, std::memory_order_release);
+            compensationSequenceOpen = false;
+        }
         InterlockedExchange(&callbackExecuting_, FALSE);
         if (callbackWaiterCount_.load(std::memory_order_acquire) != 0) {
             WakeByAddressAll(const_cast<LONG*>(&callbackExecuting_));
@@ -1528,6 +1856,19 @@ void AsioRenderer::OnAsioBufferSwitch(long doubleBufferIndex,
         finishCallback();
         return;
     }
+
+    // Keep Ring confirmation/dispatch and virtual-Bridge insertion in one
+    // callback-side seqlock interval. Producers never wait for this interval;
+    // they simply defer logical admission if their snapshot overlaps it.
+    const std::uint64_t compensationSequenceStart =
+            compensationStateSequence_.load(std::memory_order_relaxed);
+    compensationSequenceFinal = compensationSequenceStart + 2U;
+    // The acquire half prevents Ring/state operations below from moving ahead
+    // of the odd publication; producers can therefore never accept an even
+    // sequence around a partially updated callback snapshot.
+    compensationStateSequence_.exchange(
+            compensationSequenceStart + 1U, std::memory_order_acq_rel);
+    compensationSequenceOpen = true;
 
     if (awaitingFirstBufferSwitch_) {
         const std::size_t firstOutputPageIndex =
@@ -1956,6 +2297,13 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
                                 static_cast<std::uint32_t>((std::max<long>)(maxBuffer, 0)),
                                 static_cast<std::uint32_t>((std::max<long>)(preferredBuffer, 0)),
                                 granularity);
+    if (static_cast<std::uint64_t>(chosenBufferFrames) * 2U >
+        (std::numeric_limits<std::uint32_t>::max)()) {
+        if (outError != nullptr) {
+            *outError = L"The ASIO double buffer is too large for lock-free compensation accounting.";
+        }
+        return false;
+    }
 
     ASIOChannelInfo firstChannel{};
     firstChannel.channel = 0;
@@ -2034,8 +2382,10 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
         return false;
     }
 
+    bool preparedStart = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        preparedStart = startMode_ == StartMode::PreparedHandoff;
         bufferFrames_ = chosenBufferFrames;
         requestedBufferFrames_ = requestedBufferFrames;
         minBufferFrames_ = static_cast<std::uint32_t>((std::max<long>)(minBuffer, 0));
@@ -2074,11 +2424,11 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
                 return false;
             }
             admittedTimelineEndFrame_ = 0;
-            if (prebufferFrames_ != 0) {
-                // Begin every renderer generation with the full configured
-                // delay in the ordered ring. Later low-water maintenance only
-                // restores T-A; newly captured PCM always appends after this
-                // non-replaceable bridge-owned silence.
+            if (!preparedStart && prebufferFrames_ != 0) {
+                // A legacy/Normal cold generation begins with one physical T
+                // seed. Prepared banks already accumulated that same delay
+                // budget and intentionally skip this seed, avoiding 2T.
+                // Steady low-water compensation is virtual and callback-owned.
                 const std::uint32_t seededFrames =
                         ringBuffer_.PushBridgeSilence(prebufferFrames_);
                 if (seededFrames != prebufferFrames_) {
@@ -2155,6 +2505,8 @@ bool AsioRenderer::CreateBuffersOnControlThread(std::uint32_t requestedBufferFra
         running_.store(false, std::memory_order_release);
         return false;
     }
+    preparedStartPending_.store(preparedStart, std::memory_order_release);
+    preparedOutputActive_.store(!preparedStart, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     startAccepted_.store(false, std::memory_order_release);
     startAcceptedAtMs_.store(0, std::memory_order_release);
@@ -2196,6 +2548,12 @@ bool AsioRenderer::TryStartStreamIfReady(std::wstring* outError) {
             *outError = !fault.empty()
                     ? fault
                     : L"ASIO renderer is entering a faulted state.";
+        }
+        return false;
+    }
+    if (preparedStartPending_.load(std::memory_order_acquire)) {
+        if (outError != nullptr) {
+            *outError = L"The prepared handoff must be committed before the ASIO stream can start.";
         }
         return false;
     }
@@ -2377,6 +2735,215 @@ void AsioRenderer::CancelFirstOutputCallbackGate() noexcept {
     }
 }
 
+std::uint32_t AsioRenderer::CancelQueuedCompensationBridge(
+        bool countAsReplaced) noexcept {
+    for (std::uint32_t attempt = 0; attempt < 16; ++attempt) {
+        std::uint64_t state =
+                compensationBridgeState_.load(std::memory_order_acquire);
+        const std::uint32_t queued = bridge::UnpackState(state).queuedFrames;
+        if (queued == 0) {
+            return 0;
+        }
+        const std::uint64_t desired = bridge::CancelAllQueued(state);
+        if (compensationBridgeState_.compare_exchange_strong(
+                    state,
+                    desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+            if (countAsReplaced) {
+                totalBridgeSilentFramesReplaced_.fetch_add(
+                        queued, std::memory_order_relaxed);
+            }
+            return queued;
+        }
+    }
+    // The callback never spins indefinitely. BeginDrain's serial makes a
+    // contended cancellation sticky and the next callback retries it.
+    return 0;
+}
+
+bool AsioRenderer::RetireCompensationBridgeForCallback(
+        std::uint32_t frameCount) noexcept {
+    if (frameCount == 0) {
+        return true;
+    }
+    for (std::uint32_t attempt = 0; attempt < 16; ++attempt) {
+        std::uint64_t state =
+                compensationBridgeState_.load(std::memory_order_acquire);
+        const std::uint32_t inFlight =
+                bridge::UnpackState(state).inFlightFrames;
+        if (frameCount > inFlight) {
+            return false;
+        }
+        std::uint64_t desired = 0;
+        if (!bridge::TryConfirmInFlight(state, frameCount, &desired)) {
+            return false;
+        }
+        if (compensationBridgeState_.compare_exchange_strong(
+                    state,
+                    desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint32_t AsioRenderer::ClaimCompensationBridgeForCallback(
+        std::uint32_t maximumFrames) noexcept {
+    if (maximumFrames == 0) {
+        return 0;
+    }
+    for (std::uint32_t attempt = 0; attempt < 16; ++attempt) {
+        std::uint64_t state =
+                compensationBridgeState_.load(std::memory_order_acquire);
+        const auto unpacked = bridge::UnpackState(state);
+        const std::uint32_t queued = unpacked.queuedFrames;
+        const std::uint32_t inFlight = unpacked.inFlightFrames;
+        const std::uint32_t claimed = (std::min)(queued, maximumFrames);
+        if (claimed == 0 ||
+            claimed > (std::numeric_limits<std::uint32_t>::max)() - inFlight) {
+            return 0;
+        }
+        std::uint64_t desired = 0;
+        if (!bridge::TryMoveQueuedToInFlight(state, claimed, &desired)) {
+            return 0;
+        }
+        if (compensationBridgeState_.compare_exchange_strong(
+                    state,
+                    desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+            return claimed;
+        }
+    }
+    return 0;
+}
+
+void AsioRenderer::ReconcileCompensationBridgeForCallback(
+        bool draining) noexcept {
+    const std::uint64_t cancelSerial =
+            compensationBridgeCancelSerial_.load(std::memory_order_acquire);
+    if (cancelSerial != observedCompensationBridgeCancelSerial_) {
+        CancelQueuedCompensationBridge(false);
+        if (bridge::UnpackState(
+                    compensationBridgeState_.load(
+                            std::memory_order_acquire)).queuedFrames != 0) {
+            return;
+        }
+        observedCompensationBridgeCancelSerial_ = cancelSerial;
+    }
+    if (!bridge::MayPublishQueued(
+                running_.load(std::memory_order_acquire),
+                preparedOutputActive_.load(std::memory_order_acquire),
+                draining,
+                minimumTimelineFrames_,
+                cancelSerial,
+                cancelSerial)) {
+        CancelQueuedCompensationBridge(false);
+        return;
+    }
+
+    std::uint64_t state =
+            compensationBridgeState_.load(std::memory_order_acquire);
+    const bool compensationGenerationCurrent =
+            observedCompensationBridgeCancelSerial_ ==
+            compensationBridgeCancelSerial_.load(std::memory_order_acquire);
+    std::uint32_t queued = draining || !compensationGenerationCurrent
+            ? 0
+            : bridge::UnpackState(state).queuedFrames;
+    const std::uint64_t barrier =
+            compensationBridgeBarrierFrame_.load(std::memory_order_relaxed);
+    const std::uint64_t writeFrame = ringBuffer_.WritePositionFrames();
+    const std::uint64_t physicalPending = ringBuffer_.PendingFrames();
+
+    if (queued != 0) {
+        const std::uint64_t trailingPhysical = writeFrame > barrier
+                ? writeFrame - barrier
+                : 0;
+        // Replace the whole queued placeholder only once. Requiring both a
+        // complete trailing block and the post-replacement low-water floor
+        // prevents one physical frame from being counted repeatedly and keeps
+        // the DAC safety reserve intact.
+        if (bridge::CanReplaceWholeQueued(
+                    minimumTimelineFrames_,
+                    physicalPending,
+                    trailingPhysical,
+                    state)) {
+            CancelQueuedCompensationBridge(true);
+            state = compensationBridgeState_.load(std::memory_order_acquire);
+            queued = bridge::UnpackState(state).queuedFrames;
+        }
+    }
+
+    // Every confirmed callback page reduces the future timeline. Extend an
+    // existing placeholder at its same barrier, or establish a new barrier if
+    // the previous segment has fully moved in-flight. Thus the callback—not a
+    // feedback worker—restores the low-water floor after each consumption.
+    const std::uint64_t candidateBarrier = queued == 0
+            ? ringBuffer_.WritePositionFrames()
+            : barrier;
+    const std::uint64_t currentPhysicalPending = ringBuffer_.PendingFrames();
+    state = compensationBridgeState_.load(std::memory_order_acquire);
+    queued = bridge::UnpackState(state).queuedFrames;
+    const std::uint32_t needed = bridge::RequiredQueuedFrames(
+            minimumTimelineFrames_, currentPhysicalPending, state);
+    if (needed == 0) {
+        return;
+    }
+
+    const std::uint64_t serialBefore =
+            compensationBridgeCancelSerial_.load(std::memory_order_acquire);
+    if (!bridge::MayPublishQueued(
+                running_.load(std::memory_order_acquire),
+                preparedOutputActive_.load(std::memory_order_acquire),
+                capturedDrainActive_.load(std::memory_order_acquire),
+                minimumTimelineFrames_,
+                cancelSerial,
+                serialBefore)) {
+        return;
+    }
+
+    if (queued == 0) {
+        // Publish the absolute Ring boundary before publishing q. Frames
+        // already visible at this point remain ahead of the placeholder;
+        // later writes are trailing replacement candidates.
+        compensationBridgeBarrierFrame_.store(
+                candidateBarrier, std::memory_order_relaxed);
+    }
+    for (std::uint32_t attempt = 0; attempt < 16; ++attempt) {
+        state = compensationBridgeState_.load(std::memory_order_acquire);
+        std::uint64_t desired = 0;
+        if (!bridge::TryAddQueued(state, needed, &desired)) {
+            return;
+        }
+        if (compensationBridgeState_.compare_exchange_strong(
+                    state,
+                    desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+            totalBridgeSilentFramesQueued_.fetch_add(
+                    needed, std::memory_order_relaxed);
+            const std::uint64_t serialAfter =
+                    compensationBridgeCancelSerial_.load(
+                            std::memory_order_acquire);
+            if (!bridge::MayPublishQueued(
+                        running_.load(std::memory_order_acquire),
+                        preparedOutputActive_.load(
+                                std::memory_order_acquire),
+                        capturedDrainActive_.load(
+                                std::memory_order_acquire),
+                        minimumTimelineFrames_,
+                        serialBefore,
+                        serialAfter)) {
+                CancelQueuedCompensationBridge(false);
+            }
+            return;
+        }
+    }
+}
+
 bool AsioRenderer::ConfirmOutputPage(long doubleBufferIndex) {
     if (doubleBufferIndex < 0 || doubleBufferIndex > 1) {
         return false;
@@ -2391,6 +2958,11 @@ bool AsioRenderer::ConfirmOutputPage(long doubleBufferIndex) {
         return false;
     }
     if (!ringBuffer_.ConfirmDispatch(page.dispatchEndIndex)) {
+        RequestAsioFault(AsioFaultCode::OutputConfirmation);
+        return false;
+    }
+    if (!RetireCompensationBridgeForCallback(
+                page.compensationBridgeFrames)) {
         RequestAsioFault(AsioFaultCode::OutputConfirmation);
         return false;
     }
@@ -2417,6 +2989,13 @@ bool AsioRenderer::ConfirmOutputPage(long doubleBufferIndex) {
 void AsioRenderer::RollbackOutputPages() {
     ringBuffer_.RollbackDispatch();
     outputPageLedgers_.fill({});
+    compensationBridgeState_.store(0, std::memory_order_release);
+    compensationBridgeBarrierFrame_.store(
+            ringBuffer_.DispatchPosition() /
+                    (outputBytesPerFrame_ == 0 ? 1U : outputBytesPerFrame_),
+            std::memory_order_release);
+    observedCompensationBridgeCancelSerial_ =
+            compensationBridgeCancelSerial_.load(std::memory_order_acquire);
     nextDispatchSequence_ = 1;
     nextConfirmSequence_ = 1;
     awaitingFirstBufferSwitch_ = true;
@@ -2574,13 +3153,162 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
         return;
     }
 
+    if (!preparedOutputActive_.load(std::memory_order_acquire)) {
+        // IASIO::start is allowed to synchronously enter the callback before
+        // returning. Until Core commits startingBank_ as Active, return a
+        // normal accounted silence page without advancing the staged ring.
+        FillOutputBufferWithSilence(doubleBufferIndex);
+        auto& page = outputPageLedgers_[static_cast<std::size_t>(doubleBufferIndex)];
+        page.valid = true;
+        page.sequence = nextDispatchSequence_++;
+        page.dispatchEndIndex = ringBuffer_.DispatchPosition();
+        page.outputFrames = bufferFrames_;
+        page.capturedFrames = 0;
+        page.bridgeSilentFrames = 0;
+        page.managedSilentFrames = bufferFrames_;
+        page.underrunSilentFrames = 0;
+        NotifyOutputReady();
+        return;
+    }
+
     const bool draining = capturedDrainActive_.load(std::memory_order_acquire);
-    const RawFrameRingBuffer::DispatchResult dispatched =
-            ringBuffer_.Dispatch(callbackBuffer_.data(), bufferFrames_);
-    const std::uint32_t underrunSilentFrames = bufferFrames_ - dispatched.frames;
-    if (underrunSilentFrames > 0) {
+    ReconcileCompensationBridgeForCallback(draining);
+    const auto shouldKeepTentativeClaim = [this](
+                                                     std::uint64_t claimSerial) {
+        return bridge::ShouldKeepTentativeClaim(
+                running_.load(std::memory_order_acquire),
+                preparedOutputActive_.load(std::memory_order_acquire),
+                capturedDrainActive_.load(std::memory_order_acquire),
+                minimumTimelineFrames_,
+                observedCompensationBridgeCancelSerial_,
+                claimSerial,
+                compensationBridgeCancelSerial_.load(
+                        std::memory_order_acquire));
+    };
+    const auto compensationGenerationIsCurrent = [this,
+                                                   &shouldKeepTentativeClaim] {
+        const std::uint64_t currentSerial =
+                compensationBridgeCancelSerial_.load(
+                        std::memory_order_acquire);
+        return shouldKeepTentativeClaim(currentSerial);
+    };
+
+    std::uint32_t outputCursor = 0;
+    std::uint32_t capturedFrames = 0;
+    std::uint32_t physicalBridgeFrames = 0;
+    std::uint32_t compensationBridgeFrames = 0;
+    std::uint64_t dispatchEndIndex = ringBuffer_.DispatchPosition();
+    const auto dispatchPhysical = [&](std::uint32_t maximumFrames) {
+        if (maximumFrames == 0) {
+            return;
+        }
+        const RawFrameRingBuffer::DispatchResult dispatched =
+                ringBuffer_.Dispatch(
+                        callbackBuffer_.data() +
+                                static_cast<std::size_t>(outputCursor) *
+                                        outputBytesPerFrame_,
+                        maximumFrames);
+        outputCursor += dispatched.frames;
+        capturedFrames += dispatched.playerFrames;
+        physicalBridgeFrames += dispatched.bridgeFrames;
+        dispatchEndIndex = dispatched.endIndex;
+    };
+
+    std::uint64_t state =
+            compensationBridgeState_.load(std::memory_order_acquire);
+    bool compensationGenerationCurrent =
+            compensationGenerationIsCurrent();
+    std::uint32_t queued = compensationGenerationCurrent
+            ? bridge::UnpackState(state).queuedFrames
+            : 0;
+    if (queued != 0) {
+        const std::uint64_t barrier =
+                compensationBridgeBarrierFrame_.load(
+                        std::memory_order_relaxed);
+        const std::uint64_t dispatchFrame =
+                outputBytesPerFrame_ == 0
+                ? 0
+                : ringBuffer_.DispatchPosition() / outputBytesPerFrame_;
+        const bridge::PagePlan plan = bridge::PlanPage(
+                dispatchFrame,
+                ringBuffer_.WritePositionFrames(),
+                barrier,
+                state,
+                bufferFrames_);
+        if (plan.valid) {
+            dispatchPhysical(plan.physicalPrefixFrames);
+        } else {
+            // A generation rollback or drain cancellation made this old
+            // placeholder unreachable. It is safer to discard it than insert
+            // silence in front of PCM that has already crossed the boundary.
+            CancelQueuedCompensationBridge(false);
+        }
+    }
+
+    if (outputCursor < bufferFrames_) {
+        state = compensationBridgeState_.load(std::memory_order_acquire);
+        compensationGenerationCurrent =
+                compensationGenerationIsCurrent();
+        queued = !compensationGenerationCurrent
+                ? 0
+                : bridge::UnpackState(state).queuedFrames;
+        const std::uint64_t barrier =
+                compensationBridgeBarrierFrame_.load(
+                        std::memory_order_relaxed);
+        const std::uint64_t dispatchFrame =
+                outputBytesPerFrame_ == 0
+                ? 0
+                : ringBuffer_.DispatchPosition() / outputBytesPerFrame_;
+        if (queued != 0 && dispatchFrame == barrier) {
+            const std::uint64_t claimSerial =
+                    compensationBridgeCancelSerial_.load(
+                            std::memory_order_acquire);
+            std::uint32_t claimed =
+                    shouldKeepTentativeClaim(claimSerial)
+                    ? ClaimCompensationBridgeForCallback(
+                              bufferFrames_ - outputCursor)
+                    : 0;
+            if (claimed != 0 &&
+                !shouldKeepTentativeClaim(claimSerial)) {
+                // BeginDrain linearized between the live precheck and q ->
+                // in-flight CAS. The bytes have not been written to the ASIO
+                // page yet, so retire this tentative claim instead of letting
+                // one last compensation page leak across the drain boundary.
+                if (RetireCompensationBridgeForCallback(claimed)) {
+                    claimed = 0;
+                } else {
+                    RequestAsioFault(AsioFaultCode::OutputConfirmation);
+                }
+            }
+            if (claimed != 0) {
+                std::memset(callbackBuffer_.data() +
+                                    static_cast<std::size_t>(outputCursor) *
+                                            outputBytesPerFrame_,
+                            0,
+                            static_cast<std::size_t>(claimed) *
+                                    outputBytesPerFrame_);
+                outputCursor += claimed;
+                compensationBridgeFrames += claimed;
+            }
+        }
+    }
+
+    // Once the placeholder has been fully dispatched or atomically replaced,
+    // any trailing player PCM is now the next ordered timeline segment and may
+    // fill the remainder of this same ASIO page.
+    compensationGenerationCurrent =
+            compensationGenerationIsCurrent();
+    if (outputCursor < bufferFrames_ &&
+        (!compensationGenerationCurrent || bridge::UnpackState(
+                compensationBridgeState_.load(
+                        std::memory_order_acquire)).queuedFrames == 0)) {
+        dispatchPhysical(bufferFrames_ - outputCursor);
+    }
+
+    const std::uint32_t underrunSilentFrames = bufferFrames_ - outputCursor;
+    if (underrunSilentFrames != 0) {
         std::memset(callbackBuffer_.data() +
-                            static_cast<std::size_t>(dispatched.frames) *
+                            static_cast<std::size_t>(outputCursor) *
                                     outputBytesPerFrame_,
                     0,
                     static_cast<std::size_t>(underrunSilentFrames) *
@@ -2591,10 +3319,12 @@ void AsioRenderer::FillOutputBuffer(long doubleBufferIndex) {
     auto& page = outputPageLedgers_[static_cast<std::size_t>(doubleBufferIndex)];
     page.valid = true;
     page.sequence = nextDispatchSequence_++;
-    page.dispatchEndIndex = dispatched.endIndex;
+    page.dispatchEndIndex = dispatchEndIndex;
     page.outputFrames = bufferFrames_;
-    page.capturedFrames = dispatched.playerFrames;
-    page.bridgeSilentFrames = dispatched.bridgeFrames;
+    page.capturedFrames = capturedFrames;
+    page.bridgeSilentFrames =
+            physicalBridgeFrames + compensationBridgeFrames;
+    page.compensationBridgeFrames = compensationBridgeFrames;
     page.managedSilentFrames = draining ? underrunSilentFrames : 0;
     page.underrunSilentFrames = draining ? 0 : underrunSilentFrames;
     NotifyOutputReady();
@@ -2666,6 +3396,8 @@ void AsioRenderer::ResetStats() {
     pendingAsioFault_.store(0, std::memory_order_release);
     faultRequested_.store(false, std::memory_order_release);
     faultStopRequested_.store(false, std::memory_order_release);
+    preparedStartPending_.store(false, std::memory_order_release);
+    preparedOutputActive_.store(false, std::memory_order_release);
     startAcceptedAtMs_.store(0, std::memory_order_release);
     deferredSilentStartAtMs_.store(0, std::memory_order_release);
     ResetFirstOutputCallbackGate();
@@ -2678,6 +3410,12 @@ void AsioRenderer::ResetStats() {
     totalLogicalFrames_.store(0, std::memory_order_relaxed);
     totalBridgeSilentFramesQueued_.store(0, std::memory_order_relaxed);
     totalBridgeSilentFramesPlayed_.store(0, std::memory_order_relaxed);
+    totalBridgeSilentFramesReplaced_.store(0, std::memory_order_relaxed);
+    compensationBridgeState_.store(0, std::memory_order_relaxed);
+    compensationStateSequence_.store(0, std::memory_order_relaxed);
+    compensationBridgeCancelSerial_.store(0, std::memory_order_relaxed);
+    compensationBridgeBarrierFrame_.store(0, std::memory_order_relaxed);
+    observedCompensationBridgeCancelSerial_ = 0;
     maximumRealPacketFrames_.store(0, std::memory_order_relaxed);
     underrunCount_.store(0, std::memory_order_relaxed);
     prebufferEnterCount_.store(0, std::memory_order_relaxed);
